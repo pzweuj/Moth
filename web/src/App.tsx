@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   BrowserRouter,
+  Link,
   Navigate,
   Route,
   Routes,
@@ -15,6 +16,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api, type BookSummary, type SessionState } from "./api";
+import { ReaderPage } from "./reader/ReaderPage";
 
 const queryOptions = {
   retry: 1,
@@ -80,6 +82,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute initialized={setup.data.initialized} session={session.data}>
             <LibraryPage session={session.data} />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/reader/:id"
+        element={
+          <ProtectedRoute initialized={setup.data.initialized} session={session.data}>
+            <ReaderPage />
           </ProtectedRoute>
         }
       />
@@ -345,8 +355,8 @@ function LibraryPage({ session }: { session?: SessionState }) {
 }
 
 function BookCard({ book }: { book: BookSummary }) {
-  return (
-    <li className="book-card">
+  const card = (
+    <>
       <div className="book-cover">
         {book.has_cover && book.cover_url ? (
           <img src={book.cover_url} alt="" loading="lazy" />
@@ -374,6 +384,17 @@ function BookCard({ book }: { book: BookSummary }) {
           )}
         </div>
       </div>
+    </>
+  );
+
+  if (book.parse_status !== "ok") {
+    return <li className="book-card">{card}</li>;
+  }
+  return (
+    <li className="book-card">
+      <Link className="book-card-link" to={`/reader/${book.id}`} aria-label={`Read ${book.title}`}>
+        {card}
+      </Link>
     </li>
   );
 }

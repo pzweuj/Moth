@@ -4,6 +4,10 @@
 
 ## M2 — Phase 2:阅读引擎 + 阅读器 UI(下一步)
 
+> 技术选型已定稿,见 `docs/reader-tech-selection.md`(EPUB/MOBI 走 foliate-js,服务端只做
+> metadata + 提供原始文件 HTTP Range;TXT 走自研 Novel Parser + TextPublication 喂 Foliate
+> paginator;CBZ 走自研 ComicEngine + zip.js)。
+
 ### 阅读引擎(服务端,复用 Phase 1 解析结果)
 - [ ] EPUB:按 spine 提供章节 XHTML(章节内容与资源重写已就绪,待接入渲染)
 - [ ] TXT / MOBI:章节文本已渲染为 HTML,直接供阅读器使用

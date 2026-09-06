@@ -130,4 +130,49 @@ footer span { color: #b7c7b2; margin: 0 8px; }
   .book-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 18px; }
 }
 
+/* Reader */
+.reader-shell { background: #0c0f11; min-height: 100vh; }
+.reader-top-bar { align-items: center; background: #0c0f11; border-bottom: 1px solid rgba(183, 199, 178, .16); display: flex; gap: 12px; padding: 12px 18px; position: relative; z-index: 5; }
+.reader-top-bar button { background: transparent; border: 1px solid rgba(183, 199, 178, .28); border-radius: 1px; color: #c9d5c4; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 9px 12px; text-transform: uppercase; }
+.reader-top-bar button:hover:not(:disabled) { border-color: #c6dca3; color: #e1edca; }
+.reader-title { color: #e9e5dc; flex: 1; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-stage { display: flex; flex-direction: column; height: calc(100vh - 53px); position: relative; }
+.reader-host { flex: 1; min-height: 0; position: relative; }
+.reader-host foliate-view { display: block; height: 100%; width: 100%; }
+.reader-loading { align-items: center; color: #aeb5ad; display: flex; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; inset: 0; justify-content: center; letter-spacing: .08em; position: absolute; text-transform: uppercase; z-index: 2; }
+.reader-error { align-items: center; color: #e5ad9b; display: flex; flex-direction: column; gap: 16px; inset: 0; justify-content: center; padding: 24px; position: absolute; text-align: center; z-index: 2; }
+.reader-error p { margin: 0; max-width: 460px; }
+.reader-error button { background: transparent; border: 1px solid rgba(207, 138, 117, .5); border-radius: 1px; color: #e5ad9b; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 11px 14px; text-transform: uppercase; }
+.reader-bottom-bar { align-items: center; background: #0c0f11; border-top: 1px solid rgba(183, 199, 178, .16); display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; padding: 10px 14px; }
+.reader-bottom-bar button { background: transparent; border: 1px solid rgba(183, 199, 178, .28); border-radius: 1px; color: #c9d5c4; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 9px 13px; text-transform: uppercase; }
+.reader-bottom-bar button:hover:not(:disabled) { border-color: #c6dca3; color: #e1edca; }
+.reader-toc { background: #101316; border: 1px solid rgba(183, 199, 178, .2); bottom: 58px; box-shadow: 0 18px 60px rgba(0, 0, 0, .4); left: 50%; max-height: 60vh; overflow-y: auto; padding: 16px 0; position: absolute; transform: translateX(-50%); width: min(420px, 92vw); z-index: 6; }
+.reader-toc-head { align-items: center; color: #b7c7b2; display: flex; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; justify-content: space-between; letter-spacing: .14em; padding: 4px 18px 12px; text-transform: uppercase; }
+.reader-toc-head button { background: transparent; border: 0; color: #aeb5ad; font-size: 15px; padding: 2px 4px; }
+.reader-toc ul { list-style: none; margin: 0; padding: 0; }
+.reader-toc li { border-left: 1px solid rgba(183, 199, 178, .14); margin-left: 18px; padding-left: 14px; }
+.reader-toc li button { background: transparent; border: 0; color: #e9e5dc; display: block; font-size: 14px; padding: 8px 10px; text-align: left; width: 100%; }
+.reader-toc li button:hover { color: #c6dca3; }
 
+/* CBZ reader */
+.comic-viewport { align-items: center; background: #0c0f11; display: flex; flex: 1; justify-content: center; min-height: 0; overflow: auto; position: relative; }
+.comic-viewport img { object-fit: contain; }
+.comic-fit-width img { height: auto; max-width: 100%; }
+.comic-fit-height img { height: 100%; max-width: none; width: auto; }
+.comic-counter { color: #aeb5ad; font: 600 12px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .1em; padding: 0 6px; }
+.comic-thumbs { align-items: center; background: #0c0f11; border-top: 1px solid rgba(183, 199, 178, .16); display: flex; gap: 8px; overflow-x: auto; padding: 10px 14px; }
+.comic-thumb { background: rgba(232, 237, 220, .05); border: 1px solid rgba(183, 199, 178, .22); flex: 0 0 auto; height: 56px; padding: 0; position: relative; width: 40px; }
+.comic-thumb img { display: block; height: 100%; object-fit: cover; width: 100%; }
+.comic-thumb span { align-items: center; color: #8a948d; display: flex; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; height: 100%; justify-content: center; }
+.comic-thumb.is-active { border-color: #c6dca3; box-shadow: 0 0 0 1px #c6dca3; }
+
+/* Settings panel */
+.settings-panel { background: #101316; border: 1px solid rgba(183, 199, 178, .2); box-shadow: 0 18px 60px rgba(0, 0, 0, .4); display: grid; gap: 16px; padding: 22px; position: absolute; right: 18px; top: 58px; width: min(340px, 88vw); z-index: 6; }
+.settings-row > label, .settings-row > span { align-items: center; color: #c9d5c4; display: flex; flex-wrap: wrap; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; gap: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.settings-row input[type="range"] { accent-color: #c6dca3; flex: 1 1 160px; min-width: 120px; }
+.settings-row output { color: #b7c7b2; font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.theme-options { display: flex; gap: 8px; }
+.theme-options button { background: transparent; border: 1px solid rgba(183, 199, 178, .26); border-radius: 100px; color: #aeb5ad; font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; padding: 8px 12px; text-transform: uppercase; }
+.theme-options button.is-active { background: #c6dca3; border-color: #d7e9bc; color: #18211e; }
+.settings-close { background: transparent; border: 1px solid rgba(183, 199, 178, .28); border-radius: 1px; color: #c9d5c4; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 10px 12px; text-transform: uppercase; }
+.settings-close:hover { border-color: #c6dca3; color: #e1edca; }

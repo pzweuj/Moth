@@ -28,6 +28,8 @@ export type BookSummary = {
 export type ChapterInfo = {
   idx: number;
   title: string;
+  /** Byte size of the rendered chapter content. */
+  size: number;
 };
 
 export type ProgressBody = {
@@ -129,4 +131,7 @@ export const api = {
   scanLibrary: () => request<void>("/library/scan", { method: "POST" }),
   getScanStatus: () => request<ScanStatus>("/library/scan/status"),
 };
+
+/** URL of a book's raw file, served with HTTP Range support. */
+export const bookFileUrl = (id: number) => `/api/v1/books/${id}/file`;
 

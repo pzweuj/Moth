@@ -462,3 +462,130 @@ async fn cbz_pages_are_served_from_the_archive() {
         assert!(!bytes.is_empty());
     }
 }
+
+#[tokio::test]
+async fn raw_file_endpoint_supports_byte_ranges() {
+    let (_temp, app) = build_app().await;
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+
+    let books = list_books(&app, &cookie).await;
+    let epub = find_book(&books, "epub");
+    let id = epub["id"].as_i64().expect("id");
+    let full = std::fs::read(_temp.path().join("books/fixture.epub")).expect("epub file");
+    let size = full.len();
+
+    // No Range header: full 200 response, advertises byte ranges.
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}/file"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("full file");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/epub+zip"
+    );
+    assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), full.as_slice());
+
+    // A closed range returns 206 with the exact slice.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .header(header::COOKIE, &cookie)
+                .header(header::RANGE, "bytes=0-3")
+                .body(Body::empty())
+                .expect("ranged request"),
+        )
+        .await
+        .expect("ranged");
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers()[header::CONTENT_RANGE],
+        format!("bytes 0-3/{size}")
+    );
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "4".to_owned());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), &full[0..4]);
+
+    // A suffix range returns the last N bytes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .header(header::COOKIE, &cookie)
+                .header(header::RANGE, "bytes=-4")
+                .body(Body::empty())
+                .expect("suffix request"),
+        )
+        .await
+        .expect("suffix");
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers()[header::CONTENT_RANGE],
+        format!("bytes {}-{}/{}", size - 4, size - 1, size)
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), &full[size - 4..]);
+
+    // An unsatisfiable range returns 416 with the total size.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .header(header::COOKIE, &cookie)
+                .header(header::RANGE, "bytes=999999-")
+                .body(Body::empty())
+                .expect("bad range request"),
+        )
+        .await
+        .expect("bad range");
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response.headers()[header::CONTENT_RANGE],
+        format!("bytes */{size}")
+    );
+
+    // The endpoint requires login.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .body(Body::empty())
+                .expect("unauthenticated request"),
+        )
+        .await
+        .expect("unauthenticated");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

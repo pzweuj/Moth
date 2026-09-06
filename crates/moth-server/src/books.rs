@@ -5,12 +5,15 @@ use std::path::Path;
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path as AxumPath, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::io::ReaderStream;
 use zip::ZipArchive;
 
 use crate::auth::Authenticated;
@@ -34,6 +37,9 @@ pub struct BookListItem {
 pub struct ChapterInfo {
     pub idx: i64,
     pub title: String,
+    /// Byte size of the rendered chapter content, for client-side progress
+    /// estimation (each chapter is a section in the paginator).
+    pub size: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -134,14 +140,14 @@ pub async fn get_book(
     let chapters: Vec<ChapterInfo> = if format == "cbz" {
         Vec::new()
     } else {
-        sqlx::query_as::<_, (i64, String)>(
-            "SELECT idx, title FROM chapters WHERE book_id = ? ORDER BY idx",
+        sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT idx, title, length(content) FROM chapters WHERE book_id = ? ORDER BY idx",
         )
         .bind(id)
         .fetch_all(&state.db)
         .await?
         .into_iter()
-        .map(|(idx, title)| ChapterInfo { idx, title })
+        .map(|(idx, title, size)| ChapterInfo { idx, title, size })
         .collect()
     };
 
@@ -190,6 +196,176 @@ pub async fn get_cover(
         bytes,
     )
         .into_response())
+}
+
+/// A single byte range, inclusive endpoints, parsed from a `Range` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+/// How a `Range` header should be handled. A request that cannot be satisfied
+/// is answered with `416`; a header we choose not to honor (multi-range,
+/// malformed) falls back to the full `200` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeParse {
+    Satisfiable(ByteRange),
+    Unsatisfiable,
+    Ignore,
+}
+
+/// Parse a single `bytes=a-b` range against a known size.
+fn parse_range(header: &str, size: u64) -> RangeParse {
+    let Some(spec) = header.strip_prefix("bytes=") else {
+        return RangeParse::Ignore;
+    };
+    // Only single ranges are handled; a multi-range request falls back to the
+    // full representation, which RFC 7233 permits.
+    if spec.contains(',') {
+        return RangeParse::Ignore;
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return RangeParse::Ignore;
+    };
+
+    let parse = |value: &str| -> Option<u64> {
+        if value.is_empty() {
+            return None;
+        }
+        value.parse::<u64>().ok()
+    };
+
+    let start = parse(start_str);
+    let end = parse(end_str);
+    let range = match (start, end) {
+        // `bytes=start-end`
+        (Some(start), Some(end)) => {
+            if start > end || start >= size {
+                return RangeParse::Unsatisfiable;
+            }
+            ByteRange {
+                start,
+                end: end.min(size - 1),
+            }
+        }
+        // `bytes=start-`
+        (Some(start), None) => {
+            if start >= size {
+                return RangeParse::Unsatisfiable;
+            }
+            ByteRange {
+                start,
+                end: size - 1,
+            }
+        }
+        // `bytes=-N`: the last N bytes.
+        (None, Some(suffix)) => {
+            if suffix == 0 {
+                return RangeParse::Unsatisfiable;
+            }
+            ByteRange {
+                start: size.saturating_sub(suffix),
+                end: size - 1,
+            }
+        }
+        (None, None) => return RangeParse::Ignore,
+    };
+    RangeParse::Satisfiable(range)
+}
+
+/// Serve a raw book file with HTTP Range support, for `zip.js HttpRangeReader`
+/// and client-side readers. Bytes are streamed so large archives are never
+/// fully buffered server-side.
+pub async fn get_file(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath(id): AxumPath<i64>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (relative_path, format) = sqlx::query_as::<_, (String, String)>(
+        "SELECT relative_path, format FROM books WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound)?;
+
+    let full_path = state.config.books_dir.join(&relative_path);
+    let metadata = tokio::fs::metadata(&full_path).await?;
+    let size = metadata.len();
+    let content_type = content_type_for_format(&format);
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+
+    let Some(range) = range else {
+        let file = tokio::fs::File::open(&full_path).await?;
+        return Ok((
+            [
+                (header::CONTENT_TYPE, content_type.to_owned()),
+                (header::ACCEPT_RANGES, "bytes".to_owned()),
+                (header::CONTENT_LENGTH, size.to_string()),
+                (header::CACHE_CONTROL, "no-cache".to_owned()),
+            ],
+            Body::from_stream(ReaderStream::new(file)),
+        )
+            .into_response());
+    };
+
+    match parse_range(range, size) {
+        RangeParse::Satisfiable(ByteRange { start, end }) => {
+            let mut file = tokio::fs::File::open(&full_path).await?;
+            file.seek(SeekFrom::Start(start)).await?;
+            let length = end - start + 1;
+            let body = Body::from_stream(ReaderStream::new(file.take(length)));
+            Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, content_type.to_owned()),
+                    (header::ACCEPT_RANGES, "bytes".to_owned()),
+                    (header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}")),
+                    (header::CONTENT_LENGTH, length.to_string()),
+                    (header::CACHE_CONTROL, "no-cache".to_owned()),
+                ],
+                body,
+            )
+                .into_response())
+        }
+        RangeParse::Unsatisfiable => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [
+                (header::ACCEPT_RANGES, "bytes".to_owned()),
+                (header::CONTENT_RANGE, format!("bytes */{size}")),
+            ],
+            (),
+        )
+            .into_response()),
+        RangeParse::Ignore => {
+            let file = tokio::fs::File::open(&full_path).await?;
+            Ok((
+                [
+                    (header::CONTENT_TYPE, content_type.to_owned()),
+                    (header::ACCEPT_RANGES, "bytes".to_owned()),
+                    (header::CONTENT_LENGTH, size.to_string()),
+                    (header::CACHE_CONTROL, "no-cache".to_owned()),
+                ],
+                Body::from_stream(ReaderStream::new(file)),
+            )
+                .into_response())
+        }
+    }
+}
+
+fn content_type_for_format(format: &str) -> &'static str {
+    match format {
+        "epub" => "application/epub+zip",
+        "mobi" => "application/x-mobipocket-ebook",
+        "cbz" => "application/vnd.comicbook+zip",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 pub async fn get_chapter(
@@ -358,4 +534,80 @@ pub async fn scan_status(
         errors: status.errors,
         message: status.message,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn satisfied(header: &str, size: u64) -> Option<ByteRange> {
+        match parse_range(header, size) {
+            RangeParse::Satisfiable(range) => Some(range),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parses_closed_ranges() {
+        assert_eq!(
+            satisfied("bytes=0-4", 100),
+            Some(ByteRange { start: 0, end: 4 })
+        );
+        assert_eq!(
+            satisfied("bytes=95-200", 100),
+            Some(ByteRange { start: 95, end: 99 })
+        );
+        assert_eq!(
+            satisfied("bytes=10-10", 100),
+            Some(ByteRange { start: 10, end: 10 })
+        );
+    }
+
+    #[test]
+    fn parses_open_ended_and_suffix_ranges() {
+        assert_eq!(
+            satisfied("bytes=90-", 100),
+            Some(ByteRange { start: 90, end: 99 })
+        );
+        assert_eq!(
+            satisfied("bytes=-10", 100),
+            Some(ByteRange { start: 90, end: 99 })
+        );
+        // A suffix longer than the file covers the whole file.
+        assert_eq!(
+            satisfied("bytes=-500", 100),
+            Some(ByteRange { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_ranges() {
+        assert!(matches!(
+            parse_range("bytes=100-", 100),
+            RangeParse::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=100-200", 100),
+            RangeParse::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=5-2", 100),
+            RangeParse::Unsatisfiable
+        ));
+        assert!(matches!(
+            parse_range("bytes=-0", 100),
+            RangeParse::Unsatisfiable
+        ));
+    }
+
+    #[test]
+    fn ignores_other_or_malformed_headers() {
+        assert!(matches!(parse_range("items=0-1", 100), RangeParse::Ignore));
+        assert!(matches!(
+            parse_range("bytes=0-1,4-5", 100),
+            RangeParse::Ignore
+        ));
+        assert!(matches!(parse_range("bytes=abc", 100), RangeParse::Ignore));
+        assert!(matches!(parse_range("bytes=-", 100), RangeParse::Ignore));
+    }
 }

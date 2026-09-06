@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/books", get(books::list_books))
         .route("/books/{id}", get(books::get_book))
         .route("/books/{id}/cover", get(books::get_cover))
+        .route("/books/{id}/file", get(books::get_file))
         .route("/books/{id}/chapter/{idx}", get(books::get_chapter))
         .route("/books/{id}/page/{idx}", get(books::get_page))
         .route("/books/{id}/resource/{idx}", get(books::get_resource))
