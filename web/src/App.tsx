@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useMemo, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   BrowserRouter,
   Link,
@@ -16,6 +16,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api, type BookSummary, type SessionState } from "./api";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { ReaderPage } from "./reader/ReaderPage";
 
 const queryOptions = {
@@ -30,9 +31,19 @@ function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <AppRoutes />
-      </BrowserRouter>
+      <ErrorBoundary
+        fallback={(error) => (
+          <ErrorScreen
+            title="Moth hit a snag"
+            message={error.message || "Something went wrong. Reloading the app usually fixes it."}
+            onRetry={() => window.location.reload()}
+          />
+        )}
+      >
+        <BrowserRouter>
+          <AppRoutes />
+        </BrowserRouter>
+      </ErrorBoundary>
     </QueryClientProvider>
   );
 }
@@ -258,14 +269,18 @@ function LibraryPage({ session }: { session?: SessionState }) {
 
   const scanning = scanStatus.data?.scanning ?? false;
   const query = search.trim().toLowerCase();
-  const filtered = (books.data ?? []).filter((book) => {
-    const matchesFormat = format === "all" || book.format === format;
-    const matchesSearch =
-      !query ||
-      book.title.toLowerCase().includes(query) ||
-      (book.author?.toLowerCase().includes(query) ?? false);
-    return matchesFormat && matchesSearch;
-  });
+  const filtered = useMemo(
+    () =>
+      (books.data ?? []).filter((book) => {
+        const matchesFormat = format === "all" || book.format === format;
+        const matchesSearch =
+          !query ||
+          book.title.toLowerCase().includes(query) ||
+          (book.author?.toLowerCase().includes(query) ?? false);
+        return matchesFormat && matchesSearch;
+      }),
+    [books.data, format, query],
+  );
 
   return (
     <main className="home-shell">

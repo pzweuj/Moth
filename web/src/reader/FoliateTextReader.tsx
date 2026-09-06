@@ -139,19 +139,50 @@ export function FoliateTextReader({
     view.renderer.setAttribute("margin", `${settings.margin}px`);
   }, [settings]);
 
-  // Keyboard navigation (disabled while the contents drawer is open).
+  // Keyboard navigation (disabled while the contents drawer is open). Space
+  // is only captured when nothing interactive is focused so it still
+  // activates buttons.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (tocOpen) return;
       const view = viewRef.current;
       if (!view) return;
-      if (event.key === "ArrowRight" || event.key === " " || event.key === "PageDown") {
+      if (event.key === "ArrowRight" || event.key === "PageDown") {
         event.preventDefault();
         void view.next();
       } else if (event.key === "ArrowLeft" || event.key === "PageUp") {
         event.preventDefault();
         void view.prev();
+      } else if (event.key === " ") {
+        const target = event.target as HTMLElement | null;
+        if (target?.closest("button, a, input, select, textarea, [contenteditable]")) {
+          return;
+        }
+        event.preventDefault();
+        void view.next();
       }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tocOpen]);
+
+  // Escape closes the contents drawer; focus moves into it when it opens and
+  // back to the toggle button when it closes.
+  const tocButtonRef = useRef<HTMLButtonElement>(null);
+  const tocListRef = useRef<HTMLDivElement>(null);
+  const wasOpenRef = useRef(false);
+  useEffect(() => {
+    if (tocOpen) {
+      tocListRef.current?.focus();
+    } else if (wasOpenRef.current) {
+      tocButtonRef.current?.focus();
+    }
+    wasOpenRef.current = tocOpen;
+  }, [tocOpen]);
+  useEffect(() => {
+    if (!tocOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setTocOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -186,20 +217,27 @@ export function FoliateTextReader({
           ← Prev
         </button>
         {toc.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setTocOpen((open) => !open)}
-            aria-expanded={tocOpen}
-          >
-            Contents
-          </button>
+        <button
+          type="button"
+          ref={tocButtonRef}
+          onClick={() => setTocOpen((open) => !open)}
+          aria-expanded={tocOpen}
+        >
+          Contents
+        </button>
         )}
         <button type="button" onClick={next} disabled={loading || !!error}>
           Next →
         </button>
       </div>
       {tocOpen && toc.length > 0 && (
-        <div className="reader-toc" role="dialog" aria-label="Table of contents">
+        <div
+          className="reader-toc"
+          role="dialog"
+          aria-label="Table of contents"
+          tabIndex={-1}
+          ref={tocListRef}
+        >
           <div className="reader-toc-head">
             <span>Contents</span>
             <button type="button" onClick={() => setTocOpen(false)} aria-label="Close contents">

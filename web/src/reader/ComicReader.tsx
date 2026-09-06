@@ -30,6 +30,10 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const urlsRef = useRef(new Map<number, string>());
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
+  // The initial page is read once; detail.progress is deliberately excluded
+  // from the effect deps so a progress refetch cannot tear down and reopen
+  // the archive mid-read.
+  const initialPageRef = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -40,7 +44,8 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       const names = sortComicEntries(loader.entries).map((entry) => entry.filename);
       if (names.length === 0) throw new Error("No readable pages in this archive.");
       setPages(names);
-      const start = detail.progress?.page_index ?? 0;
+      const start = initialPageRef.current ?? detail.progress?.page_index ?? 0;
+      initialPageRef.current = start;
       setIndex(Math.min(Math.max(0, start), names.length - 1));
       setLoading(false);
     };
@@ -57,7 +62,11 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       for (const url of urls.values()) URL.revokeObjectURL(url);
       urls.clear();
     };
-  }, [detail.id, detail.progress?.page_index]);
+    // detail.progress is intentionally not a dependency: the archive is only
+    // opened once per book, and a progress refetch must not tear it down.
+    // The initial page is read through initialPageRef instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail.id]);
 
   // Load the current page image into an object URL.
   useEffect(() => {
@@ -130,15 +139,23 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const prev = useCallback(() => goTo(index - 1), [goTo, index]);
   const next = useCallback(() => goTo(index + 1), [goTo, index]);
 
-  // Keyboard navigation.
+  // Keyboard navigation. Space only pages when nothing interactive is focused
+  // so it still activates buttons.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "ArrowRight" || event.key === " " || event.key === "PageDown") {
+      if (event.key === "ArrowRight" || event.key === "PageDown") {
         event.preventDefault();
         next();
       } else if (event.key === "ArrowLeft" || event.key === "PageUp") {
         event.preventDefault();
         prev();
+      } else if (event.key === " ") {
+        const target = event.target as HTMLElement | null;
+        if (target?.closest("button, a, input, select, textarea, [contenteditable]")) {
+          return;
+        }
+        event.preventDefault();
+        next();
       }
     };
     window.addEventListener("keydown", onKey);

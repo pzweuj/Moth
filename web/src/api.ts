@@ -7,12 +7,6 @@ export type SessionState = {
   username?: string;
 };
 
-export type HealthState = {
-  status: string;
-  version: string;
-  database: string;
-};
-
 export type BookSummary = {
   id: number;
   title: string;
@@ -117,7 +111,6 @@ export const api = {
     }),
   getSession: () => request<SessionState>("/session"),
   logout: () => request<void>("/session", { method: "DELETE" }),
-  getHealth: () => request<HealthState>("/health"),
   getBooks: () => request<BookSummary[]>("/books"),
   getBook: (id: number) => request<BookDetail>(`/books/${id}`),
   getChapter: (id: number, idx: number) =>

@@ -2,16 +2,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, type ProgressBody } from "../api";
+import { ErrorBoundary } from "../ErrorBoundary";
 import {
   loadSettings,
   saveSettings,
   type ReaderSettings,
   type ReaderTheme,
 } from "./settings";
+import { useProgressSaver } from "./useProgressSaver";
 import { FoliateTextReader } from "./FoliateTextReader";
 import { ComicReader } from "./ComicReader";
 
-const SAVE_DELAY_MS = 1500;
+const SAVE_LABELS: Record<string, string> = {
+  saving: "Saving…",
+  saved: "Saved",
+  error: "Save failed",
+};
 
 export function ReaderPage() {
   const { id } = useParams();
@@ -19,51 +25,52 @@ export function ReaderPage() {
   const bookId = Number(id);
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [position, setPosition] = useState<ProgressBody | null>(null);
 
-  const timerRef = useRef<number | null>(null);
-  const pendingRef = useRef<ProgressBody | null>(null);
+  const valid = Number.isInteger(bookId) && bookId > 0;
+  const { onProgress, saveState } = useProgressSaver(valid ? bookId : 0);
+
+  const handleProgress = useCallback(
+    (progress: ProgressBody) => {
+      setPosition(progress);
+      onProgress(progress);
+    },
+    [onProgress],
+  );
 
   const detail = useQuery({
     queryKey: ["book", bookId],
     queryFn: () => api.getBook(bookId),
-    enabled: Number.isInteger(bookId) && bookId > 0,
+    enabled: valid,
   });
 
-  useEffect(() => saveSettings(settings), [settings]);
+  useEffect(() => {
+    saveSettings(settings);
+  }, [settings]);
 
-  const flushProgress = useCallback(() => {
-    if (timerRef.current != null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
+  // Escape closes the settings panel; focus moves into the panel when it
+  // opens and returns to the toggle button when it closes.
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const settingsPanelRef = useRef<HTMLDivElement>(null);
+  const wasOpenRef = useRef(false);
+  useEffect(() => {
+    if (settingsOpen) {
+      settingsPanelRef.current?.focus();
+    } else if (wasOpenRef.current) {
+      settingsButtonRef.current?.focus();
     }
-    const pending = pendingRef.current;
-    if (pending) {
-      pendingRef.current = null;
-      void api.putProgress(bookId, pending);
-    }
-  }, [bookId]);
+    wasOpenRef.current = settingsOpen;
+  }, [settingsOpen]);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settingsOpen]);
 
-  // Save the latest location on a debounce, and flush it on unmount so a
-  // reader closed mid-session still persists its place.
-  const onProgress = useCallback(
-    (progress: ProgressBody) => {
-      pendingRef.current = progress;
-      if (timerRef.current != null) return;
-      timerRef.current = window.setTimeout(() => {
-        timerRef.current = null;
-        const value = pendingRef.current;
-        if (value) {
-          pendingRef.current = null;
-          void api.putProgress(bookId, value);
-        }
-      }, SAVE_DELAY_MS);
-    },
-    [bookId],
-  );
-
-  useEffect(() => flushProgress, [flushProgress]);
-
-  if (!Number.isInteger(bookId) || bookId <= 0) {
+  if (!valid) {
     return <Navigate to="/" replace />;
   }
 
@@ -101,9 +108,18 @@ export function ReaderPage() {
           ← Library
         </button>
         <span className="reader-title">{book.title}</span>
+        {position && (
+          <span className="reader-position">{Math.round(position.percent)}%</span>
+        )}
+        {saveState !== "idle" && (
+          <span className={`save-indicator ${saveState}`} aria-live="polite">
+            {SAVE_LABELS[saveState]}
+          </span>
+        )}
         <span className="format-badge">{book.format}</span>
         <button
           type="button"
+          ref={settingsButtonRef}
           onClick={() => setSettingsOpen((open) => !open)}
           aria-expanded={settingsOpen}
           aria-label="Reader settings"
@@ -116,13 +132,26 @@ export function ReaderPage() {
           settings={settings}
           onChange={setSettings}
           onClose={() => setSettingsOpen(false)}
+          panelRef={settingsPanelRef}
         />
       )}
-      {book.format === "cbz" ? (
-        <ComicReader detail={book} onProgress={onProgress} />
-      ) : (
-        <FoliateTextReader detail={book} settings={settings} onProgress={onProgress} />
-      )}
+      <ErrorBoundary
+        key={book.id}
+        fallback={(error) => (
+          <div className="reader-error">
+            <p>{error.message || "This book could not be displayed."}</p>
+            <button type="button" onClick={() => navigate("/")}>
+              Back to library
+            </button>
+          </div>
+        )}
+      >
+        {book.format === "cbz" ? (
+          <ComicReader detail={book} onProgress={handleProgress} />
+        ) : (
+          <FoliateTextReader detail={book} settings={settings} onProgress={handleProgress} />
+        )}
+      </ErrorBoundary>
     </main>
   );
 }
@@ -131,10 +160,12 @@ function SettingsPanel({
   settings,
   onChange,
   onClose,
+  panelRef,
 }: {
   settings: ReaderSettings;
   onChange: (settings: ReaderSettings) => void;
   onClose: () => void;
+  panelRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const update = <K extends keyof ReaderSettings>(
     key: K,
@@ -146,7 +177,13 @@ function SettingsPanel({
     { value: "dark", label: "Dark" },
   ];
   return (
-    <div className="settings-panel" role="dialog" aria-label="Reader settings">
+    <div
+      className="settings-panel"
+      role="dialog"
+      aria-label="Reader settings"
+      tabIndex={-1}
+      ref={panelRef}
+    >
       <div className="settings-row">
         <label>
           <span>Font size</span>

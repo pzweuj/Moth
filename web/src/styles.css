@@ -136,6 +136,10 @@ footer span { color: #b7c7b2; margin: 0 8px; }
 .reader-top-bar button { background: transparent; border: 1px solid rgba(183, 199, 178, .28); border-radius: 1px; color: #c9d5c4; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 9px 12px; text-transform: uppercase; }
 .reader-top-bar button:hover:not(:disabled) { border-color: #c6dca3; color: #e1edca; }
 .reader-title { color: #e9e5dc; flex: 1; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-position { color: #7f8a7a; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
+.save-indicator { color: #7f8a7a; font: 600 10px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.save-indicator.saved { color: #8faf7d; }
+.save-indicator.error { color: #e5ad9b; }
 .reader-stage { display: flex; flex-direction: column; height: calc(100vh - 53px); position: relative; }
 .reader-host { flex: 1; min-height: 0; position: relative; }
 .reader-host foliate-view { display: block; height: 100%; width: 100%; }

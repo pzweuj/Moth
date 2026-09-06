@@ -12,7 +12,6 @@
   "dependencies": {
     "@tanstack/react-query": "^5.75.5",
     "@zip.js/zip.js": "^2.11.1",
-    "fflate": "^0.8.3",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.6.2"
