@@ -319,7 +319,9 @@ pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
 }
 
 fn title_from_xhtml(html: &str) -> Option<String> {
-    let re = regex::Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex");
+    static TITLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TITLE
+        .get_or_init(|| regex::Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex"));
     re.captures(html)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().trim().to_owned())

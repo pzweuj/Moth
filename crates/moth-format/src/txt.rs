@@ -1,6 +1,7 @@
 //! Plain-text parsing: encoding detection, decoding, and chapter splitting.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
@@ -10,19 +11,26 @@ use crate::{Chapter, ParseError, ParsedBook};
 
 /// Chapter heading markers, checked case-insensitively against a line. CJK
 /// covers 第N章/节/回/卷/部/篇; Latin covers chapter/part/volume/book/section.
-fn chapter_marker() -> Regex {
-    Regex::new(r"(?i)^\s*(chapter|part|volume|book|section)\s+[0-9ivxlcdm]+")
-        .expect("chapter marker")
+fn chapter_marker() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(chapter|part|volume|book|section)\s+[0-9ivxlcdm]+")
+            .expect("chapter marker")
+    })
 }
 
-fn cjk_marker() -> Regex {
-    Regex::new(r"^\s*第\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[章节回卷部篇]\b?")
-        .expect("cjk marker")
+fn cjk_marker() -> &'static Regex {
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        Regex::new(r"^\s*第\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[章节回卷部篇]\b?")
+            .expect("cjk marker")
+    })
 }
 
 /// A horizontal rule used to separate sections, e.g. `----` or `* * *`.
-fn separator() -> Regex {
-    Regex::new(r"^\s*([-*_＝=~]|\* ?\* ?\*){3,}\s*$").expect("separator")
+fn separator() -> &'static Regex {
+    static SEPARATOR: OnceLock<Regex> = OnceLock::new();
+    SEPARATOR.get_or_init(|| Regex::new(r"^\s*([-*_＝=~]|\* ?\* ?\*){3,}\s*$").expect("separator"))
 }
 
 /// A paragraph break is one or more blank lines.
@@ -152,16 +160,18 @@ fn strip_separators(body: &str) -> String {
 }
 
 /// Fixed-size chunking for continuous prose without any section markers.
+/// Lengths are counted in characters, not bytes, so CJK prose (3 bytes per
+/// character in UTF-8) produces the same chapter sizes as Latin text.
 fn chunked(lines: &[&str], text: &str) -> Vec<(String, String)> {
     let mut chapters: Vec<(String, String)> = Vec::new();
     let mut start = 0;
     let mut length = 0usize;
     for (index, line) in lines.iter().enumerate() {
-        length += line.len();
+        length += line.chars().count();
         if length >= MAX_CHAPTER_CHARS && index > start && !line.trim().is_empty() {
             chapters.push(("".to_owned(), lines[start..index].join("\n")));
             start = index;
-            length = line.len();
+            length = line.chars().count();
         }
     }
     if start < lines.len() {
@@ -306,6 +316,26 @@ mod tests {
         let text = "Part one\n\n----\n\nPart two";
         let chapters = split_chapters(text);
         assert_eq!(chapters.len(), 2);
+    }
+
+    #[test]
+    fn chunks_cjk_prose_by_character_count() {
+        // 200 lines of 100 CJK characters (300 UTF-8 bytes) each. Counted in
+        // characters this is 20,000 chars -> 3 chapters; counted in bytes it
+        // would be 60,000 bytes -> 8 chapters.
+        let line = "字".repeat(100);
+        let text = std::iter::repeat_n(line.as_str(), 200)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chapters = split_chapters(&text);
+        assert_eq!(chapters.len(), 3);
+        for chapter in &chapters[..2] {
+            let chars = chapter.1.chars().count();
+            assert!(
+                (MAX_CHAPTER_CHARS - 200..MAX_CHAPTER_CHARS).contains(&chars),
+                "unexpected chapter length: {chars}"
+            );
+        }
     }
 
     #[test]

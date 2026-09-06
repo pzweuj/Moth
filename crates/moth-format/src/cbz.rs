@@ -10,6 +10,19 @@ use crate::{Page, ParseError, ParsedBook};
 /// Image extensions accepted as comic pages.
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
+/// Skip macOS junk: `__MACOSX/` resource-fork directories and AppleDouble
+/// `._name` files carry metadata, not pages, and would otherwise sort first
+/// and become both page 0 and the cover.
+fn is_junk_entry(name: &str) -> bool {
+    let name = name.replace('\\', "/");
+    if name.starts_with("__MACOSX/") {
+        return true;
+    }
+    name.rsplit('/')
+        .next()
+        .is_some_and(|base| base.starts_with("._"))
+}
+
 fn mime_for(extension: &str) -> &'static str {
     match extension {
         "png" => "image/png",
@@ -74,6 +87,9 @@ pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
             continue;
         }
         let name = entry.name().replace('\\', "/");
+        if is_junk_entry(&name) {
+            continue;
+        }
         let Some(extension) = name.rsplit('.').next() else {
             continue;
         };
@@ -128,5 +144,15 @@ mod tests {
         let mut names = vec!["page_10.jpg", "page_2.jpg", "page_1.jpg"];
         names.sort_by(|a, b| natural_compare(a, b));
         assert_eq!(names, vec!["page_1.jpg", "page_2.jpg", "page_10.jpg"]);
+    }
+
+    #[test]
+    fn skips_macosx_and_appledouble_entries() {
+        assert!(is_junk_entry("__MACOSX/page_1.png"));
+        assert!(is_junk_entry("._page_1.jpg"));
+        assert!(is_junk_entry("comic/._page_2.png"));
+        assert!(!is_junk_entry("page_1.jpg"));
+        assert!(!is_junk_entry("comic/page_2.png"));
+        assert!(!is_junk_entry("comic/.hidden.jpg"));
     }
 }

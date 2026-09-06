@@ -3,24 +3,40 @@
 //! active content (scripts, embedded objects) removed.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use regex::Regex;
 
 use crate::resolve_reference;
 
+fn element_regex(name: &str) -> &'static Regex {
+    static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        ["script", "iframe", "object", "embed"]
+            .into_iter()
+            .map(|name| {
+                let pattern = format!(r"(?is)<{name}\b[^>]*>.*?</{name}\s*>");
+                (name, Regex::new(&pattern).expect("element regex"))
+            })
+            .collect()
+    });
+    cache.get(name).expect("cached element regex")
+}
+
 fn strip_elements(html: &str, names: &[&str]) -> String {
     let mut out = html.to_owned();
     for name in names {
-        let pattern = format!(r"(?is)<{name}\b[^>]*>.*?</{name}\s*>");
-        let re = Regex::new(&pattern).expect("element regex");
-        out = re.replace_all(&out, "").into_owned();
+        out = element_regex(name).replace_all(&out, "").into_owned();
     }
     out
 }
 
 fn strip_event_handlers(html: &str) -> String {
-    let re = Regex::new(r#"(?i)\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#)
-        .expect("event handler regex");
+    static HANDLERS: OnceLock<Regex> = OnceLock::new();
+    let re = HANDLERS.get_or_init(|| {
+        Regex::new(r#"(?i)\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#)
+            .expect("event handler regex")
+    });
     re.replace_all(html, "").into_owned()
 }
 
@@ -36,8 +52,10 @@ pub fn sanitize_and_rewrite(
     let stripped = strip_elements(html, &["script", "iframe", "object", "embed"]);
     let stripped = strip_event_handlers(&stripped);
 
-    let re =
-        Regex::new(r#"(?i)(src|href)\s*=\s*("([^"]*)"|'([^']*)')"#).expect("url attribute regex");
+    static URL_ATTRIBUTE: OnceLock<Regex> = OnceLock::new();
+    let re = URL_ATTRIBUTE.get_or_init(|| {
+        Regex::new(r#"(?i)(src|href)\s*=\s*("([^"]*)"|'([^']*)')"#).expect("url attribute regex")
+    });
     re.replace_all(&stripped, |caps: &regex::Captures<'_>| {
         let attribute = &caps[1];
         let value = caps

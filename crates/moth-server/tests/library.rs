@@ -301,6 +301,17 @@ async fn book_api_requires_login() {
 }
 
 #[tokio::test]
+async fn library_scan_requires_login() {
+    let (_temp, app) = build_app().await;
+    let response = app
+        .clone()
+        .oneshot(json_request(Method::POST, "/api/v1/library/scan", ""))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn txt_chapters_and_progress_roundtrip() {
     let (_temp, app) = build_app().await;
     let cookie = setup_and_login(&app).await;

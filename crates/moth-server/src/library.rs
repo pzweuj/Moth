@@ -12,11 +12,15 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use time::OffsetDateTime;
 
+use crate::auth::Authenticated;
 use crate::error::AppError;
 use crate::state::AppState;
 
 /// HTTP handler: kick off a background scan.
-pub async fn start_scan(State(state): State<AppState>) -> Result<(), AppError> {
+pub async fn start_scan(
+    State(state): State<AppState>,
+    _user: Authenticated,
+) -> Result<(), AppError> {
     start_scan_on(&state).await
 }
 
@@ -73,25 +77,39 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
             .unwrap_or_else(|_| path.to_string_lossy().into_owned());
         seen.push(relative.clone());
 
-        let (format, hash, size) = {
+        let (format, hashed) = {
             let path = path.clone();
-            tokio::task::spawn_blocking(
-                move || -> Result<(Option<BookFormat>, Option<String>, u64), AppError> {
-                    let format = BookFormat::from_path(&path);
-                    match hash_file(&path) {
-                        Ok((hash, size)) => Ok((format, Some(hash), size)),
-                        Err(error) => Err(error.into()),
-                    }
-                },
-            )
+            tokio::task::spawn_blocking(move || {
+                let format = BookFormat::from_path(&path);
+                let hashed = hash_file(&path).map_err(AppError::from);
+                (format, hashed)
+            })
             .await
-            .map_err(|error| AppError::Io(std::io::Error::other(error)))??
+            .map_err(|error| AppError::Io(std::io::Error::other(error)))?
         };
-        let (Some(format), Some(hash)) = (format, hash) else {
-            // The format was recognized during collection; a missing hash means
-            // the file became unreadable, so record it instead of dropping it.
-            state.scan_status.lock().await.errors += 1;
+        let Some(format) = format else {
+            // Unreachable in practice: collect_books only returns files whose
+            // extension named a supported format.
             continue;
+        };
+        let (hash, size) = match hashed {
+            Ok(values) => values,
+            Err(error) => {
+                // The file could not be read (removed mid-scan, permission
+                // changes, ...). Record it so the shelf shows the failure
+                // instead of silently dropping it.
+                store_parse_error(
+                    state,
+                    &relative,
+                    format,
+                    String::new(),
+                    0,
+                    &error.to_string(),
+                )
+                .await?;
+                bump_processed(state).await;
+                continue;
+            }
         };
 
         if is_unchanged(&state.db, &relative, &hash, size).await? {

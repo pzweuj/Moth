@@ -14,6 +14,21 @@ async fn main() -> Result<(), moth_server::error::AppError> {
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
+    // Purge expired sessions hourly; expired tokens are otherwise only
+    // removed when the exact token is replayed.
+    let purge_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            match moth_server::auth::purge_expired_sessions(&purge_state).await {
+                Ok(count) if count > 0 => tracing::info!(count, "purged expired sessions"),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "could not purge expired sessions"),
+            }
+        }
+    });
+
     // Index the library in the background on startup; the scan task is
     // short-lived and never blocks the server.
     tokio::spawn(async move {

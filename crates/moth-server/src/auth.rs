@@ -20,6 +20,8 @@ use crate::{error::AppError, state::AppState};
 pub const SESSION_COOKIE: &str = "moth_session";
 const MIN_PASSWORD_CHARS: usize = 10;
 const MAX_USERNAME_CHARS: usize = 64;
+/// Minimum gap between `last_used_at` refreshes for one session.
+const LAST_USED_REFRESH_SECS: i64 = 60;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Credentials {
@@ -143,7 +145,11 @@ async fn user_exists(state: &AppState) -> Result<bool, AppError> {
 }
 
 async fn create_user(state: &AppState, credentials: &Credentials) -> Result<(), AppError> {
-    let password_hash = hash_password(&credentials.password)?;
+    // Argon2 is deliberately slow; hash off the async runtime.
+    let password = credentials.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
     let timestamp = now_unix();
     let mut transaction = state.db.begin().await?;
 
@@ -181,13 +187,17 @@ async fn verify_user(state: &AppState, credentials: &Credentials) -> Result<bool
         return Ok(false);
     }
 
-    let parsed_hash = match PasswordHash::new(&password_hash) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-    Ok(Argon2::default()
-        .verify_password(credentials.password.as_bytes(), &parsed_hash)
-        .is_ok())
+    // Password verification runs off the async runtime; it is deliberately slow.
+    let password = credentials.password.clone();
+    let verified = tokio::task::spawn_blocking(move || match PasswordHash::new(&password_hash) {
+        Ok(parsed_hash) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok(),
+        Err(_) => false,
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    Ok(verified)
 }
 
 fn hash_password(password: &str) -> Result<String, AppError> {
@@ -223,7 +233,7 @@ async fn create_session(state: &AppState) -> Result<String, AppError> {
 async fn resolve_session(state: &AppState, token: &str) -> Result<Option<String>, AppError> {
     let token_hash = hash_token(token);
     let row = sqlx::query(
-        "SELECT a.username, s.expires_at FROM sessions s JOIN user_account a ON a.id = 1 WHERE s.token_hash = ?",
+        "SELECT a.username, s.expires_at, s.last_used_at FROM sessions s JOIN user_account a ON a.id = 1 WHERE s.token_hash = ?",
     )
     .bind(&token_hash)
     .fetch_optional(&state.db)
@@ -239,11 +249,16 @@ async fn resolve_session(state: &AppState, token: &str) -> Result<Option<String>
     }
 
     let username: String = row.try_get("username")?;
-    sqlx::query("UPDATE sessions SET last_used_at = ? WHERE token_hash = ?")
-        .bind(now_unix())
-        .bind(token_hash)
-        .execute(&state.db)
-        .await?;
+    let last_used_at: i64 = row.try_get("last_used_at")?;
+    // Refresh the marker at most once per throttle window so an authenticated
+    // request does not turn into a write on every call.
+    if now_unix().saturating_sub(last_used_at) >= LAST_USED_REFRESH_SECS {
+        sqlx::query("UPDATE sessions SET last_used_at = ? WHERE token_hash = ?")
+            .bind(now_unix())
+            .bind(token_hash)
+            .execute(&state.db)
+            .await?;
+    }
     Ok(Some(username))
 }
 
@@ -408,6 +423,85 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn last_used_at_refresh_is_throttled() {
+        let (_temp, state) = test_state().await;
+        let credentials = Credentials {
+            username: "moth".to_owned(),
+            password: "a secure password".to_owned(),
+        };
+        create_user(&state, &credentials).await.expect("setup");
+        let token = create_session(&state).await.expect("session");
+
+        // A fresh session was just touched: resolving again must not move it.
+        let before: i64 = sqlx::query_scalar("SELECT last_used_at FROM sessions")
+            .fetch_one(&state.db)
+            .await
+            .expect("timestamp");
+        assert_eq!(
+            resolve_session(&state, &token)
+                .await
+                .expect("resolve")
+                .as_deref(),
+            Some("moth")
+        );
+        let after: i64 = sqlx::query_scalar("SELECT last_used_at FROM sessions")
+            .fetch_one(&state.db)
+            .await
+            .expect("timestamp");
+        assert_eq!(before, after);
+
+        // Once the throttle window has passed, the marker is refreshed again.
+        let stale = now_unix() - LAST_USED_REFRESH_SECS - 1;
+        sqlx::query("UPDATE sessions SET last_used_at = ?")
+            .bind(stale)
+            .execute(&state.db)
+            .await
+            .expect("backdate");
+        assert_eq!(
+            resolve_session(&state, &token)
+                .await
+                .expect("resolve")
+                .as_deref(),
+            Some("moth")
+        );
+        let refreshed: i64 = sqlx::query_scalar("SELECT last_used_at FROM sessions")
+            .fetch_one(&state.db)
+            .await
+            .expect("timestamp");
+        assert!(refreshed >= stale);
+    }
+
+    #[tokio::test]
+    async fn purge_expired_sessions_removes_only_expired_rows() {
+        let (_temp, state) = test_state().await;
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, created_at, expires_at, last_used_at) VALUES (?, 0, 0, 0)",
+        )
+        .bind(hash_token("expired"))
+        .execute(&state.db)
+        .await
+        .expect("expired row");
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(hash_token("live"))
+        .bind(now_unix())
+        .bind(now_unix() + 3600)
+        .bind(now_unix())
+        .execute(&state.db)
+        .await
+        .expect("live row");
+
+        let purged = purge_expired_sessions(&state).await.expect("purge");
+        assert_eq!(purged, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&state.db)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
     }
 
     #[test]
