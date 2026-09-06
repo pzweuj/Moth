@@ -6,7 +6,7 @@ use std::path::Path;
 use axum::{
     Json,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -368,21 +368,59 @@ fn content_type_for_format(format: &str) -> &'static str {
     }
 }
 
+#[derive(Deserialize)]
+pub struct ChapterQuery {
+    /// Optional explicit encoding label for TXT books (`utf-8`, `gb18030`,
+    /// `gbk`, `big5`, `utf-16le`, `utf-16be`). When set, the chapter is
+    /// re-decoded from the original file with that encoding instead of the
+    /// auto-detected one the scan used.
+    pub encoding: Option<String>,
+}
+
 pub async fn get_chapter(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
+    Query(query): Query<ChapterQuery>,
 ) -> Result<Json<ChapterContent>, AppError> {
-    let row = sqlx::query("SELECT title, content FROM chapters WHERE book_id = ? AND idx = ?")
-        .bind(book_id)
-        .bind(idx)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT b.format, b.relative_path, c.title, c.content \
+         FROM chapters c JOIN books b ON b.id = c.book_id \
+         WHERE c.book_id = ? AND c.idx = ?",
+    )
+    .bind(book_id)
+    .bind(idx)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound)?;
+    let format: String = row.try_get("format")?;
+
+    let (title, content) = if format == "txt" && query.encoding.is_some() {
+        // The stored chapters were rendered with the detected encoding. For a
+        // manual override, re-read the original file, re-decode it, and serve
+        // the requested chapter so a wrong guess is fixed without a rescan.
+        let relative_path: String = row.try_get("relative_path")?;
+        let path = state.config.books_dir.join(&relative_path);
+        let encoding = query.encoding.clone().unwrap_or_default();
+        let book = tokio::task::spawn_blocking(move || {
+            moth_format::txt::parse_with_encoding(&path, Some(&encoding))
+        })
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?
+        .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))?;
+        let chapter = book
+            .chapters
+            .get(idx as usize)
+            .ok_or_else(|| AppError::NotFound)?;
+        (chapter.title.clone(), chapter.content.clone())
+    } else {
+        (row.try_get("title")?, row.try_get("content")?)
+    };
+
     Ok(Json(ChapterContent {
         idx,
-        title: row.try_get("title")?,
-        content: row.try_get("content")?,
+        title,
+        content,
     }))
 }
 

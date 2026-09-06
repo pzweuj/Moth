@@ -75,7 +75,13 @@ describe("TextPublication", () => {
     const publication = new TextPublication(detail);
     const url = await publication.sections[1].load();
     expect(url).toBe("blob:mock-url");
-    expect(api.getChapter).toHaveBeenCalledWith(7, 1);
+    expect(api.getChapter).toHaveBeenCalledWith(7, 1, undefined);
+  });
+
+  it("passes an explicit encoding to the chapter API", async () => {
+    const publication = new TextPublication(detail, "gb18030");
+    await publication.sections[0].load();
+    expect(api.getChapter).toHaveBeenCalledWith(7, 0, "gb18030");
   });
 
   it("caches blob URLs across loads and revokes on destroy", async () => {

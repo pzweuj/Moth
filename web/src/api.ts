@@ -113,8 +113,10 @@ export const api = {
   logout: () => request<void>("/session", { method: "DELETE" }),
   getBooks: () => request<BookSummary[]>("/books"),
   getBook: (id: number) => request<BookDetail>(`/books/${id}`),
-  getChapter: (id: number, idx: number) =>
-    request<ChapterContent>(`/books/${id}/chapter/${idx}`),
+  getChapter: (id: number, idx: number, encoding?: string) =>
+    request<ChapterContent>(
+      `/books/${id}/chapter/${idx}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`,
+    ),
   getProgress: (id: number) => request<ProgressBody>(`/books/${id}/progress`),
   putProgress: (id: number, progress: ProgressBody) =>
     request<void>(`/books/${id}/progress`, {

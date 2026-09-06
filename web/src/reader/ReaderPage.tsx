@@ -19,12 +19,24 @@ const SAVE_LABELS: Record<string, string> = {
   error: "Save failed",
 };
 
+/** TXT encoding options offered to the reader when auto-detection is wrong. */
+export const TXT_ENCODINGS = [
+  { value: "", label: "Auto" },
+  { value: "utf-8", label: "UTF-8" },
+  { value: "gb18030", label: "GB18030" },
+  { value: "gbk", label: "GBK" },
+  { value: "big5", label: "Big5" },
+  { value: "utf-16le", label: "UTF-16LE" },
+  { value: "utf-16be", label: "UTF-16BE" },
+] as const;
+
 export function ReaderPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const bookId = Number(id);
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [encoding, setEncoding] = useState("");
   const [position, setPosition] = useState<ProgressBody | null>(null);
 
   const valid = Number.isInteger(bookId) && bookId > 0;
@@ -133,6 +145,9 @@ export function ReaderPage() {
           onChange={setSettings}
           onClose={() => setSettingsOpen(false)}
           panelRef={settingsPanelRef}
+          showEncoding={book.format === "txt"}
+          encoding={encoding}
+          onEncodingChange={setEncoding}
         />
       )}
       <ErrorBoundary
@@ -149,7 +164,12 @@ export function ReaderPage() {
         {book.format === "cbz" ? (
           <ComicReader detail={book} onProgress={handleProgress} />
         ) : (
-          <FoliateTextReader detail={book} settings={settings} onProgress={handleProgress} />
+          <FoliateTextReader
+            detail={book}
+            settings={settings}
+            encoding={encoding}
+            onProgress={handleProgress}
+          />
         )}
       </ErrorBoundary>
     </main>
@@ -161,11 +181,17 @@ function SettingsPanel({
   onChange,
   onClose,
   panelRef,
+  showEncoding,
+  encoding,
+  onEncodingChange,
 }: {
   settings: ReaderSettings;
   onChange: (settings: ReaderSettings) => void;
   onClose: () => void;
   panelRef: React.RefObject<HTMLDivElement | null>;
+  showEncoding: boolean;
+  encoding: string;
+  onEncodingChange: (encoding: string) => void;
 }) {
   const update = <K extends keyof ReaderSettings>(
     key: K,
@@ -241,6 +267,23 @@ function SettingsPanel({
           ))}
         </div>
       </div>
+      {showEncoding && (
+        <div className="settings-row">
+          <label>
+            <span>Encoding</span>
+            <select
+              value={encoding}
+              onChange={(event) => onEncodingChange(event.target.value)}
+            >
+              {TXT_ENCODINGS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
       <button type="button" className="settings-close" onClick={onClose}>
         Done
       </button>

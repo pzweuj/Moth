@@ -225,10 +225,42 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Decode bytes with a specific encoding label (`utf-8`, `gb18030`, `gbk`,
+/// `big5`, `utf-16le`, `utf-16be`). Unknown labels fall back to auto-detection
+/// so a bad client value never fails a read.
+pub fn decode_with(label: &str, bytes: &[u8]) -> String {
+    let encoding = match label.to_ascii_lowercase().as_str() {
+        "utf-8" => UTF_8,
+        "gb18030" => encoding_rs::GB18030,
+        "gbk" => encoding_rs::GBK,
+        "big5" => encoding_rs::BIG5,
+        "utf-16le" => UTF_16LE,
+        "utf-16be" => UTF_16BE,
+        _ => return decode(bytes),
+    };
+    let (decoded, _, had_errors) = encoding.decode(bytes);
+    if had_errors {
+        // Fall back rather than failing to render a book.
+        decode(bytes)
+    } else {
+        decoded.into_owned()
+    }
+}
+
 /// Parse a plain-text book.
 pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
+    parse_with_encoding(path, None)
+}
+
+/// Parse a plain-text book, optionally decoding with an explicit encoding
+/// label (see [`decode_with`]) instead of auto-detection.
+pub fn parse_with_encoding(path: &Path, encoding: Option<&str>) -> Result<ParsedBook, ParseError> {
     let bytes = std::fs::read(path)?;
-    let text = normalize(&decode(&bytes));
+    let decoded = match encoding {
+        Some(label) => decode_with(label, &bytes),
+        None => decode(&bytes),
+    };
+    let text = normalize(&decoded);
     if text.trim().is_empty() {
         return Err(ParseError::NoContent);
     }
@@ -336,6 +368,27 @@ mod tests {
                 "unexpected chapter length: {chars}"
             );
         }
+    }
+
+    #[test]
+    fn decodes_legacy_encodings_by_label() {
+        // "中文" encoded in the three CJK encodings.
+        let utf8 = "中文".as_bytes().to_vec();
+        assert_eq!(decode_with("utf-8", &utf8), "中文");
+
+        let gb18030 = [0xD6, 0xD0, 0xCE, 0xC4];
+        assert_eq!(decode_with("gb18030", &gb18030), "中文");
+        assert_eq!(decode_with("gbk", &gb18030), "中文");
+
+        let big5 = [0xA4, 0xA4, 0xA4, 0xE5];
+        assert_eq!(decode_with("big5", &big5), "中文");
+
+        // BOM-free UTF-16LE with an explicit label.
+        let utf16le = [0x2D, 0x4E, 0x87, 0x65];
+        assert_eq!(decode_with("utf-16le", &utf16le), "中文");
+
+        // An unknown label falls back to auto-detection (UTF-8 here).
+        assert_eq!(decode_with("bogus", &utf8), "中文");
     }
 
     #[test]

@@ -174,6 +174,7 @@ footer span { color: #b7c7b2; margin: 0 8px; }
 .settings-panel { background: #101316; border: 1px solid rgba(183, 199, 178, .2); box-shadow: 0 18px 60px rgba(0, 0, 0, .4); display: grid; gap: 16px; padding: 22px; position: absolute; right: 18px; top: 58px; width: min(340px, 88vw); z-index: 6; }
 .settings-row > label, .settings-row > span { align-items: center; color: #c9d5c4; display: flex; flex-wrap: wrap; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; gap: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .settings-row input[type="range"] { accent-color: #c6dca3; flex: 1 1 160px; min-width: 120px; }
+.settings-row select { background: #14181b; border: 1px solid rgba(183, 199, 178, .28); border-radius: 1px; color: #c9d5c4; font: 600 11px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; padding: 8px 10px; text-transform: uppercase; }
 .settings-row output { color: #b7c7b2; font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .theme-options { display: flex; gap: 8px; }
 .theme-options button { background: transparent; border: 1px solid rgba(183, 199, 178, .26); border-radius: 100px; color: #aeb5ad; font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; padding: 8px 12px; text-transform: uppercase; }

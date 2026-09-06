@@ -14,6 +14,9 @@ interface TextSection {
  * text books paginate through the same renderer as EPUB and MOBI. Each section
  * `load()` fetches the server-rendered chapter HTML and exposes it as a blob
  * URL for the paginator.
+ *
+ * `encoding` is an optional override for the server-side TXT decoder; changing
+ * it re-decodes chapters from the original file without a rescan.
  */
 export class TextPublication {
   readonly sections: TextSection[];
@@ -22,8 +25,13 @@ export class TextPublication {
   readonly dir = "ltr";
 
   #blobs = new Map<string, string>();
+  #encoding: string | undefined;
 
-  constructor(private readonly detail: BookDetail) {
+  constructor(
+    private readonly detail: BookDetail,
+    encoding?: string,
+  ) {
+    this.#encoding = encoding;
     this.metadata = { title: detail.title };
     this.sections = detail.chapters.map((chapter) => {
       const id = String(chapter.idx);
@@ -74,7 +82,7 @@ export class TextPublication {
   async #load(id: string): Promise<string> {
     const cached = this.#blobs.get(id);
     if (cached) return cached;
-    const chapter = await api.getChapter(this.detail.id, Number(id));
+    const chapter = await api.getChapter(this.detail.id, Number(id), this.#encoding);
     const html = wrapChapter(chapter.title, chapter.content);
     const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
     this.#blobs.set(id, url);

@@ -29,6 +29,17 @@ fn write_txt(dir: &Path) {
     std::fs::write(dir.join("novel.txt"), content).expect("write txt");
 }
 
+fn write_gbk_txt(path: &Path) {
+    // "第一章 出发\n\n编码测试\n\n第二章 路上\n\n正确解码。\n" GBK-encoded.
+    let bytes = [
+        0xB5, 0xDA, 0xD2, 0xBB, 0xD5, 0xC2, 0x20, 0xB3, 0xF6, 0xB7, 0xA2, 0x0A, 0x0A, 0xB1, 0xE0,
+        0xC2, 0xEB, 0xB2, 0xE2, 0xCA, 0xD4, 0x0A, 0x0A, 0xB5, 0xDA, 0xB6, 0xFE, 0xD5, 0xC2, 0x20,
+        0xC2, 0xB7, 0xC9, 0xCF, 0x0A, 0x0A, 0xD5, 0xFD, 0xC8, 0xB7, 0xBD, 0xE2, 0xC2, 0xEB, 0xA1,
+        0xA3, 0x0A,
+    ];
+    std::fs::write(path, bytes).expect("write gbk txt");
+}
+
 fn write_cbz(path: &Path) {
     let file = std::fs::File::create(path).expect("create cbz");
     let mut zip = zip::ZipWriter::new(file);
@@ -309,6 +320,57 @@ async fn library_scan_requires_login() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn txt_chapter_supports_manual_encoding_override() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let books = temp.path().join("books");
+    std::fs::create_dir_all(&books).expect("books dir");
+    write_gbk_txt(&books.join("legacy.txt"));
+
+    let mut config = Config::for_test(temp.path().join("data"));
+    config.books_dir = books;
+    let pool = db::connect(&config).await.expect("database");
+    let app = router(moth_server::state::AppState::new(config, pool));
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+
+    let books = list_books(&app, &cookie).await;
+    let txt = find_book(&books, "txt");
+    let id = txt["id"].as_i64().expect("id");
+
+    // Without an override the auto-detected chapters are served as stored.
+    let chapter = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}/chapter/0"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("chapter");
+    assert_eq!(chapter.status(), StatusCode::OK);
+
+    // With ?encoding=gb18030 the chapter is re-decoded from the original file.
+    let chapter = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}/chapter/0?encoding=gb18030"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("chapter");
+    let chapter = response_json(chapter).await;
+    assert!(
+        chapter["content"]
+            .as_str()
+            .expect("content")
+            .contains("编码测试")
+    );
 }
 
 #[tokio::test]

@@ -11,6 +11,8 @@ import type { ReaderSettings } from "./settings";
 interface FoliateTextReaderProps {
   detail: BookDetail;
   settings: ReaderSettings;
+  /** Optional explicit encoding for TXT decoding (reparses on change). */
+  encoding?: string;
   onProgress: (progress: ProgressBody) => void;
 }
 
@@ -23,6 +25,7 @@ interface FoliateTextReaderProps {
 export function FoliateTextReader({
   detail,
   settings,
+  encoding,
   onProgress,
 }: FoliateTextReaderProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -42,7 +45,8 @@ export function FoliateTextReader({
     if (!host) return;
     let cancelled = false;
     let view: FoliateViewElement | null = null;
-    const publication = detail.format === "txt" ? new TextPublication(detail) : null;
+    const publication =
+      detail.format === "txt" ? new TextPublication(detail, encoding) : null;
     publicationRef.current = publication;
 
     const open = async () => {
@@ -129,7 +133,9 @@ export function FoliateTextReader({
       publication?.destroy();
       publicationRef.current = null;
     };
-  }, [detail]);
+    // `encoding` reopens the book so a manual TXT encoding change takes effect
+    // immediately. `detail` carries the book identity and progress.
+  }, [detail, encoding]);
 
   // Apply setting changes to the open renderer.
   useEffect(() => {
