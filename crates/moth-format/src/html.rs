@@ -1,0 +1,105 @@
+//! Sanitizing and URL rewriting for EPUB chapter XHTML. Chapters are stored
+//! server-side with internal resource URLs rewritten to served endpoints, and
+//! active content (scripts, embedded objects) removed.
+
+use std::collections::HashMap;
+
+use regex::Regex;
+
+use crate::resolve_reference;
+
+fn strip_elements(html: &str, names: &[&str]) -> String {
+    let mut out = html.to_owned();
+    for name in names {
+        let pattern = format!(r"(?is)<{name}\b[^>]*>.*?</{name}\s*>");
+        let re = Regex::new(&pattern).expect("element regex");
+        out = re.replace_all(&out, "").into_owned();
+    }
+    out
+}
+
+fn strip_event_handlers(html: &str) -> String {
+    let re = Regex::new(r#"(?i)\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#)
+        .expect("event handler regex");
+    re.replace_all(html, "").into_owned()
+}
+
+/// Remove active content and rewrite internal `src`/`href` references to the
+/// resource endpoint prefix. References that are not in `resources` are left
+/// unchanged; absolute and scheme URLs are never rewritten.
+pub fn sanitize_and_rewrite(
+    html: &str,
+    base_dir: &str,
+    resources: &HashMap<String, usize>,
+    prefix: &str,
+) -> String {
+    let stripped = strip_elements(html, &["script", "iframe", "object", "embed"]);
+    let stripped = strip_event_handlers(&stripped);
+
+    let re =
+        Regex::new(r#"(?i)(src|href)\s*=\s*("([^"]*)"|'([^']*)')"#).expect("url attribute regex");
+    re.replace_all(&stripped, |caps: &regex::Captures<'_>| {
+        let attribute = &caps[1];
+        let value = caps
+            .get(3)
+            .map(|m| m.as_str())
+            .or_else(|| caps.get(4).map(|m| m.as_str()))
+            .unwrap_or_default();
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("data:")
+            || trimmed.starts_with("mailto:")
+        {
+            return caps[0].to_owned();
+        }
+        let resolved = resolve_reference(base_dir, trimmed);
+        if let Some(index) = resources.get(&resolved) {
+            format!(r#"{attribute}="{prefix}/{index}""#)
+        } else {
+            caps[0].to_owned()
+        }
+    })
+    .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map() -> HashMap<String, usize> {
+        let mut map = HashMap::new();
+        map.insert("OEBPS/Images/x.jpg".to_owned(), 0);
+        map.insert("OEBPS/css/main.css".to_owned(), 1);
+        map
+    }
+
+    #[test]
+    fn rewrites_relative_resources() {
+        let html = r#"<html><body><img src="../Images/x.jpg"/><link rel="stylesheet" href="../css/main.css"/></body></html>"#;
+        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/api/v1/books/1/resource");
+        assert!(out.contains(r#"src="/api/v1/books/1/resource/0""#));
+        assert!(out.contains(r#"href="/api/v1/books/1/resource/1""#));
+    }
+
+    #[test]
+    fn leaves_external_and_fragment_urls() {
+        let html = r##"<a href="#note">n</a><img src="https://x/y.png"/><img src="data:image/png;base64,aa"/>"##;
+        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/resource");
+        assert!(out.contains(r##"href="#note""##));
+        assert!(out.contains(r#"src="https://x/y.png""#));
+        assert!(out.contains(r#"src="data:image/png;base64,aa""#));
+    }
+
+    #[test]
+    fn strips_active_content() {
+        let html = r#"<p onclick="evil()">x</p><script>alert(1)</script><iframe src="https://evil"></iframe>"#;
+        let out = sanitize_and_rewrite(html, "", &HashMap::new(), "/resource");
+        assert!(!out.contains("<script"));
+        assert!(!out.contains("<iframe"));
+        assert!(!out.contains("onclick"));
+        assert!(out.contains("<p>x</p>"));
+    }
+}

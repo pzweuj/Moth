@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/moth-server", "crates/moth-format"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+axum = "0.8.4"
+argon2 = "0.5.3"
+axum-extra = { version = "0.10.3", features = ["cookie"] }
+base64 = "0.22.1"
+chardetng = "1.0.0"
+encoding_rs = "0.8.35"
+hex = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+mobi = "0.8.0"
+moth-format = { path = "crates/moth-format" }
+quick-xml = "0.42.0"
+rand = "0.8.5"
+regex = "1.13.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["full"] }
+time = "0.3.41"
+tower-http = { version = "0.6.6", features = ["fs", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+zip = "8.0.0"

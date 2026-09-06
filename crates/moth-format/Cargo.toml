@@ -1,0 +1,17 @@
+[package]
+name = "moth-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Book parsing for Moth: EPUB, MOBI, CBZ, and TXT."
+
+[dependencies]
+chardetng = { workspace = true }
+encoding_rs = { workspace = true }
+image = { workspace = true }
+mobi = { workspace = true }
+quick-xml = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }
