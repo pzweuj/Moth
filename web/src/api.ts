@@ -1,10 +1,12 @@
 import {
   acknowledgeProgress,
   clearOfflineData,
+  clearOfflineContent,
   drainOfflineWrites,
   freezeOfflineStorage,
   getOfflineBook,
   getOfflineBooks,
+  getOfflineSections,
   getOfflineChapter,
   getOfflinePage,
   getOfflineResource,
@@ -14,6 +16,7 @@ import {
   removePendingProgress,
   reconcileOfflineInstance,
   saveOfflineBookSummary,
+  saveOfflineSections,
   saveOfflineCover,
   saveOfflinePage,
   saveOfflineChapter,
@@ -48,6 +51,32 @@ export type BookSummary = {
   file_size: number;
   /** Present for local shelf entries that have at least one cached unit. */
   cached_content?: boolean;
+  section_id?: number;
+  section_name?: string;
+  series_id?: number;
+  series_name?: string;
+  series_order?: number;
+  missing?: boolean;
+};
+
+export type SeriesSummary = {
+  id: number;
+  name: string;
+  section_id: number;
+  sort_order: number;
+  book_count: number;
+  cover_url?: string;
+  books: BookSummary[];
+};
+
+export type SectionSummary = {
+  id: number;
+  name: string;
+  sort_order: number;
+  is_system: boolean;
+  book_count: number;
+  series: SeriesSummary[];
+  books: BookSummary[];
 };
 
 export type ChapterInfo = {
@@ -334,7 +363,7 @@ function mayUseCachedContent(error: unknown): boolean {
   return offline()
     || error instanceof TypeError
     || (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "AbortError")
-    || (error instanceof ApiError && (error.status === 401 || error.status === 403 || error.status >= 500));
+    || (error instanceof ApiError && (error.status === 401 || error.status === 403 || error.status === 404 || error.status >= 500));
 }
 
 /**
@@ -561,22 +590,112 @@ export const api = {
       return false;
     }
   },
-  getBooks: async () => {
+  getBooks: async (filters?: { section_id?: number; series_id?: number }) => {
+    const params = new URLSearchParams();
+    if (filters?.section_id !== undefined) params.set("section_id", String(filters.section_id));
+    if (filters?.series_id !== undefined) params.set("series_id", String(filters.series_id));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
     try {
-      const books = await request<BookSummary[]>("/books");
+      const books = await request<BookSummary[]>(`/books${suffix}`);
       await Promise.all(books.map((book) => saveOfflineBookSummary(book).catch(() => undefined)));
       return books;
     } catch (error) {
       if (!mayUseCachedContent(error)) throw error;
       try {
-        const cached = await getOfflineBooks();
-        if (cached.length > 0 || offline()) return cached;
+      const cached = await getOfflineBooks();
+        const filtered = cached.filter((book) =>
+          (filters?.section_id === undefined || book.section_id === filters.section_id)
+          && (filters?.series_id === undefined || book.series_id === filters.series_id),
+        );
+        if (filtered.length > 0 || offline()) return filtered;
       } catch {
         // Preserve the original network/API error when local storage is unavailable.
       }
       throw error;
     }
   },
+  clearOfflineContent: () => clearOfflineContent(),
+  getSections: async () => {
+    const asFallback = async (): Promise<SectionSummary[]> => {
+      const [snapshot, books] = await Promise.all([
+        getOfflineSections().catch(() => null),
+        getOfflineBooks().catch(() => []),
+      ]);
+      if (snapshot && Array.isArray(snapshot)) {
+        const cached = new Map(books.map((book) => [book.id, book]));
+        return snapshot
+          .map((section) => {
+            const sectionBooks = section.books.filter((book) => cached.has(book.id));
+            const series = section.series.map((item) => {
+              const seriesBooks = item.books.filter((book) => cached.has(book.id));
+              return { ...item, books: seriesBooks, book_count: seriesBooks.length };
+            });
+            return {
+              ...section,
+              books: sectionBooks,
+              series,
+              book_count: sectionBooks.length + series.reduce((total, item) => total + item.book_count, 0),
+            };
+          })
+          .filter((section) => section.books.length > 0 || section.series.some((series) => series.books.length > 0) || section.is_system);
+      }
+      return [{
+        id: 0,
+        name: "Unclassified",
+        sort_order: 0,
+        is_system: true,
+        book_count: books.length,
+        series: [],
+        books,
+      }];
+    };
+    try {
+      const sections = await request<unknown>("/sections");
+      if (!Array.isArray(sections)) return asFallback();
+      const typed = sections as SectionSummary[];
+      await saveOfflineSections(typed).catch(() => undefined);
+      await Promise.all(typed.flatMap((section) => [
+        ...section.books.map((book) => saveOfflineBookSummary(book)),
+        ...section.series.flatMap((series) => series.books.map((book) => saveOfflineBookSummary(book))),
+      ].map((promise) => promise.catch(() => undefined))));
+      return typed;
+    } catch (error) {
+      if (!mayUseCachedContent(error)) throw error;
+      return asFallback();
+    }
+  },
+  createSection: (name: string) => request<SectionSummary>("/sections", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  }),
+  updateSection: (id: number, patch: { name?: string; sort_order?: number }) => request<SectionSummary>(`/sections/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  }),
+  deleteSection: (id: number) => request<void>(`/sections/${id}`, { method: "DELETE" }),
+  reorderSections: (ids: number[]) => request<void>("/sections/reorder", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  }),
+  createSeries: (name: string, section_id: number) => request<SeriesSummary>("/series", {
+    method: "POST",
+    body: JSON.stringify({ name, section_id }),
+  }),
+  getSeries: (id: number) => request<SeriesSummary>(`/series/${id}`),
+  updateSeries: (id: number, patch: { name?: string; section_id?: number; sort_order?: number }) => request<SeriesSummary>(`/series/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  }),
+  deleteSeries: (id: number) => request<void>(`/series/${id}`, { method: "DELETE" }),
+  organizeBooks: (book_ids: number[], target: { section_id?: number; series_id?: number }) => request<void>("/books/organize", {
+    method: "POST",
+    body: JSON.stringify({ book_ids, ...target }),
+  }),
+  reorderSeriesBooks: (id: number, ids: number[]) => request<void>(`/series/${id}/books/reorder`, {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  }),
+  deleteMissingBook: (id: number) => request<void>(`/books/${id}`, { method: "DELETE" }),
   getBook: async (id: number, encoding?: string) => {
     const suffix = encoding ? `?encoding=${encodeURIComponent(encoding)}` : "";
     try {

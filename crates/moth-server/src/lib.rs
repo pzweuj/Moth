@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod library;
+pub mod organization;
 pub mod state;
 
 use axum::{
@@ -38,7 +39,44 @@ pub fn router(state: AppState) -> Router {
                 .delete(auth::logout),
         )
         .route("/books", get(books::list_books))
-        .route("/books/{id}", get(books::get_book))
+        .route(
+            "/books/{id}",
+            get(books::get_book).delete(organization::delete_missing_book),
+        )
+        .route(
+            "/sections",
+            get(organization::list_sections).post(organization::create_section),
+        )
+        .route(
+            "/sections/reorder",
+            axum::routing::post(organization::reorder_sections),
+        )
+        .route(
+            "/sections/{id}",
+            get(organization::get_section)
+                .patch(organization::update_section)
+                .put(organization::update_section)
+                .delete(organization::delete_section),
+        )
+        .route(
+            "/series",
+            get(organization::list_series).post(organization::create_series),
+        )
+        .route(
+            "/series/{id}",
+            get(organization::get_series)
+                .patch(organization::update_series)
+                .put(organization::update_series)
+                .delete(organization::delete_series),
+        )
+        .route(
+            "/series/{id}/books/reorder",
+            axum::routing::post(organization::reorder_series_books),
+        )
+        .route(
+            "/books/organize",
+            axum::routing::post(organization::organize_books),
+        )
         .route(
             "/books/{id}/offline-manifest",
             get(books::get_offline_manifest),

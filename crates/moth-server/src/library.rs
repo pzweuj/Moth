@@ -91,6 +91,14 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
     state.scan_status.lock().await.total = files.len() as u64;
 
     let mut seen: Vec<String> = Vec::with_capacity(files.len());
+    let collected_relatives: HashSet<String> = files
+        .iter()
+        .filter_map(|path| {
+            path.strip_prefix(&books_dir)
+                .ok()
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
     for path in files {
         let relative = path
             .strip_prefix(&books_dir)
@@ -128,6 +136,13 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
                 continue;
             }
         };
+
+        // A unique content match whose old path is absent from this complete
+        // enumeration is treated as a move/rename. The existing row (and its
+        // manually managed classification and progress) is retained. Multiple
+        // candidates are deliberately left alone so duplicate files are never
+        // silently merged.
+        adopt_moved_book(state, &relative, &hash, size, format, &collected_relatives).await?;
 
         if is_unchanged(&state.db, &relative, &hash, size).await? {
             bump_processed(state).await;
@@ -316,17 +331,19 @@ async fn is_unchanged(
     hash: &str,
     size: u64,
 ) -> Result<bool, AppError> {
-    let row =
-        sqlx::query("SELECT sha256, file_size, parse_status FROM books WHERE relative_path = ?")
-            .bind(relative)
-            .fetch_optional(db)
-            .await?;
+    let row = sqlx::query(
+        "SELECT sha256, file_size, parse_status, missing FROM books WHERE relative_path = ?",
+    )
+    .bind(relative)
+    .fetch_optional(db)
+    .await?;
     Ok(match row {
         Some(row) => {
             let existing_hash: String = row.try_get("sha256")?;
             let existing_size: i64 = row.try_get("file_size")?;
             let status: String = row.try_get("parse_status")?;
-            existing_hash == hash && existing_size == size as i64 && status == "ok"
+            let missing: bool = row.try_get("missing")?;
+            existing_hash == hash && existing_size == size as i64 && status == "ok" && !missing
         }
         None => false,
     })
@@ -334,6 +351,54 @@ async fn is_unchanged(
 
 fn now_unix() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+async fn adopt_moved_book(
+    state: &AppState,
+    relative: &str,
+    hash: &str,
+    size: u64,
+    format: BookFormat,
+    present_paths: &HashSet<String>,
+) -> Result<(), AppError> {
+    // A row already using this path wins; the caller will update it normally.
+    let path_exists: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM books WHERE relative_path = ?")
+            .bind(relative)
+            .fetch_optional(&state.db)
+            .await?;
+    if path_exists.is_some() {
+        return Ok(());
+    }
+    let candidates: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, relative_path FROM books WHERE sha256 = ? AND file_size = ? AND format = ?",
+    )
+    .bind(hash)
+    .bind(size as i64)
+    .bind(format.as_str())
+    .fetch_all(&state.db)
+    .await?;
+    let candidates: Vec<(i64, String)> = candidates
+        .into_iter()
+        .filter(|(_, old_path)| !present_paths.contains(old_path))
+        .collect();
+    if candidates.len() != 1 {
+        return Ok(());
+    }
+    let (id, old_path) = &candidates[0];
+    sqlx::query("UPDATE books SET relative_path = ?, missing = 0, updated_at = ? WHERE id = ?")
+        .bind(relative)
+        .bind(now_unix())
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    tracing::info!(book_id = id, old_path = %old_path, new_path = %relative, "adopted moved book");
+    Ok(())
+}
+
+/// Timestamp helper shared by user-managed metadata mutations.
+pub(crate) fn now_unix_for_api() -> i64 {
+    now_unix()
 }
 
 /// Build a JPEG cover thumbnail fitting within 400x600, or `None` when the
@@ -392,7 +457,7 @@ async fn store_book(
             sqlx::query(
                 "UPDATE books SET title = ?, author = ?, format = ?, file_size = ?, \
                  sha256 = ?, has_cover = ?, page_count = ?, parse_status = 'ok', \
-                 parse_error = NULL, updated_at = ? WHERE id = ?",
+                 parse_error = NULL, missing = 0, updated_at = ? WHERE id = ?",
             )
             .bind(&book.title)
             .bind(&book.author)
@@ -422,8 +487,8 @@ async fn store_book(
         None => {
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO books (title, author, format, relative_path, file_size, \
-                 sha256, has_cover, page_count, parse_status, added_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?, ?) RETURNING id",
+                 sha256, has_cover, page_count, parse_status, section_id, added_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', (SELECT id FROM sections WHERE is_system = 1 LIMIT 1), ?, ?) RETURNING id",
             )
             .bind(&book.title)
             .bind(&book.author)
@@ -513,7 +578,7 @@ async fn store_parse_error(
             sqlx::query(
                 "UPDATE books SET title = ?, format = ?, file_size = ?, sha256 = ?, \
                  has_cover = 0, page_count = 0, parse_status = 'error', \
-                 parse_error = ?, updated_at = ? WHERE id = ?",
+                 parse_error = ?, missing = 0, updated_at = ? WHERE id = ?",
             )
             .bind(relative.rsplit('/').next().unwrap_or(relative))
             .bind(format.as_str())
@@ -541,8 +606,8 @@ async fn store_parse_error(
         None => {
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO books (title, author, format, relative_path, file_size, \
-                 sha256, has_cover, page_count, parse_status, parse_error, added_at, \
-                 updated_at) VALUES (?, NULL, ?, ?, ?, ?, 0, 0, 'error', ?, ?, ?) RETURNING id",
+                 sha256, has_cover, page_count, parse_status, parse_error, section_id, added_at, \
+                 updated_at) VALUES (?, NULL, ?, ?, ?, ?, 0, 0, 'error', ?, (SELECT id FROM sections WHERE is_system = 1 LIMIT 1), ?, ?) RETURNING id",
             )
             .bind(relative.rsplit('/').next().unwrap_or(relative))
             .bind(format.as_str())
@@ -566,21 +631,25 @@ async fn store_parse_error(
     Ok(())
 }
 
-/// Delete books whose files disappeared from the library, along with their
-/// derived content (cascades) and cache files.
+/// Mark books whose files disappeared from a complete library scan. Keeping
+/// the row preserves manual organization and reading progress while the
+/// source is temporarily unavailable; the owner can explicitly remove a
+/// missing record through the management API.
 async fn prune_missing(state: &AppState, seen: &[String]) -> Result<(), AppError> {
-    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, relative_path FROM books")
-        .fetch_all(&state.db)
-        .await?;
-    for (id, relative) in rows {
+    let rows: Vec<(i64, String, bool)> =
+        sqlx::query_as("SELECT id, relative_path, missing FROM books")
+            .fetch_all(&state.db)
+            .await?;
+    for (id, relative, already_missing) in rows {
         if !seen.iter().any(|seen| seen == &relative) {
-            sqlx::query("DELETE FROM books WHERE id = ?")
+            sqlx::query("UPDATE books SET missing = 1, updated_at = ? WHERE id = ?")
+                .bind(now_unix())
                 .bind(id)
                 .execute(&state.db)
                 .await?;
-            let _ = tokio::fs::remove_dir_all(state.book_covers_dir(id)).await;
-            let _ = tokio::fs::remove_dir_all(state.book_resources_dir(id)).await;
-            tracing::info!(book_id = id, %relative, "removed missing book");
+            if !already_missing {
+                tracing::info!(book_id = id, %relative, "marked missing book");
+            }
         }
     }
     Ok(())

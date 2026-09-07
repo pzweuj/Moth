@@ -1,4 +1,4 @@
-import type { BookDetail, BookSummary, ChapterInfo, ProgressBody } from "../api";
+import type { BookDetail, BookSummary, ChapterInfo, ProgressBody, SectionSummary } from "../api";
 
 /**
  * Browser storage for the online first reader.
@@ -10,7 +10,7 @@ import type { BookDetail, BookSummary, ChapterInfo, ProgressBody } from "../api"
  * to use the same origin.
  */
 const DB_NAME = "moth-reader-v3";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const SCOPE_STORAGE_KEY = "moth:offline-scope";
 const TXT_PARSER_VERSION = "txt-v1";
 
@@ -325,6 +325,7 @@ async function database(): Promise<IDBDatabase> {
       const progressByContext = create("progressByContext", { keyPath: "key" });
       const queue = create("queue", { keyPath: "key" });
       create("books", { keyPath: "id" });
+      create("sections", { keyPath: "id" });
 
       // Indexes let cleanup and offline shelf reads avoid loading binary
       // payloads with getAll(). This upgrade is safe for the previous schema.
@@ -452,6 +453,29 @@ export async function saveOfflineBookSummary(summary: BookSummary, detail?: Book
     };
     store.put(next);
     return undefined;
+  });
+}
+
+/** Store the last server-provided organization tree for offline navigation. */
+export async function saveOfflineSections(sections: SectionSummary[]): Promise<void> {
+  if (storageFrozen) return;
+  await transaction(["sections"], "readwrite", async (tx) => {
+    const store = tx.objectStore("sections");
+    for (const section of sections) store.put(section);
+    // Remove sections deleted on the server while keeping the book/unit
+    // stores untouched. A fresh snapshot is the source of truth for names and
+    // ordering after reconnect.
+    const existing = await cursorValues<SectionSummary>(store);
+    const keep = new Set(sections.map((section) => section.id));
+    for (const section of existing) if (!keep.has(section.id)) store.delete(section.id);
+    return undefined;
+  });
+}
+
+export async function getOfflineSections(): Promise<SectionSummary[] | null> {
+  return transaction(["sections"], "readonly", async (tx) => {
+    const values = await cursorValues<SectionSummary>(tx.objectStore("sections"));
+    return values.length ? values.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name)) : null;
   });
 }
 
@@ -797,6 +821,30 @@ export async function clearOfflineBookContent(id: number): Promise<void> {
   announceStorageEvent("cleared");
 }
 
+/** Clear all cached reading units while retaining metadata, organization,
+ * progress and its pending sync queue. */
+export async function clearOfflineContent(): Promise<void> {
+  if (storageFrozen) return;
+  await transaction(["books", "staged", "chunks", "chapters", "pages", "resources"], "readwrite", async (tx) => {
+    for (const name of ["staged", "chunks", "chapters", "pages", "resources"]) {
+      tx.objectStore(name).clear();
+    }
+    const books = tx.objectStore("books");
+    const values = await cursorValues<StoredBook>(books);
+    for (const book of values) {
+      book.hasCachedContent = false;
+      book.cachedUnits = 0;
+      book.cachedPages = 0;
+      book.complete = false;
+      book.cover = undefined;
+      delete book.summary.cached_content;
+      books.put(book);
+    }
+    return undefined;
+  });
+  announceStorageEvent("cleared");
+}
+
 /** Compatibility name. It now clears content only, preserving progress. */
 export async function deleteOfflineBook(id: number): Promise<void> {
   await clearOfflineBookContent(id);
@@ -964,7 +1012,7 @@ export async function removePendingProgress(key: string): Promise<void> {
 }
 
 export async function clearOfflineData(): Promise<void> {
-  const names = ["books", "staged", "chunks", "chapters", "pages", "resources", "progress", "progressByContext", "queue"];
+  const names = ["books", "sections", "staged", "chunks", "chapters", "pages", "resources", "progress", "progressByContext", "queue"];
   await transaction(names, "readwrite", async (tx) => {
     names.forEach((name) => tx.objectStore(name).clear());
     return undefined;

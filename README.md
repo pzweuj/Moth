@@ -13,8 +13,10 @@ Implemented so far:
   split), and the React/Vite application shell.
 - **Library** — background scanning of the library directory across all four
   formats, metadata and cover extraction, a bookshelf with search and format
-  filters, reading content (chapters, comic pages, EPUB resources), and
-  single-user reading progress. Parsing is done by the `moth-format` crate
+  filters, custom sections and book series, reading content (chapters, comic
+  pages, EPUB resources), and single-user reading progress. Books can be
+  organized as `section → series → book`, with independent books living
+  directly in a section. Parsing is done by the `moth-format` crate
   (EPUB via `zip` + `quick-xml`, MOBI via `mobi`, CBZ via `zip`, TXT via
   `chardetng`/`encoding_rs`).
 - **Reader and local cache** — paginated EPUB/TXT/MOBI reading, lazy CBZ
@@ -24,9 +26,9 @@ Implemented so far:
   Whole-book downloads are not part of the product flow; an uncached chapter
   or page clearly asks for a connection.
 
-The reader view and online-first cache are implemented. Remaining release work
-is browser and Docker acceptance on desktop, Android, and iPhone, plus real
-MOBI/AZW3 fixture validation.
+The reader view, online-first cache, and manual library organization are
+implemented. Remaining release work is browser and Docker acceptance on
+desktop, Android, and iPhone, plus real MOBI/AZW3 fixture validation.
 
 ## Local development
 
@@ -51,9 +53,11 @@ pnpm install
 pnpm --dir web dev
 ```
 
-The Vite server runs at <http://localhost:5173> and proxies `/api` to Axum at
+The Vite server runs at <http://127.0.0.1:5373> by default and proxies `/api` to Axum at
 <http://127.0.0.1:8080>. The API can run without `web/dist`; the production
-static shell is served only when that directory exists.
+static shell is served only when that directory exists. Set `VITE_PORT` in
+PowerShell before starting if you need another available port, for example
+`$env:VITE_PORT = "6000"`.
 
 To populate the library with sample books (TXT, CBZ, EPUB) for manual testing:
 

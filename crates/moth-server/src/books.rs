@@ -29,7 +29,7 @@ use crate::state::{AppState, TxtCacheKey};
 const TXT_PARSER_VERSION: &str = "txt-v1";
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct BookListItem {
     pub id: i64,
     pub title: String,
@@ -42,6 +42,14 @@ pub struct BookListItem {
     pub percent: f64,
     pub content_version: String,
     pub file_size: i64,
+    /// Direct section for an ungrouped book. Series members inherit the
+    /// section from their series and are exposed through the same field.
+    pub section_id: Option<i64>,
+    pub section_name: Option<String>,
+    pub series_id: Option<i64>,
+    pub series_name: Option<String>,
+    pub series_order: Option<i64>,
+    pub missing: bool,
 }
 
 #[derive(Serialize)]
@@ -109,6 +117,12 @@ pub struct BookDetail {
     pub progress: Option<ProgressBody>,
     pub content_version: String,
     pub file_size: i64,
+    pub section_id: Option<i64>,
+    pub section_name: Option<String>,
+    pub series_id: Option<i64>,
+    pub series_name: Option<String>,
+    pub series_order: Option<i64>,
+    pub missing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parser_version: Option<String>,
 }
@@ -163,37 +177,78 @@ fn cover_url(id: i64, has_cover: bool, version: &str) -> Option<String> {
 pub async fn list_books(
     State(state): State<AppState>,
     _user: Authenticated,
+    Query(query): Query<BookListQuery>,
 ) -> Result<Json<Vec<BookListItem>>, AppError> {
+    if query.section_id.is_some() && query.series_id.is_some() {
+        return Err(AppError::Validation(
+            "Choose either a section or a series filter".to_owned(),
+        ));
+    }
+    let books = fetch_book_items(&state.db, query.section_id, query.series_id).await?;
+    Ok(Json(books))
+}
+
+/// Shared book projection used by the flat shelf and the organized shelf.
+/// Keeping the projection in one place ensures both views expose identical
+/// progress, cache-busting and classification metadata.
+pub(crate) async fn fetch_book_items(
+    db: &sqlx::SqlitePool,
+    section_filter: Option<i64>,
+    series_filter: Option<i64>,
+) -> Result<Vec<BookListItem>, AppError> {
     let rows = sqlx::query(
         "SELECT b.id, b.title, b.author, b.format, b.has_cover, b.page_count, \
-         b.parse_status, b.sha256, b.file_size, \
+         b.parse_status, b.sha256, b.file_size, b.missing, b.series_order, \
+         s.id AS series_id, s.name AS series_name, \
+         COALESCE(s.section_id, b.section_id) AS section_id, \
+         COALESCE(ss.name, ds.name) AS section_name, \
          COALESCE(CASE WHEN p.content_version IS NULL OR p.content_version = b.sha256 \
          THEN p.percent ELSE 0.0 END, 0.0) AS percent \
-         FROM books b LEFT JOIN reading_progress p ON p.book_id = b.id \
-         ORDER BY b.title COLLATE NOCASE",
+         FROM books b \
+         LEFT JOIN series s ON s.id = b.series_id \
+         LEFT JOIN sections ss ON ss.id = s.section_id \
+         LEFT JOIN sections ds ON ds.id = b.section_id \
+         LEFT JOIN reading_progress p ON p.book_id = b.id \
+         WHERE (? IS NULL OR COALESCE(s.section_id, b.section_id) = ?) \
+           AND (? IS NULL OR b.series_id = ?) \
+         ORDER BY CASE WHEN ? IS NOT NULL THEN b.series_order END, b.title COLLATE NOCASE",
     )
-    .fetch_all(&state.db)
+    .bind(section_filter)
+    .bind(section_filter)
+    .bind(series_filter)
+    .bind(series_filter)
+    .bind(series_filter)
+    .fetch_all(db)
     .await?;
 
     let mut books = Vec::with_capacity(rows.len());
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let version: String = row.try_get("sha256")?;
+        let has_cover: bool = row.try_get("has_cover")?;
+        let series_id: Option<i64> = row.try_get("series_id")?;
+        let series_order: i64 = row.try_get("series_order")?;
         books.push(BookListItem {
             id,
             title: row.try_get("title")?,
             author: row.try_get("author")?,
             format: row.try_get("format")?,
-            has_cover: row.try_get("has_cover")?,
-            cover_url: cover_url(id, row.try_get("has_cover")?, &version),
+            has_cover,
+            cover_url: cover_url(id, has_cover, &version),
             page_count: row.try_get("page_count")?,
             parse_status: row.try_get("parse_status")?,
             percent: row.try_get("percent")?,
             content_version: version,
             file_size: row.try_get("file_size")?,
+            section_id: row.try_get("section_id")?,
+            section_name: row.try_get("section_name")?,
+            series_id,
+            series_name: row.try_get("series_name")?,
+            series_order: series_id.map(|_| series_order),
+            missing: row.try_get("missing")?,
         });
     }
-    Ok(Json(books))
+    Ok(books)
 }
 
 pub async fn get_book(
@@ -203,8 +258,15 @@ pub async fn get_book(
     Query(query): Query<ChapterQuery>,
 ) -> Result<Json<BookDetail>, AppError> {
     let book = sqlx::query(
-        "SELECT title, author, format, relative_path, has_cover, page_count, parse_status, parse_error, sha256, file_size \
-         FROM books WHERE id = ?",
+        "SELECT b.title, b.author, b.format, b.relative_path, b.has_cover, b.page_count, \
+         b.parse_status, b.parse_error, b.sha256, b.file_size, b.missing, b.series_order, \
+         s.id AS series_id, s.name AS series_name, \
+         COALESCE(s.section_id, b.section_id) AS section_id, \
+         COALESCE(ss.name, ds.name) AS section_name \
+         FROM books b LEFT JOIN series s ON s.id = b.series_id \
+         LEFT JOIN sections ss ON ss.id = s.section_id \
+         LEFT JOIN sections ds ON ds.id = b.section_id \
+         WHERE b.id = ?",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -221,6 +283,13 @@ pub async fn get_book(
     let parse_error: Option<String> = book.try_get("parse_error")?;
     let content_version: String = book.try_get("sha256")?;
     let file_size: i64 = book.try_get("file_size")?;
+    let missing: bool = book.try_get("missing")?;
+    let section_id: Option<i64> = book.try_get("section_id")?;
+    let section_name: Option<String> = book.try_get("section_name")?;
+    let series_id: Option<i64> = book.try_get("series_id")?;
+    let series_name: Option<String> = book.try_get("series_name")?;
+    let series_order_value: i64 = book.try_get("series_order")?;
+    let series_order: Option<i64> = series_id.map(|_| series_order_value);
 
     let requested_encoding = requested_txt_encoding(&query);
     let chapters: Vec<ChapterInfo> = if format == "cbz" {
@@ -308,6 +377,12 @@ pub async fn get_book(
         progress,
         content_version,
         file_size,
+        section_id,
+        section_name,
+        series_id,
+        series_name,
+        series_order,
+        missing,
         parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
     }))
 }
@@ -652,6 +727,12 @@ pub struct ChapterQuery {
     pub encoding: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct BookListQuery {
+    pub section_id: Option<i64>,
+    pub series_id: Option<i64>,
+}
+
 #[derive(Deserialize)]
 pub struct VersionQuery {
     pub v: Option<String>,
@@ -906,7 +987,7 @@ pub async fn get_chapter(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let row = sqlx::query(
-        "SELECT b.format, b.relative_path, b.sha256, c.title, c.content \
+        "SELECT b.format, b.relative_path, b.sha256, b.missing, c.title, c.content \
          FROM chapters c JOIN books b ON b.id = c.book_id \
          WHERE c.book_id = ? AND c.idx = ?",
     )
@@ -918,10 +999,15 @@ pub async fn get_chapter(
     let format: String = row.try_get("format")?;
     let relative_path: String = row.try_get("relative_path")?;
     let content_version: String = row.try_get("sha256")?;
-    // Validate the immutable snapshot before conditional responses too. A
-    // client that sends If-None-Match must not receive 304 for bytes that
-    // changed underneath the last scan.
-    let snapshot_path = ensure_snapshot(&state, book_id, &relative_path, &content_version).await?;
+    let missing: bool = row.try_get("missing")?;
+    // A missing source can still serve the last indexed chapter HTML. Only
+    // explicit TXT re-decoding needs the original bytes and therefore still
+    // requires a snapshot.
+    let snapshot_path = if missing {
+        None
+    } else {
+        Some(ensure_snapshot(&state, book_id, &relative_path, &content_version).await?)
+    };
     let etag = format!("\"{content_version}\"");
     if if_match_misses(&headers, &etag) {
         return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
@@ -940,8 +1026,9 @@ pub async fn get_chapter(
         if !valid_encoding(encoding) {
             return Err(AppError::Validation("Unsupported text encoding".to_owned()));
         }
+        let snapshot = snapshot_path.ok_or(AppError::NotFound)?;
         let book =
-            cached_txt_chapters(&state, book_id, &content_version, encoding, snapshot_path).await?;
+            cached_txt_chapters(&state, book_id, &content_version, encoding, snapshot).await?;
         let chapter = book.get(idx as usize).ok_or_else(|| AppError::NotFound)?;
         (chapter.title.clone(), chapter.content.clone())
     } else {
@@ -972,7 +1059,7 @@ pub async fn get_resource(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let row = sqlx::query(
-        "SELECT r.mime, r.path AS source_path, b.relative_path, b.sha256 FROM resources r JOIN books b ON b.id = r.book_id \
+        "SELECT r.mime, r.path AS source_path, b.relative_path, b.sha256, b.missing FROM resources r JOIN books b ON b.id = r.book_id \
          WHERE r.book_id = ? AND r.idx = ?",
     )
     .bind(book_id)
@@ -984,7 +1071,10 @@ pub async fn get_resource(
     let source_path: String = row.try_get("source_path")?;
     let relative_path: String = row.try_get("relative_path")?;
     let version: String = row.try_get("sha256")?;
-    ensure_snapshot(&state, book_id, &relative_path, &version).await?;
+    let missing: bool = row.try_get("missing")?;
+    if !missing {
+        ensure_snapshot(&state, book_id, &relative_path, &version).await?;
+    }
     let etag = format!("\"{version}\"");
     if if_match_misses(&headers, &etag) {
         return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
@@ -1024,9 +1114,9 @@ pub async fn get_page(
     AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let (entry_name, mime, file_path, version) =
-        sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT p.path, p.mime, b.relative_path, b.sha256 FROM pages p \
+    let (entry_name, mime, file_path, version, missing) =
+        sqlx::query_as::<_, (String, String, String, String, bool)>(
+            "SELECT p.path, p.mime, b.relative_path, b.sha256, b.missing FROM pages p \
          JOIN books b ON b.id = p.book_id WHERE p.book_id = ? AND p.idx = ?",
         )
         .bind(book_id)
@@ -1036,6 +1126,9 @@ pub async fn get_page(
         .ok_or_else(|| AppError::NotFound)?;
 
     let etag = format!("\"{version}\"");
+    if missing {
+        return Err(AppError::NotFound);
+    }
     let snapshot_path = ensure_snapshot(&state, book_id, &file_path, &version).await?;
     if if_match_misses(&headers, &etag) {
         return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());

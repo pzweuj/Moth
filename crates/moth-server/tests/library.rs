@@ -1058,3 +1058,131 @@ async fn raw_file_endpoint_supports_byte_ranges() {
         .expect("unauthenticated");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn organization_crud_keeps_books_in_one_destination() {
+    let (_temp, app) = build_app().await;
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(Method::GET, "/api/v1/sections", &cookie, ""))
+        .await
+        .expect("sections");
+    assert_eq!(response.status(), StatusCode::OK);
+    let sections = response_json(response).await;
+    assert_eq!(sections.as_array().expect("sections array").len(), 1);
+    assert_eq!(sections[0]["is_system"], true);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/sections",
+            r#"{"name":"Science Fiction"}"#,
+        ))
+        .await
+        .expect("create section");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // The endpoint is authenticated just like the existing shelf APIs.
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/sections",
+            &cookie,
+            r#"{"name":"Science Fiction"}"#,
+        ))
+        .await
+        .expect("create section");
+    assert_eq!(response.status(), StatusCode::OK);
+    let section = response_json(response).await;
+    let section_id = section["id"].as_i64().expect("section id");
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/series",
+            &cookie,
+            &format!(r#"{{"name":"The Set","section_id":{section_id}}}"#),
+        ))
+        .await
+        .expect("create series");
+    assert_eq!(response.status(), StatusCode::OK);
+    let series_id = response_json(response).await["id"]
+        .as_i64()
+        .expect("series id");
+
+    let books = list_books(&app, &cookie).await;
+    let ids: Vec<i64> = books
+        .as_array()
+        .expect("books array")
+        .iter()
+        .take(2)
+        .map(|book| book["id"].as_i64().expect("book id"))
+        .collect();
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/books/organize",
+            &cookie,
+            &serde_json::json!({"book_ids": ids, "series_id": series_id}).to_string(),
+        ))
+        .await
+        .expect("organize books");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(authed_request(Method::GET, "/api/v1/sections", &cookie, ""))
+        .await
+        .expect("organized sections");
+    let sections = response_json(response).await;
+    let organized = sections
+        .as_array()
+        .expect("sections array")
+        .iter()
+        .find(|section| section["id"] == section_id)
+        .expect("created section");
+    assert_eq!(organized["series"][0]["id"], series_id);
+    assert_eq!(organized["series"][0]["book_count"], ids.len());
+    assert_eq!(
+        organized["books"].as_array().expect("direct books").len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn scan_marks_missing_books_and_restores_them() {
+    let (temp, app) = build_app().await;
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+    let before = list_books(&app, &cookie).await;
+    let txt = find_book(&before, "txt").clone();
+    let txt_id = txt["id"].as_i64().expect("book id");
+    let path = temp.path().join("books/novel.txt");
+    let content = std::fs::read(&path).expect("book bytes");
+    std::fs::remove_file(&path).expect("remove book");
+    run_scan(&app, &cookie).await;
+    let missing = list_books(&app, &cookie).await;
+    let entry = missing
+        .as_array()
+        .expect("books array")
+        .iter()
+        .find(|book| book["id"] == txt_id)
+        .expect("missing entry");
+    assert_eq!(entry["missing"], true);
+    let moved_path = temp.path().join("books/moved-novel.txt");
+    std::fs::write(&moved_path, content).expect("restore book");
+    run_scan(&app, &cookie).await;
+    let restored = list_books(&app, &cookie).await;
+    let entry = restored
+        .as_array()
+        .expect("books array")
+        .iter()
+        .find(|book| book["id"] == txt_id)
+        .expect("restored entry");
+    assert_eq!(entry["missing"], false);
+}
