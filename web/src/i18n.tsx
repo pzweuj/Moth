@@ -219,6 +219,10 @@ const messages: Record<string, { "zh-CN": Message; en: Message }> = {
     "zh-CN": "固定版式 EPUB 会保留原始布局，不支持正文重排。",
     en: "Fixed-layout EPUBs keep their original layout; text reflow is unavailable.",
   },
+  "Fixed-layout books keep their original layout; text reflow is unavailable.": {
+    "zh-CN": "固定版式书籍会保留原始布局，不支持正文重排。",
+    en: "Fixed-layout books keep their original layout; text reflow is unavailable.",
+  },
   "Done": { "zh-CN": "完成", en: "Done" },
   "Contents": { "zh-CN": "目录", en: "Contents" },
   "Close contents": { "zh-CN": "关闭目录", en: "Close contents" },
@@ -371,6 +375,9 @@ export function translateError(error: unknown, t: UiContextValue["t"]): string {
   if (error && typeof error === "object") {
     const value = error as { code?: unknown; message?: unknown };
     const code = typeof value.code === "string" ? value.code : "";
+    if (code === "series_name_taken" && typeof value.message === "string" && /destination section/i.test(value.message)) {
+      return t("The destination section already has a series with that name");
+    }
     const codeKeys: Record<string, string> = {
       invalid_credentials: "Invalid username or password",
       not_found: "The requested resource was not found",

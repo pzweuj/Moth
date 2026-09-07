@@ -376,10 +376,8 @@ export function FoliateTextReader({
       }
 
       installBookTransformGuards(book);
-      onLayoutChangeRef.current?.(
-        detail.format === "epub"
-          && (book as unknown as { rendition?: { layout?: string } }).rendition?.layout === "pre-paginated",
-      );
+      const isFixedLayout = (book as unknown as { rendition?: { layout?: string } }).rendition?.layout === "pre-paginated";
+      onLayoutChangeRef.current?.(isFixedLayout);
       if (detail.format !== "txt" && !publication) installFoliateSectionCache(book, detail, requestController.signal);
 
       if (cancelled) {
@@ -410,9 +408,15 @@ export function FoliateTextReader({
       viewRef.current = element;
 
       // The renderer is created by `open()`, so layout settings apply after.
-      element.renderer.setAttribute("flow", "paginated");
-      element.renderer.setAttribute("margin", `${settingsRef.current.margin}px`);
-      element.renderer.setStyles(readerCss(settingsRef.current));
+      // Fixed-layout EPUBs use `foliate-fxl`, which intentionally has no
+      // `setStyles` method: injecting reflow CSS there would both crash the
+      // reader and violate the publication's fixed geometry.
+      const renderer = element.renderer as typeof element.renderer & { setStyles?: (css: string) => void };
+      if (typeof renderer.setStyles === "function") {
+        renderer.setAttribute("flow", "paginated");
+        renderer.setAttribute("margin", `${settingsRef.current.margin}px`);
+        renderer.setStyles(readerCss(settingsRef.current));
+      }
 
       setToc(flattenToc(book.toc));
 
@@ -477,10 +481,15 @@ export function FoliateTextReader({
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
+    const renderer = view.renderer as typeof view.renderer & { setStyles?: (css: string) => void };
+    // Fixed-layout EPUB renderers preserve their own page geometry and do
+    // not expose style injection. Theme controls still affect the outer
+    // reader chrome through the app-level theme.
+    if (typeof renderer.setStyles !== "function") return;
     const currentLocation = view.lastLocation?.cfi
       ?? (typeof view.lastLocation?.fraction === "number" ? { fraction: view.lastLocation.fraction } : undefined);
-    view.renderer.setStyles(readerCss(settings));
-    view.renderer.setAttribute("margin", `${settings.margin}px`);
+    renderer.setStyles(readerCss(settings));
+    renderer.setAttribute("margin", `${settings.margin}px`);
     // Changing font metrics causes Foliate to reflow its columns. Re-resolve
     // the current CFI/fraction after the reflow so a slider change does not
     // unexpectedly jump to the beginning of a chapter.

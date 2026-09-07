@@ -57,4 +57,17 @@ describe("localized UI preferences", () => {
     );
     expect(screen.getByText("找不到请求的内容。")).toBeInTheDocument();
   });
+
+  it("keeps destination conflicts specific", () => {
+    function DestinationProbe() {
+      const { t } = useUi();
+      return <p>{translateError(new ApiError(409, "series_name_taken", "The destination section already has a series with that name"), t)}</p>;
+    }
+    render(
+      <UiProvider>
+        <DestinationProbe />
+      </UiProvider>,
+    );
+    expect(screen.getByText("目标栏目中已有同名系列。")).toBeInTheDocument();
+  });
 });

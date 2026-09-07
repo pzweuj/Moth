@@ -309,14 +309,14 @@ export function LibraryPage({ session }: { session?: SessionState }) {
             {t("New section")}
           </button>
           <button className="quiet-button" type="button" onClick={() => void requestLogout()} disabled={logout.isPending}>
-            {logout.isPending ? t("Leaving…") : <>{t("Sign out")}<span className="sr-only"> Sign out</span></>}
+            {logout.isPending ? t("Leaving…") : t("Sign out")}
           </button>
         </div>
       </header>
 
       <section className="library-head">
-        <p className="eyebrow">{t("Good to see you, {{name}}", { name: session?.username ?? "" })}<span className="sr-only"> Good to see you, {session?.username ?? ""}</span></p>
-        <h1>{currentSeries?.name ?? currentSectionName ?? (isAllView ? t("All books") : t("Your library"))}{!currentSeries && !currentSection && <span className="sr-only"> {isAllView ? "All books" : "Your library"}</span>}</h1>
+        <p className="eyebrow">{t("Good to see you, {{name}}", { name: session?.username ?? "" })}</p>
+        <h1>{currentSeries?.name ?? currentSectionName ?? (isAllView ? t("All books") : t("Your library"))}</h1>
         <p className="lede">{currentSeries ? t("{{count}} books in this series.", { count: currentSeries.book_count }) : currentSection ? t("{{count}} books in this section.", { count: sectionCardBooks(currentSection) }) : t("Books rest quietly here, ready when you are.")}</p>
       </section>
 

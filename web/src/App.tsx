@@ -215,8 +215,7 @@ function SetupPage({ initialized }: { initialized: boolean }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
-  const [error, setError] = useState("");
-  const [legacyError, setLegacyError] = useState("");
+  const [error, setError] = useState<unknown | null>(null);
   const setup = useMutation({
     mutationFn: async () => {
       await api.setup(username.trim(), password);
@@ -237,8 +236,7 @@ function SetupPage({ initialized }: { initialized: boolean }) {
       }
     },
     onError: (mutationError: Error) => {
-      setError(translateError(mutationError, t));
-      setLegacyError(mutationError.message);
+      setError(mutationError);
     },
   });
 
@@ -248,28 +246,27 @@ function SetupPage({ initialized }: { initialized: boolean }) {
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setError("");
-    setLegacyError("");
+    setError(null);
     if (password !== confirmation) {
-      setError(t("Passwords do not match."));
+      setError(new Error("Passwords do not match."));
       return;
     }
     if (password.length < 10) {
-      setError(t("Use at least 10 characters for your password."));
+      setError(new Error("Use at least 10 characters for your password."));
       return;
     }
     setup.mutate();
   };
 
   return (
-    <AuthLayout kicker={t("First light")} title={t("Make this place yours.")} legacyTitle="Make this place yours." description={t("Set up your account. Moth keeps the rest of the experience quiet and close to your books.")}>
+    <AuthLayout kicker={t("First light")} title={t("Make this place yours.")} description={t("Set up your account. Moth keeps the rest of the experience quiet and close to your books.")}>
       <form className="auth-form" onSubmit={submit} noValidate>
-        <Field label={t("Username")} legacyLabel="Username" value={username} onChange={setUsername} autoComplete="username" required />
-        <Field label={t("Password")} legacyLabel="Password" type="password" value={password} onChange={setPassword} autoComplete="new-password" minLength={10} required />
-        <Field label={t("Repeat password")} legacyLabel="Repeat password" type="password" value={confirmation} onChange={setConfirmation} autoComplete="new-password" minLength={10} required />
-        <FormError message={error} legacyMessage={legacyError} />
+        <Field label={t("Username")} value={username} onChange={setUsername} autoComplete="username" required />
+        <Field label={t("Password")} type="password" value={password} onChange={setPassword} autoComplete="new-password" minLength={10} required />
+        <Field label={t("Repeat password")} type="password" value={confirmation} onChange={setConfirmation} autoComplete="new-password" minLength={10} required />
+        <FormError message={error ? translateError(error, t) : ""} />
         <button className="primary-button" type="submit" disabled={setup.isPending}>
-          {setup.isPending ? t("Preparing Moth…") : <>{t("Set up your account")}<span className="sr-only"> Set up your account</span></>}
+          {setup.isPending ? t("Preparing Moth…") : t("Set up your account")}
         </button>
       </form>
     </AuthLayout>
@@ -284,8 +281,7 @@ function LoginPage({ initialized, session }: { initialized: boolean; session?: S
   const state = location.state as { username?: string } | null;
   const [username, setUsername] = useState(state?.username ?? "");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [legacyError, setLegacyError] = useState("");
+  const [error, setError] = useState<unknown | null>(null);
   const login = useMutation({
     mutationFn: () => api.login(username.trim(), password),
     onSuccess: async () => {
@@ -293,8 +289,7 @@ function LoginPage({ initialized, session }: { initialized: boolean; session?: S
       navigate("/", { replace: true, state: null });
     },
     onError: (mutationError: Error) => {
-      setError(translateError(mutationError, t));
-      setLegacyError(mutationError.message);
+      setError(mutationError);
     },
   });
 
@@ -307,19 +302,18 @@ function LoginPage({ initialized, session }: { initialized: boolean; session?: S
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setError("");
-    setLegacyError("");
+    setError(null);
     login.mutate();
   };
 
   return (
-    <AuthLayout kicker={t("Welcome back")} title={t("Pick up the thread.")} legacyTitle="Pick up the thread." description={t("Your library is waiting on the other side of a simple sign-in.")}>
+    <AuthLayout kicker={t("Welcome back")} title={t("Pick up the thread.")} description={t("Your library is waiting on the other side of a simple sign-in.")}>
       <form className="auth-form" onSubmit={submit} noValidate>
-        <Field label={t("Username")} legacyLabel="Username" value={username} onChange={setUsername} autoComplete="username" required />
-        <Field label={t("Password")} legacyLabel="Password" type="password" value={password} onChange={setPassword} autoComplete="current-password" required />
-        <FormError message={error} legacyMessage={legacyError} />
+        <Field label={t("Username")} value={username} onChange={setUsername} autoComplete="username" required />
+        <Field label={t("Password")} type="password" value={password} onChange={setPassword} autoComplete="current-password" required />
+        <FormError message={error ? translateError(error, t) : ""} />
         <button className="primary-button" type="submit" disabled={login.isPending}>
-          {login.isPending ? t("Opening…") : <><span aria-hidden="true">{t("Sign in")}</span><span className="sr-only">Sign in</span></>}
+          {login.isPending ? t("Opening…") : t("Sign in")}
         </button>
       </form>
     </AuthLayout>
@@ -344,7 +338,7 @@ function ProtectedRoute({
   return <>{children}</>;
 }
 
-function AuthLayout({ kicker, title, legacyTitle, description, children }: { kicker: string; title: string; legacyTitle?: string; description: string; children: ReactNode }) {
+function AuthLayout({ kicker, title, description, children }: { kicker: string; title: string; description: string; children: ReactNode }) {
   const { t } = useUi();
   return (
     <main className="auth-shell">
@@ -352,7 +346,7 @@ function AuthLayout({ kicker, title, legacyTitle, description, children }: { kic
       <div className="auth-appearance"><AppearanceControls /></div>
       <section className="auth-intro">
         <p className="eyebrow">{t("Moth / personal library")}</p>
-        <h1>{title}{legacyTitle && <span className="sr-only"> {legacyTitle}</span>}</h1>
+        <h1>{title}</h1>
         <p className="lede">{description}</p>
         <div className="auth-rule" />
         <p className="auth-footnote">{t("Private by default")}<br />{t("Ready when the network is not.")}</p>
@@ -370,7 +364,7 @@ function AuthLayout({ kicker, title, legacyTitle, description, children }: { kic
   );
 }
 
-function Field({ label, legacyLabel, type = "text", value, onChange, ...props }: { label: string; legacyLabel?: string; type?: string; value: string; onChange: (value: string) => void; autoComplete?: string; minLength?: number; required?: boolean }) {
+function Field({ label, type = "text", value, onChange, ...props }: { label: string; type?: string; value: string; onChange: (value: string) => void; autoComplete?: string; minLength?: number; required?: boolean }) {
   const id = label.toLowerCase().replaceAll(" ", "-");
   return (
     <>
@@ -378,14 +372,13 @@ function Field({ label, legacyLabel, type = "text", value, onChange, ...props }:
         <span>{label}</span>
         <input id={id} type={type} value={value} onChange={(event) => onChange(event.target.value)} {...props} />
       </label>
-      {legacyLabel && legacyLabel !== label && <label className="sr-only" htmlFor={id}>{legacyLabel}</label>}
     </>
   );
 }
 
-function FormError({ message, legacyMessage }: { message: string; legacyMessage?: string }) {
+function FormError({ message }: { message: string }) {
   if (!message) return null;
-  return <p className="form-error" role="alert">{message}{legacyMessage && <span className="sr-only"> {legacyMessage}</span>}</p>;
+  return <p className="form-error" role="alert">{message}</p>;
 }
 
 function LoadingScreen({ label }: { label: string }) {

@@ -29,9 +29,9 @@ describe("Moth authentication shell", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: /make this place yours/i })).toBeInTheDocument();
-    expect(screen.getByLabelText("Username")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /set up your account/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "打造你的阅读空间。" })).toBeInTheDocument();
+    expect(screen.getByLabelText("用户名")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "创建账户" })).toBeInTheDocument();
   });
 
   it("shows login for an initialized server and displays API errors", async () => {
@@ -49,14 +49,14 @@ describe("Moth authentication shell", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    expect(await screen.findByRole("heading", { name: /pick up the thread/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "继续上次阅读。" })).toBeInTheDocument();
 
     const user = userEvent.setup();
-    await user.type(screen.getByLabelText("Username"), "moth");
-    await user.type(screen.getByLabelText("Password"), "wrong password");
-    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
+    await user.type(screen.getByLabelText("用户名"), "moth");
+    await user.type(screen.getByLabelText("密码"), "wrong password");
+    await user.click(screen.getByRole("button", { name: "登录" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid username or password");
+    expect(await screen.findByRole("alert")).toHaveTextContent("用户名或密码错误");
   });
 
   it("initializes, signs in, and opens the protected home", async () => {
@@ -77,16 +77,16 @@ describe("Moth authentication shell", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    expect(await screen.findByRole("heading", { name: /make this place yours/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "打造你的阅读空间。" })).toBeInTheDocument();
     const user = userEvent.setup();
-    await user.type(screen.getByLabelText("Username"), "moth");
-    await user.type(screen.getByLabelText("Password"), "a secure password");
-    await user.type(screen.getByLabelText("Repeat password"), "a secure password");
+    await user.type(screen.getByLabelText("用户名"), "moth");
+    await user.type(screen.getByLabelText("密码"), "a secure password");
+    await user.type(screen.getByLabelText("确认密码"), "a secure password");
     initialized = true;
-    await user.click(screen.getByRole("button", { name: /set up your account/i }));
+    await user.click(screen.getByRole("button", { name: "创建账户" }));
 
-    expect(await screen.findByRole("heading", { name: /your library/i })).toBeInTheDocument();
-    expect(screen.getByText(/good to see you, moth/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "我的书库" })).toBeInTheDocument();
+    expect(screen.getByText("欢迎回来，moth")).toBeInTheDocument();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/v1/session", expect.objectContaining({ method: "POST" })));
   });
 
@@ -103,9 +103,9 @@ describe("Moth authentication shell", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(<App />);
-    expect(await screen.findByRole("heading", { name: /your library/i })).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole("button", { name: /sign out/i }));
-    expect(await screen.findByRole("heading", { name: /pick up the thread/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "我的书库" })).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "退出登录" }));
+    expect(await screen.findByRole("heading", { name: "继续上次阅读。" })).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/session", expect.objectContaining({ method: "DELETE" }));
   });
 });

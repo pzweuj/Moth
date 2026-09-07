@@ -402,7 +402,7 @@ function SettingsPanel({
       <div className="settings-appearance">
         <AppearanceControls compact showTheme={false} />
       </div>
-      {fixedLayout && <p className="settings-note">{t("Fixed-layout EPUBs keep their original layout; text reflow is unavailable.")}</p>}
+      {fixedLayout && <p className="settings-note">{t("Fixed-layout books keep their original layout; text reflow is unavailable.")}</p>}
       {!isComic && <div className="settings-row">
         <label>
           <span>{t("Font size")}</span>
