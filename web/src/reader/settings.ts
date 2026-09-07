@@ -19,12 +19,20 @@ const DEFAULTS: ReaderSettings = {
 
 const STORAGE_KEY = "moth:reader-settings";
 
+function normalizeSettings(value: Partial<ReaderSettings>): ReaderSettings {
+  const fontSize = Number.isFinite(value.fontSize) ? Math.min(36, Math.max(12, Math.round(value.fontSize as number))) : DEFAULTS.fontSize;
+  const lineHeight = Number.isFinite(value.lineHeight) ? Math.min(2.2, Math.max(1.3, Math.round((value.lineHeight as number) * 10) / 10)) : DEFAULTS.lineHeight;
+  const margin = Number.isFinite(value.margin) ? Math.min(48, Math.max(0, Math.round((value.margin as number) / 2) * 2)) : DEFAULTS.margin;
+  const theme: ReaderTheme = value.theme === "dark" || value.theme === "sepia" ? value.theme : "light";
+  return { fontSize, lineHeight, margin, theme };
+}
+
 export function loadSettings(): ReaderSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULTS };
     const parsed = JSON.parse(raw) as Partial<ReaderSettings>;
-    return { ...DEFAULTS, ...parsed };
+    return normalizeSettings(parsed);
   } catch {
     return { ...DEFAULTS };
   }

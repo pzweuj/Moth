@@ -24,7 +24,12 @@ Implemented so far:
   restoration, serialised progress saves, a PWA shell, and IndexedDB storage
   for visited chapters, comic pages, resources, and local-first progress.
   Whole-book downloads are not part of the product flow; an uncached chapter
-  or page clearly asks for a connection.
+  or page clearly asks for a connection. The interface defaults to Simplified
+  Chinese and can switch to English, with persisted light/dark appearance
+  preferences. Text readers share a 12–36 px font-size control; CBZ readers
+  default to fit-screen and support fit-width or 50–300% custom zoom. On
+  touch-first layouts, the reader hides the previous/next buttons and uses
+  short taps in the outer 30% of the page for navigation.
 
 The reader view, online-first cache, and manual library organization are
 implemented. Remaining release work is browser and Docker acceptance on

@@ -174,6 +174,7 @@ footer span { color: #b7c7b2; margin: 0 8px; }
 .comic-fit-width img { height: auto; max-width: 100%; }
 .comic-fit-height img { height: 100%; max-width: none; width: auto; }
 .comic-counter { color: #aeb5ad; font: 600 12px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .1em; padding: 0 6px; }
+.comic-pages-toggle { min-width: 72px; }
 .comic-thumbs { align-items: center; background: #0c0f11; border-top: 1px solid rgba(183, 199, 178, .16); display: flex; gap: 8px; overflow-x: auto; padding: 10px 14px; }
 .comic-thumb { background: rgba(232, 237, 220, .05); border: 1px solid rgba(183, 199, 178, .22); flex: 0 0 auto; height: 56px; padding: 0; position: relative; width: 40px; }
 .comic-thumb img { display: block; height: 100%; object-fit: cover; width: 100%; }
@@ -221,3 +222,186 @@ footer span { color: #b7c7b2; margin: 0 8px; }
 .inline-action { background: transparent; border: 0; color: #c6dca3; cursor: pointer; padding: 0; text-decoration: underline; }
 .inline-action:disabled { cursor: wait; opacity: .6; }
 .storage-action { background: transparent; border: 0; color: #b7c7b2; cursor: pointer; }
+
+/* UI preferences and shared visual language */
+:root {
+  --app-bg: #f5f5ef;
+  --app-surface: #ffffff;
+  --app-surface-muted: #edf0e9;
+  --app-text: #26332e;
+  --app-heading: #17231f;
+  --app-muted: #68756d;
+  --app-faint: #8a958e;
+  --app-border: rgba(45, 73, 61, .18);
+  --app-accent: #5e805f;
+  --app-accent-strong: #3e654d;
+  --app-accent-soft: #dce8d9;
+  --app-danger: #a64f42;
+  --reader-bg: #fbfaf7;
+  --reader-text: #1f2328;
+}
+
+html[data-theme="dark"] {
+  --app-bg: #151a19;
+  --app-surface: #1c2421;
+  --app-surface-muted: #242e2a;
+  --app-text: #d8e1da;
+  --app-heading: #f2f5ed;
+  --app-muted: #a8b5ab;
+  --app-faint: #829087;
+  --app-border: rgba(193, 216, 197, .2);
+  --app-accent: #a7c891;
+  --app-accent-strong: #c4dfa9;
+  --app-accent-soft: #2e4033;
+  --app-danger: #e5a092;
+  --reader-bg: #14181a;
+  --reader-text: #d8d3cc;
+}
+html { color-scheme: light; }
+html[data-theme="dark"] { color-scheme: dark; }
+
+html, body, #root { min-height: 100%; }
+body {
+  background: var(--app-bg);
+  color: var(--app-text);
+  font-family: "Noto Sans SC", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  line-height: 1.55;
+  transition: background-color .2s ease, color .2s ease;
+}
+.home-shell { overflow-x: hidden; overflow-y: auto; }
+html[lang="zh-CN"] .eyebrow,
+html[lang="zh-CN"] .quiet-button,
+html[lang="zh-CN"] .primary-button,
+html[lang="zh-CN"] .format-chip,
+html[lang="zh-CN"] .reader-top-bar button,
+html[lang="zh-CN"] .reader-bottom-bar button,
+html[lang="zh-CN"] .settings-row > label,
+html[lang="zh-CN"] .settings-row > span { letter-spacing: .03em; text-transform: none; }
+button, input, select { font-family: inherit; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--app-accent) 45%, transparent);
+  outline-offset: 2px;
+}
+.sr-only { border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); height: 1px; margin: -1px; overflow: hidden; padding: 0; position: absolute; white-space: nowrap; width: 1px; }
+
+.landing-shell, .auth-shell, .home-shell, .state-screen {
+  background: radial-gradient(circle at 78% 16%, color-mix(in srgb, var(--app-accent) 18%, transparent), transparent 36%), var(--app-bg) !important;
+  color: var(--app-text);
+}
+.landing-shell h1, .home-hero h1, .auth-intro h1, .state-screen h1, .library-head h1 { color: var(--app-heading); letter-spacing: -.04em; }
+html[lang="zh-CN"] .auth-intro h1 { font-size: clamp(44px, 6vw, 78px); letter-spacing: -.025em; line-height: 1.08; }
+html[lang="zh-CN"] .library-head h1 { font-size: clamp(38px, 5vw, 64px); letter-spacing: -.025em; line-height: 1.12; }
+.lede, .state-screen p:not(.eyebrow), .auth-footnote, .shelf-hint { color: var(--app-muted); }
+.eyebrow { color: var(--app-accent-strong); letter-spacing: .12em; }
+.grain { opacity: .035; }
+.auth-appearance { position: absolute; right: clamp(24px, 7vw, 110px); top: 28px; z-index: 3; }
+.appearance-controls { align-items: center; display: inline-flex; gap: 8px; }
+.appearance-locale, .appearance-theme { align-items: center; background: color-mix(in srgb, var(--app-surface) 78%, transparent); border: 1px solid var(--app-border); border-radius: 999px; display: inline-flex; gap: 2px; padding: 3px; }
+.appearance-controls button { background: transparent; border: 0; border-radius: 999px; color: var(--app-muted); cursor: pointer; font-size: 12px; min-height: 30px; min-width: 34px; padding: 5px 9px; }
+.appearance-controls button:hover, .appearance-controls button.is-active { background: var(--app-accent-soft); color: var(--app-accent-strong); }
+.appearance-controls.is-compact button { min-height: 28px; min-width: 30px; padding: 4px 7px; }
+.auth-card { background: color-mix(in srgb, var(--app-surface) 86%, transparent); border-color: var(--app-border); box-shadow: 0 24px 70px color-mix(in srgb, var(--app-heading) 10%, transparent); }
+.auth-card::before { border-color: var(--app-accent); }
+.field span, .settings-row > label, .settings-row > span { color: var(--app-muted); }
+.field input, .search-input { background: color-mix(in srgb, var(--app-surface) 80%, transparent); border-color: var(--app-border); color: var(--app-text); }
+.field input:focus, .search-input:focus { background: var(--app-surface); border-color: var(--app-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-accent) 18%, transparent); }
+.primary-button { background: var(--app-accent); border-color: var(--app-accent); color: #fff; }
+.primary-button:hover:not(:disabled) { background: var(--app-accent-strong); }
+.quiet-button, .reader-top-bar button, .reader-bottom-bar button { border-color: var(--app-border); color: var(--app-accent-strong); }
+.quiet-button:hover:not(:disabled), .reader-top-bar button:hover:not(:disabled), .reader-bottom-bar button:hover:not(:disabled) { border-color: var(--app-accent); color: var(--app-accent-strong); }
+.form-error { background: color-mix(in srgb, var(--app-danger) 12%, transparent); border-color: var(--app-danger); color: var(--app-danger); }
+.home-nav { border-bottom: 1px solid var(--app-border); padding-bottom: 14px; width: min(1200px, 100%); margin-left: auto; margin-right: auto; }
+.wordmark { color: var(--app-muted); }
+.wordmark span { color: var(--app-accent); }
+.home-shell { padding-top: 28px; }
+.library-head { margin-left: auto; margin-right: auto; max-width: 1180px; width: 100%; }
+.library-toolbar { background: color-mix(in srgb, var(--app-surface) 72%, transparent); border: 1px solid var(--app-border); border-radius: 14px; margin-left: auto; margin-right: auto; max-width: 1180px; padding: 12px; }
+.format-chip, .organization-select, .organization-toolbar select { border-color: var(--app-border); color: var(--app-muted); }
+.format-chip.is-active { background: var(--app-accent); border-color: var(--app-accent); color: #fff; }
+.section-card, .series-card, .empty-library, .organization-toolbar, .series-order { background: color-mix(in srgb, var(--app-surface) 88%, transparent); border-color: var(--app-border); border-radius: 14px; box-shadow: 0 10px 28px color-mix(in srgb, var(--app-heading) 5%, transparent); }
+.section-card h2, .series-card h2, .empty-library h2, .series-order h2, .book-info h3 { color: var(--app-heading); }
+.section-card p, .series-card p, .book-author, .book-path, .book-progress, .shelf-hint { color: var(--app-muted); }
+.section-card a, .series-card a { border-radius: 14px; }
+.section-card a:hover, .series-card a:hover { background: var(--app-surface-muted); }
+.book-card { position: relative; }
+.book-card-link { color: inherit; display: block; text-decoration: none; }
+.book-info h3 { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-height: 1.4; max-height: 2.8em; overflow: hidden; white-space: normal; }
+.book-select { background: color-mix(in srgb, var(--app-surface) 82%, transparent); border: 1px solid var(--app-border); border-radius: 999px; padding: 4px; }
+.book-select input { display: block; margin: 0; }
+.book-cover, .series-cover { background: var(--app-surface-muted); border-color: var(--app-border); }
+.book-cover-placeholder .cover-format, .series-cover span { color: var(--app-accent); }
+.progress-rail { background: color-mix(in srgb, var(--app-accent) 22%, transparent); }
+.progress-rail span { background: var(--app-accent); }
+.storage-note, .scan-note, .offline-cache-indicator { color: var(--app-muted); }
+.storage-warning, .offline-error, .cover-error { color: var(--app-danger); }
+.inline-action, .storage-action { color: var(--app-accent-strong); }
+.series-cover img { object-fit: contain; }
+
+/* Shared dialogs replace browser-native prompts and keep focus in the app. */
+.dialog-backdrop { align-items: center; background: rgba(10, 17, 14, .46); display: flex; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 30; }
+.dialog-card { background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 16px; box-shadow: 0 24px 80px rgba(0, 0, 0, .24); color: var(--app-text); max-width: 460px; padding: 26px; width: min(100%, 460px); }
+.dialog-card h2 { color: var(--app-heading); font-size: 1.35rem; font-weight: 650; margin: 0 0 10px; }
+.dialog-card p { color: var(--app-muted); margin: 0 0 18px; white-space: pre-line; }
+.dialog-input { background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 8px; color: var(--app-text); padding: 11px 12px; width: 100%; }
+.dialog-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px; }
+.dialog-actions .compact-button { margin-top: 0; }
+
+/* Reader chrome follows the selected site theme; publication CSS remains per book. */
+.reader-shell, .reader-top-bar, .reader-bottom-bar, .comic-viewport, .comic-thumbs { background: var(--app-bg); color: var(--app-text); }
+.reader-shell { display: flex; flex-direction: column; height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
+.reader-top-bar { flex: 0 0 auto; }
+.reader-top-bar, .reader-bottom-bar, .comic-thumbs { border-color: var(--app-border); padding-left: max(14px, env(safe-area-inset-left)); padding-right: max(14px, env(safe-area-inset-right)); }
+.reader-title { color: var(--app-heading); }
+.reader-position, .save-indicator, .comic-counter { color: var(--app-muted); }
+.reader-toc, .settings-panel { background: var(--app-surface); border-color: var(--app-border); color: var(--app-text); }
+.reader-toc-head, .reader-toc li button { color: var(--app-text); }
+.reader-toc li { border-color: var(--app-border); }
+.settings-panel { border-radius: 14px; }
+.settings-appearance { display: flex; justify-content: flex-end; }
+.settings-note { background: var(--app-surface-muted); border-left: 3px solid var(--app-accent); color: var(--app-muted); font-size: 12px; line-height: 1.5; margin: 0; padding: 8px 10px; }
+.settings-row input[type="range"] { accent-color: var(--app-accent); }
+.settings-row select, .organization-select { background: var(--app-surface-muted); border-color: var(--app-border); color: var(--app-text); }
+.settings-stepper, .settings-reset { background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 7px; color: var(--app-accent-strong); cursor: pointer; min-height: 28px; min-width: 28px; }
+.settings-reset { padding: 7px 10px; width: 100%; }
+.reader-stage { flex: 1 1 auto; height: auto; min-height: 0; }
+.reader-host { background: var(--app-bg); }
+.comic-scale-fit-screen img { height: auto; max-height: 100%; max-width: 100%; width: auto; }
+.comic-scale-fit-width img { height: auto; max-width: 100%; width: 100%; }
+.comic-image-frame { align-items: center; display: flex; flex: 0 0 auto; height: 100%; justify-content: center; min-height: 100%; min-width: 100%; overflow: visible; }
+.comic-scale-custom .comic-image-frame { align-items: flex-start; justify-content: flex-start; min-height: 100%; min-width: 100%; }
+.comic-scale-custom img { height: auto; max-height: 100%; max-width: 100%; transform: scale(var(--comic-scale, 1)); transform-origin: top left; width: auto; }
+.comic-viewport.comic-is-zoomed { touch-action: auto; }
+.comic-mode-label { color: var(--app-muted); font-size: 12px; padding: 0 6px; }
+.comic-viewport { overscroll-behavior: contain; }
+.comic-viewport img { display: block; }
+.comic-pages-toggle { background: var(--app-surface-muted); }
+.reader-tap-hint { align-items: center; background: color-mix(in srgb, var(--app-heading) 86%, transparent); border: 1px solid var(--app-border); border-radius: 999px; bottom: 72px; color: var(--app-surface); display: flex; font-size: 12px; gap: 10px; left: 50%; max-width: calc(100% - 28px); padding: 8px 10px 8px 14px; position: absolute; transform: translateX(-50%); z-index: 8; }
+.reader-tap-hint button { background: transparent; border: 0; color: var(--app-accent); cursor: pointer; font-weight: 650; padding: 3px 4px; }
+.library-shortcuts { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; margin: 0 auto 12px; max-width: 1180px; padding: 0 28px; }
+.library-shortcuts a { background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 999px; color: var(--app-accent-strong); font-size: 13px; padding: 7px 12px; text-decoration: none; }
+.library-shortcuts a:hover { border-color: var(--app-accent); }
+
+@media (max-width: 840px), (pointer: coarse) and (hover: none) {
+  .reader-bottom-bar > button:first-child, .reader-bottom-bar > button:last-child { display: none; }
+  .reader-bottom-bar { justify-content: space-around; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  .reader-top-bar { gap: 6px; padding-top: max(9px, env(safe-area-inset-top)); }
+  .reader-top-bar .reader-title { font-size: 14px; }
+  .reader-top-bar .appearance-controls { display: none; }
+  .settings-panel { bottom: max(66px, calc(env(safe-area-inset-bottom) + 56px)); max-height: calc(100dvh - 130px); overflow-y: auto; right: 10px; top: auto; }
+  .comic-thumbs { max-height: 76px; overflow-y: hidden; }
+  .book-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 600px) {
+  .auth-appearance { right: 18px; top: 16px; }
+  .auth-shell { padding-left: 20px; padding-right: 20px; }
+  .library-head { margin-top: 68px; }
+  .home-nav { align-items: flex-start; gap: 12px; }
+  .home-actions { align-items: flex-end; gap: 7px; }
+  .home-actions .quiet-button { padding: 8px 9px; }
+  .library-toolbar { border-radius: 12px; padding: 10px; }
+  .library-breadcrumbs, .organization-actions, .organization-toolbar, .section-grid, .series-grid, .series-order, .shelf-hint { padding-left: 14px; padding-right: 14px; }
+  .section-grid, .series-grid { grid-template-columns: 1fr; }
+  .dialog-card { padding: 22px; }
+  .library-shortcuts { padding-left: 14px; padding-right: 14px; }
+}

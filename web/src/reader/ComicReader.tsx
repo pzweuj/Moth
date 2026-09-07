@@ -1,16 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 import type { BookDetail, ProgressBody } from "../api";
 import { bookFileUrl } from "../api";
 import { makeRangeLoader, type ZipLoader } from "./zipLoader";
 import { sortComicEntries } from "./comicPages";
 import { getOfflinePage, getOfflinePages, saveOfflinePage } from "../offline/db";
+import type { ComicSettings } from "./comicSettings";
+import { isMobileReadingLayout } from "./readerInteractions";
+import { translateError, useUi } from "../i18n";
+import { ReaderTapHint } from "./ReaderTapHint";
 
 interface ComicReaderProps {
   detail: BookDetail;
   onProgress: (progress: ProgressBody) => void;
+  settings: ComicSettings;
+  onBack?: () => void;
 }
-
-type FitMode = "width" | "height";
 
 const THUMB_RADIUS = 3;
 
@@ -32,14 +36,17 @@ function mapPageNumbers(names: string[], serverPages?: string[]): number[] {
  * loaded lazily; only the current page (plus a small window for the thumbnail
  * strip and one ahead/behind) is fetched from the server.
  */
-export function ComicReader({ detail, onProgress }: ComicReaderProps) {
+export function ComicReader({ detail, onProgress, settings, onBack }: ComicReaderProps) {
+  const { t } = useUi();
   const [pages, setPages] = useState<string[]>([]);
   const [index, setIndex] = useState(0);
   const [src, setSrc] = useState<string | null>(null);
-  const [fit, setFit] = useState<FitMode>("width");
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [pageError, setPageError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown | null>(null);
+  const [pageError, setPageError] = useState<unknown | null>(null);
+  // Keep the page strip tucked away on touch layouts so the image gets the
+  // full viewport by default. Desktop readers start with the panel visible.
+  const [pagesOpen, setPagesOpen] = useState(() => !isMobileReadingLayout());
   const [, refreshCache] = useState(0);
 
   const loaderRef = useRef<ZipLoader | null>(null);
@@ -52,6 +59,8 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const pageNumbersRef = useRef<number[]>([]);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const touchHandledRef = useRef(false);
+  const tapStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
   currentIndexRef.current = index;
@@ -172,7 +181,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     open().catch((err: unknown) => {
       if (cancelled) return;
       console.error("could not open comic", err);
-      setError(err instanceof Error ? err.message : "Could not open this comic.");
+      setError(err);
       setLoading(false);
     });
     const urls = urlsRef.current;
@@ -208,7 +217,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       .catch((err: unknown) => {
         if (!cancelled) {
           console.error("page load failed", err);
-          setPageError(err instanceof Error ? err.message : "Could not load this page.");
+          setPageError(err);
           setSrc(null);
         }
       });
@@ -251,8 +260,16 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     });
   }, [detail.page_count, pages, index]);
 
+  // A newly selected page always starts at its top-left origin. This matters
+  // when a custom zoom leaves a scroll position on the previous image.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    viewport?.scrollTo?.({ left: 0, top: 0, behavior: "auto" });
+  }, [index]);
+
   const goTo = useCallback(
     (target: number) => {
+      if (pages.length === 0) return;
       setIndex(Math.min(Math.max(0, target), pages.length - 1));
     },
     [pages.length],
@@ -260,6 +277,30 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
 
   const prev = useCallback(() => goTo(index - 1), [goTo, index]);
   const next = useCallback(() => goTo(index + 1), [goTo, index]);
+  const zoomed = settings.mode === "custom" && settings.scale > 100;
+
+  const handleViewportClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    if (touchHandledRef.current) {
+      touchHandledRef.current = false;
+      return;
+    }
+    const target = event.target as Element | null;
+    if (target?.closest("button,a,input,select,textarea,[contenteditable],.reader-tap-hint,.reader-error,.reader-loading")) return;
+    if (document.querySelector(".settings-panel, .reader-toc")) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (isMobileReadingLayout() && tapStartRef.current) {
+      const start = tapStartRef.current;
+      tapStartRef.current = null;
+      if (event.timeStamp - start.time > 550 || Math.abs(event.clientX - start.x) > 10 || Math.abs(event.clientY - start.y) > 10) return;
+      if (event.clientX < rect.left + rect.width * 0.3) prev();
+      else if (event.clientX > rect.left + rect.width * 0.7) next();
+      return;
+    }
+    if (!isMobileReadingLayout()) {
+      if (event.clientX < rect.left + rect.width / 2) prev();
+      else next();
+    }
+  }, [next, prev]);
 
   const retryPage = useCallback(() => {
     setPageError(null);
@@ -271,7 +312,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       }
       setPageError("Could not load this page.");
     }).catch((err: unknown) => {
-      setPageError(err instanceof Error ? err.message : "Could not load this page.");
+      setPageError(err);
     });
   }, [index, loadPage]);
 
@@ -305,74 +346,103 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
 
   return (
     <div className="reader-stage">
+      <ReaderTapHint />
       <div
-        className={`comic-viewport comic-fit-${fit}`}
+        ref={viewportRef}
+        className={`comic-viewport comic-scale-${settings.mode}${zoomed ? " comic-is-zoomed" : ""}`}
+        style={settings.mode === "custom" ? { "--comic-scale": `${settings.scale / 100}` } as CSSProperties : undefined}
         onPointerDown={(event) => {
-          if (event.pointerType === "touch") {
+          if (event.isPrimary === false) return;
+          const target = event.target as Element | null;
+          if (target?.closest("button,a,input,select,textarea,[contenteditable],.reader-tap-hint,.reader-error,.reader-loading")) return;
+          if (document.querySelector(".settings-panel, .reader-toc, [aria-modal='true']")) return;
+          if (event.pointerType === "touch" || isMobileReadingLayout() || zoomed) {
             touchStartRef.current = { x: event.clientX, y: event.clientY };
+            tapStartRef.current = { x: event.clientX, y: event.clientY, time: event.timeStamp };
             touchHandledRef.current = false;
           }
         }}
         onPointerUp={(event) => {
-          if (event.pointerType !== "touch" || !touchStartRef.current) return;
+          if (!touchStartRef.current) return;
           const start = touchStartRef.current;
           touchStartRef.current = null;
           const deltaX = event.clientX - start.x;
           const deltaY = event.clientY - start.y;
+          const viewport = viewportRef.current;
+          const canScroll = zoomed || Boolean(
+            viewport
+            && (viewport.scrollWidth > viewport.clientWidth + 1
+              || viewport.scrollHeight > viewport.clientHeight + 1),
+          );
+          // A zoomed image is a scroll surface. Once the pointer moved more
+          // than a tap threshold, consume the click so a horizontal drag
+          // cannot also turn the page after the browser scrolls the image.
+          if (canScroll && (Math.abs(deltaX) > 10 || Math.abs(deltaY) > 10)) {
+            touchHandledRef.current = true;
+            tapStartRef.current = null;
+            return;
+          }
           if (Math.abs(deltaX) > 44 && Math.abs(deltaX) > Math.abs(deltaY)) {
             touchHandledRef.current = true;
             if (deltaX < 0) next();
             else prev();
           }
         }}
-        onClick={(event) => {
-          if (touchHandledRef.current) {
-            touchHandledRef.current = false;
-            return;
-          }
-          const rect = event.currentTarget.getBoundingClientRect();
-          if (event.clientX < rect.left + rect.width / 2) prev();
-          else next();
+        onPointerCancel={() => {
+          touchStartRef.current = null;
+          tapStartRef.current = null;
         }}
+        onClick={handleViewportClick}
       >
         {src ? (
-          <img src={src} alt={`Page ${(pageNumbersRef.current[index] ?? index) + 1} of ${detail.page_count || pages.length}`} />
-        ) : pageError ? (
+          <div className="comic-image-frame">
+            <img src={src} alt={t("Page {{page}} of {{total}}", { page: (pageNumbersRef.current[index] ?? index) + 1, total: detail.page_count || pages.length })} />
+          </div>
+        ) : pageError !== null ? (
           <div className="reader-error">
-            <p>{pageError}</p>
-            <button type="button" onClick={(event) => { event.stopPropagation(); retryPage(); }}>Retry page</button>
+            <p>{translateError(pageError, t)}</p>
+            <button type="button" onClick={(event) => { event.stopPropagation(); retryPage(); }}>{t("Retry page")}</button>
           </div>
         ) : (
-          !error && <div className="reader-loading">Loading page…</div>
+          !error && <div className="reader-loading">{t("Loading page…")}</div>
         )}
-        {error && (
+        {error !== null && (
           <div className="reader-error">
-            <p>{error}</p>
-            <button type="button" onClick={() => window.history.back()}>
-              Back to library
+            <p>{translateError(error, t)}</p>
+            <button type="button" onClick={() => {
+              if (onBack) onBack();
+              else window.history.back();
+            }}>
+              {t("Back to library")}
             </button>
           </div>
         )}
       </div>
-      <div className="reader-bottom-bar">
-        <button type="button" onClick={(event) => { event.stopPropagation(); prev(); }} disabled={index <= 0}>
-          ← Prev
+      <div className="reader-bottom-bar" data-reader-controls="true">
+        <button type="button" onClick={(event) => { event.stopPropagation(); prev(); }} disabled={index <= 0} aria-label={t("Previous page")}>
+          ← {t("Prev")}
         </button>
         <span className="comic-counter">
-          {pages.length === 0 ? "—" : `${(pageNumbersRef.current[index] ?? index) + 1} / ${detail.page_count || pages.length}`}
+          {pages.length === 0 ? "—" : t("Page {{page}} of {{total}}", { page: (pageNumbersRef.current[index] ?? index) + 1, total: detail.page_count || pages.length })}
         </span>
         <button
+          className="comic-pages-toggle"
           type="button"
-          onClick={(event) => { event.stopPropagation(); setFit((mode) => (mode === "width" ? "height" : "width")); }}
+          aria-expanded={pagesOpen}
+          aria-controls="comic-pages-panel"
+          onClick={(event) => { event.stopPropagation(); setPagesOpen((open) => !open); }}
         >
-          Fit {fit === "width" ? "width" : "height"}
+          {t("Pages")} {pages.length ? `(${pages.length})` : ""}
         </button>
-        <button type="button" onClick={(event) => { event.stopPropagation(); next(); }} disabled={index >= pages.length - 1}>
-          Next →
+        <span className="comic-mode-label" aria-label={t("Image size")}>
+          {t(settings.mode === "fit-screen" ? "Fit screen" : settings.mode === "fit-width" ? "Fit width" : "Custom zoom")}
+        </span>
+        <button type="button" onClick={(event) => { event.stopPropagation(); next(); }} disabled={index >= pages.length - 1} aria-label={t("Next page")}>
+          {t("Next")} →
         </button>
       </div>
-      {windowPages.length > 0 && (
-        <div className="comic-thumbs" role="list" aria-label="Pages">
+      {pagesOpen && windowPages.length > 0 && (
+        <div id="comic-pages-panel" className="comic-thumbs" role="list" aria-label={t("Pages")}>
           {windowPages.map((name, offset) => {
             const i = thumbIndexOffset + offset;
             const thumbUrl = urlsRef.current.get(i);
@@ -383,7 +453,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
                 className={`comic-thumb ${i === index ? "is-active" : ""}`}
                 onClick={(event) => { event.stopPropagation(); goTo(i); }}
                 role="listitem"
-                aria-label={`Go to page ${i + 1}`}
+                aria-label={t("Go to page {{page}}", { page: i + 1 })}
                 aria-current={i === index ? "page" : undefined}
               >
                 {thumbUrl ? (
@@ -396,7 +466,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
           })}
         </div>
       )}
-      {loading && <div className="reader-loading">Opening comic…</div>}
+      {loading && <div className="reader-loading">{t("Opening comic…")}</div>}
     </div>
   );
 }

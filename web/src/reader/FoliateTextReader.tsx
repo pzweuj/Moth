@@ -9,6 +9,9 @@ import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
 import { getOfflineChapterIndices, saveOfflineChapter, saveOfflineResource } from "../offline/db";
 import { sanitizeBookDocument } from "./bookSanitizer";
+import { installTapNavigation } from "./readerInteractions";
+import { translateError, useUi } from "../i18n";
+import { ReaderTapHint } from "./ReaderTapHint";
 
 interface FoliateTextReaderProps {
   detail: BookDetail;
@@ -16,6 +19,9 @@ interface FoliateTextReaderProps {
   /** Optional explicit encoding for TXT decoding (reparses on change). */
   encoding?: string;
   onProgress: (progress: ProgressBody) => void;
+  /** Reports whether an EPUB declares a fixed (pre-paginated) layout. */
+  onLayoutChange?: (fixedLayout: boolean) => void;
+  onBack?: () => void;
 }
 
 type TocEntry = { label: string; href?: string; level: number };
@@ -209,19 +215,24 @@ export function FoliateTextReader({
   settings,
   encoding,
   onProgress,
+  onLayoutChange,
+  onBack,
 }: FoliateTextReaderProps) {
+  const { t } = useUi();
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<FoliateViewElement | null>(null);
   const publicationRef = useRef<TextPublication | null>(null);
   const onProgressRef = useRef(onProgress);
+  const onLayoutChangeRef = useRef(onLayoutChange);
   onProgressRef.current = onProgress;
+  onLayoutChangeRef.current = onLayoutChange;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const restoredRef = useRef(false);
   const [toc, setToc] = useState<TocEntry[]>([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -230,10 +241,13 @@ export function FoliateTextReader({
     const requestController = new AbortController();
     restoredRef.current = false;
     let view: FoliateViewElement | null = null;
+    let removeTapNavigation: (() => void) | undefined;
     let zipLoader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
     const reportPublicationError = (error: unknown) => {
       if (cancelled) return;
-      setError(error instanceof Error ? error.message : "This chapter is not cached yet. Connect to the server to continue reading.");
+      // Keep the original error object so a later language switch can render
+      // the same stable API code in the newly selected locale.
+      setError(error);
     };
     let publication: TextPublication | null = detail.format === "txt"
       ? new TextPublication(detail, encoding)
@@ -247,6 +261,10 @@ export function FoliateTextReader({
       ) as unknown as FoliateViewElement;
       view = element;
       host.append(element);
+      removeTapNavigation = installTapNavigation(element, {
+        previous: () => { void element.prev(); },
+        next: () => { void element.next(); },
+      });
 
       // EPUB/MOBI documents are user-provided HTML. The vendored renderer
       // already runs them in a sandbox; this second layer removes active
@@ -358,6 +376,10 @@ export function FoliateTextReader({
       }
 
       installBookTransformGuards(book);
+      onLayoutChangeRef.current?.(
+        detail.format === "epub"
+          && (book as unknown as { rendition?: { layout?: string } }).rendition?.layout === "pre-paginated",
+      );
       if (detail.format !== "txt" && !publication) installFoliateSectionCache(book, detail, requestController.signal);
 
       if (cancelled) {
@@ -427,7 +449,7 @@ export function FoliateTextReader({
     open().catch((err: unknown) => {
       if (cancelled) return;
       console.error("could not open book", err);
-      setError(err instanceof Error ? err.message : "Could not open this book.");
+      setError(err);
       setLoading(false);
     });
 
@@ -435,10 +457,12 @@ export function FoliateTextReader({
       cancelled = true;
       restoredRef.current = false;
       requestController.abort();
+      removeTapNavigation?.();
       void zipLoader?.close().catch(() => undefined);
       view?.close();
       view?.remove();
       viewRef.current = null;
+      onLayoutChangeRef.current?.(false);
       publication?.destroy();
       publicationRef.current = null;
     };
@@ -453,8 +477,18 @@ export function FoliateTextReader({
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
+    const currentLocation = view.lastLocation?.cfi
+      ?? (typeof view.lastLocation?.fraction === "number" ? { fraction: view.lastLocation.fraction } : undefined);
     view.renderer.setStyles(readerCss(settings));
     view.renderer.setAttribute("margin", `${settings.margin}px`);
+    // Changing font metrics causes Foliate to reflow its columns. Re-resolve
+    // the current CFI/fraction after the reflow so a slider change does not
+    // unexpectedly jump to the beginning of a chapter.
+    if (currentLocation !== undefined) {
+      requestAnimationFrame(() => {
+        if (viewRef.current === view) void view.goTo(currentLocation);
+      });
+    }
   }, [settings]);
 
   // Keyboard navigation (disabled while the contents drawer is open). Space
@@ -520,19 +554,23 @@ export function FoliateTextReader({
 
   return (
     <div className="reader-stage">
+      <ReaderTapHint />
       <div ref={hostRef} className="reader-host" />
-      {loading && <div className="reader-loading">Opening…</div>}
-      {error && (
+      {loading && <div className="reader-loading">{t("Opening…")}</div>}
+      {error !== null && (
         <div className="reader-error">
-          <p>{error}</p>
-          <button type="button" onClick={() => window.history.back()}>
-            Back to library
+            <p>{translateError(error, t)}</p>
+          <button type="button" onClick={() => {
+            if (onBack) onBack();
+            else window.history.back();
+          }}>
+            {t("Back to library")}
           </button>
         </div>
       )}
-      <div className="reader-bottom-bar">
-        <button type="button" onClick={prev} disabled={loading || !!error}>
-          ← Prev
+      <div className="reader-bottom-bar" data-reader-controls="true">
+        <button type="button" onClick={prev} disabled={loading || !!error} aria-label={t("Previous page")}>
+          ← {t("Prev")}
         </button>
         {toc.length > 0 && (
         <button
@@ -540,25 +578,26 @@ export function FoliateTextReader({
           ref={tocButtonRef}
           onClick={() => setTocOpen((open) => !open)}
           aria-expanded={tocOpen}
+          aria-label={t("Contents")}
         >
-          Contents
+          {t("Contents")}
         </button>
         )}
-        <button type="button" onClick={next} disabled={loading || !!error}>
-          Next →
+        <button type="button" onClick={next} disabled={loading || !!error} aria-label={t("Next page")}>
+          {t("Next")} →
         </button>
       </div>
       {tocOpen && toc.length > 0 && (
         <div
           className="reader-toc"
           role="dialog"
-          aria-label="Table of contents"
+          aria-label={t("Contents")}
           tabIndex={-1}
           ref={tocListRef}
         >
           <div className="reader-toc-head">
-            <span>Contents</span>
-            <button type="button" onClick={() => setTocOpen(false)} aria-label="Close contents">
+            <span>{t("Contents")}</span>
+            <button type="button" onClick={() => setTocOpen(false)} aria-label={t("Close contents")}>
               ✕
             </button>
           </div>
@@ -574,7 +613,7 @@ export function FoliateTextReader({
                   }}
                   disabled={!item.href}
                 >
-                  {item.label || `Chapter ${index + 1}`}
+                  {item.label || `${t("Chapter")} ${index + 1}`}
                 </button>
               </li>
             ))}

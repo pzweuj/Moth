@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Navigate, useNavigate, useParams } from "react-router-dom";
+import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, type ProgressBody } from "../api";
 import { ErrorBoundary } from "../ErrorBoundary";
@@ -12,7 +12,11 @@ import {
 import { useProgressSaver } from "./useProgressSaver";
 import { FoliateTextReader } from "./FoliateTextReader";
 import { ComicReader } from "./ComicReader";
+import { loadComicSettings, saveComicSettings, type ComicSettings, type ComicScaleMode } from "./comicSettings";
 import { getLocalProgress, getOfflineTxtEncoding, setOfflineTxtEncoding } from "../offline/db";
+import { translateError, useUi } from "../i18n";
+import { AppearanceControls } from "../ui/AppearanceControls";
+import type { ReaderReturnLocation } from "../library/LibraryPage";
 
 const SAVE_LABELS: Record<string, string> = {
   "local-saved": "Saved on device",
@@ -44,16 +48,33 @@ function storedTxtEncoding(bookId: number): string {
 }
 
 export function ReaderPage() {
+  const { t, theme: appTheme, setTheme: setAppTheme } = useUi();
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const bookId = Number(id);
+  const returnTo = (location.state as { returnTo?: ReaderReturnLocation } | null)?.returnTo;
+  const backToLibrary = useCallback(() => {
+    if (returnTo?.pathname?.startsWith("/")) {
+      navigate(returnTo.pathname, { replace: true, state: returnTo.state });
+    } else {
+      navigate("/", { replace: true });
+    }
+  }, [navigate, returnTo]);
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
+  const [comicSettings, setComicSettings] = useState<ComicSettings>(loadComicSettings);
+  const [fixedLayout, setFixedLayout] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [encoding, setEncoding] = useState(() => storedTxtEncoding(bookId));
   const [position, setPosition] = useState<ProgressBody | null>(null);
   const [localProgress, setLocalProgress] = useState<ProgressBody | null>(null);
   const [localProgressReady, setLocalProgressReady] = useState(false);
   const [offlineEncodingReady, setOfflineEncodingReady] = useState(true);
+
+  useEffect(() => {
+    const nextTheme: ReaderTheme = appTheme === "dark" ? "dark" : settings.theme === "dark" ? "light" : settings.theme;
+    if (nextTheme !== settings.theme) setSettings((current) => ({ ...current, theme: nextTheme }));
+  }, [appTheme, settings.theme]);
 
   const valid = Number.isInteger(bookId) && bookId > 0;
   const detail = useQuery({
@@ -159,6 +180,15 @@ export function ReaderPage() {
     saveSettings(settings);
   }, [settings]);
 
+  useEffect(() => {
+    saveComicSettings(comicSettings);
+  }, [comicSettings]);
+
+  const handleSettingsChange = useCallback((next: ReaderSettings) => {
+    setSettings(next);
+    setAppTheme(next.theme === "dark" ? "dark" : "light");
+  }, [setAppTheme]);
+
   // Escape closes the settings panel; focus moves into the panel when it
   // opens and returns to the toggle button when it closes.
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
@@ -189,7 +219,7 @@ export function ReaderPage() {
     return (
       <main className="state-screen">
         <span className="spinner" aria-hidden="true" />
-        <p>Opening your book…</p>
+        <p>{t("Opening your book…")}</p>
       </main>
     );
   }
@@ -201,15 +231,15 @@ export function ReaderPage() {
       : "This book could not be opened.";
     return (
       <main className="state-screen">
-        <p className="eyebrow">Moth / reader</p>
-        <h1>Book unavailable</h1>
-        <p>{message}</p>
+        <p className="eyebrow">{t("Moth / reader")}</p>
+        <h1>{t("Book unavailable")}</h1>
+        <p>{translateError(message, t)}</p>
         <button
           className="primary-button compact-button"
           type="button"
-          onClick={() => navigate("/")}
+          onClick={backToLibrary}
         >
-          Back to library
+          {t("Back to library")}
         </button>
       </main>
     );
@@ -219,7 +249,7 @@ export function ReaderPage() {
     return (
       <main className="state-screen">
         <span className="spinner" aria-hidden="true" />
-        <p>Restoring your place…</p>
+        <p>{t("Restoring your place…")}</p>
       </main>
     );
   }
@@ -232,8 +262,8 @@ export function ReaderPage() {
   return (
     <main className="reader-shell">
       <header className="reader-top-bar">
-        <button type="button" onClick={() => navigate("/")}>
-          ← Library
+        <button type="button" onClick={backToLibrary}>
+          ← {t("Your library")}
         </button>
         <span className="reader-title">{book.title}</span>
         {position && (
@@ -241,7 +271,7 @@ export function ReaderPage() {
         )}
         {saveState !== "idle" && (
           <span className={`save-indicator ${saveState}`} aria-live="polite">
-            {SAVE_LABELS[saveState]}
+            {t(SAVE_LABELS[saveState] ?? saveState)}
           </span>
         )}
         <span className="format-badge">{book.format}</span>
@@ -250,41 +280,48 @@ export function ReaderPage() {
           ref={settingsButtonRef}
           onClick={() => setSettingsOpen((open) => !open)}
           aria-expanded={settingsOpen}
-          aria-label="Reader settings"
+          aria-label={t("Reader settings")}
         >
           Aa
         </button>
+        <AppearanceControls compact />
       </header>
       {settingsOpen && (
         <SettingsPanel
           settings={settings}
-          onChange={setSettings}
+          onChange={handleSettingsChange}
           onClose={() => setSettingsOpen(false)}
           panelRef={settingsPanelRef}
           showEncoding={book.format === "txt"}
           encoding={encoding}
           onEncodingChange={handleEncodingChange}
+          isComic={book.format === "cbz"}
+          comicSettings={comicSettings}
+          onComicChange={setComicSettings}
+          fixedLayout={fixedLayout}
         />
       )}
       <ErrorBoundary
         key={`${book.id}:${book.content_version}:${book.format}:${encoding}`}
         fallback={(error) => (
           <div className="reader-error">
-            <p>{error.message || "This book could not be displayed."}</p>
-            <button type="button" onClick={() => navigate("/")}>
-              Back to library
+            <p>{translateError(error, t)}</p>
+            <button type="button" onClick={backToLibrary}>
+              {t("Back to library")}
             </button>
           </div>
         )}
       >
         {book.format === "cbz" ? (
-            <ComicReader detail={readerBook} onProgress={handleProgress} />
+            <ComicReader detail={readerBook} onProgress={handleProgress} settings={comicSettings} onBack={backToLibrary} />
         ) : (
           <FoliateTextReader
             detail={readerBook}
             settings={settings}
             encoding={encoding}
             onProgress={handleProgress}
+            onLayoutChange={setFixedLayout}
+            onBack={backToLibrary}
           />
         )}
       </ErrorBoundary>
@@ -325,6 +362,10 @@ function SettingsPanel({
   showEncoding,
   encoding,
   onEncodingChange,
+  isComic,
+  comicSettings,
+  onComicChange,
+  fixedLayout,
 }: {
   settings: ReaderSettings;
   onChange: (settings: ReaderSettings) => void;
@@ -333,7 +374,12 @@ function SettingsPanel({
   showEncoding: boolean;
   encoding: string;
   onEncodingChange: (encoding: string) => void;
+  isComic: boolean;
+  comicSettings: ComicSettings;
+  onComicChange: (settings: ComicSettings) => void;
+  fixedLayout: boolean;
 }) {
+  const { t } = useUi();
   const update = <K extends keyof ReaderSettings>(
     key: K,
     value: ReaderSettings[K],
@@ -343,67 +389,110 @@ function SettingsPanel({
     { value: "sepia", label: "Sepia" },
     { value: "dark", label: "Dark" },
   ];
+  const visibleThemes = isComic ? themes.filter((theme) => theme.value !== "sepia") : themes;
+  const activeTheme = isComic && settings.theme === "sepia" ? "light" : settings.theme;
   return (
     <div
       className="settings-panel"
       role="dialog"
-      aria-label="Reader settings"
+      aria-label={t("Reader settings")}
       tabIndex={-1}
       ref={panelRef}
     >
-      <div className="settings-row">
+      <div className="settings-appearance">
+        <AppearanceControls compact showTheme={false} />
+      </div>
+      {fixedLayout && <p className="settings-note">{t("Fixed-layout EPUBs keep their original layout; text reflow is unavailable.")}</p>}
+      {!isComic && <div className="settings-row">
         <label>
-          <span>Font size</span>
+          <span>{t("Font size")}</span>
+          <button type="button" className="settings-stepper" disabled={fixedLayout} onClick={() => update("fontSize", Math.max(12, settings.fontSize - 1))} aria-label={t("Decrease font size")}>−</button>
           <input
             type="range"
             min={12}
-            max={28}
+            max={36}
             step={1}
             value={settings.fontSize}
+            disabled={fixedLayout}
+            aria-label={t("Font size")}
             onChange={(event) => update("fontSize", Number(event.target.value))}
           />
+          <button type="button" className="settings-stepper" disabled={fixedLayout} onClick={() => update("fontSize", Math.min(36, settings.fontSize + 1))} aria-label={t("Increase font size")}>+</button>
           <output>{settings.fontSize}px</output>
         </label>
-      </div>
-      <div className="settings-row">
+      </div>}
+      {!isComic && <div className="settings-row">
         <label>
-          <span>Line height</span>
+          <span>{t("Line height")}</span>
           <input
             type="range"
             min={1.3}
             max={2.2}
             step={0.1}
             value={settings.lineHeight}
+            disabled={fixedLayout}
+            aria-label={t("Line height")}
             onChange={(event) => update("lineHeight", Number(event.target.value))}
           />
           <output>{settings.lineHeight.toFixed(1)}</output>
         </label>
-      </div>
-      <div className="settings-row">
+      </div>}
+      {!isComic && <div className="settings-row">
         <label>
-          <span>Margin</span>
+          <span>{t("Margin")}</span>
           <input
             type="range"
             min={0}
             max={48}
             step={2}
             value={settings.margin}
+            disabled={fixedLayout}
+            aria-label={t("Margin")}
             onChange={(event) => update("margin", Number(event.target.value))}
           />
           <output>{settings.margin}px</output>
         </label>
-      </div>
+      </div>}
+      {isComic && <>
+        <div className="settings-row">
+          <span>{t("Image size")}</span>
+          <div className="theme-options" role="group" aria-label={t("Image size")}>
+            {(["fit-screen", "fit-width", "custom"] as ComicScaleMode[]).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                className={comicSettings.mode === mode ? "is-active" : ""}
+                aria-pressed={comicSettings.mode === mode}
+                onClick={() => onComicChange({ ...comicSettings, mode })}
+              >
+                {t(mode === "fit-screen" ? "Fit screen" : mode === "fit-width" ? "Fit width" : "Custom zoom")}
+              </button>
+            ))}
+          </div>
+        </div>
+        {comicSettings.mode === "custom" && <div className="settings-row">
+          <label>
+            <span>{t("Zoom")}</span>
+            <button type="button" className="settings-stepper" onClick={() => onComicChange({ ...comicSettings, scale: Math.max(50, comicSettings.scale - 10) })} aria-label={t("Decrease zoom")}>−</button>
+            <input type="range" min={50} max={300} step={10} value={comicSettings.scale} aria-label={t("Zoom")} onChange={(event) => onComicChange({ ...comicSettings, scale: Number(event.target.value) })} />
+            <button type="button" className="settings-stepper" onClick={() => onComicChange({ ...comicSettings, scale: Math.min(300, comicSettings.scale + 10) })} aria-label={t("Increase zoom")}>+</button>
+            <output>{comicSettings.scale}%</output>
+          </label>
+        </div>}
+        <button type="button" className="settings-reset" onClick={() => onComicChange({ mode: "fit-screen", scale: 100 })}>{t("Reset")}</button>
+      </>}
       <div className="settings-row">
-        <span>Theme</span>
-        <div className="theme-options" role="group" aria-label="Theme">
-          {themes.map((theme) => (
+        <span>{t("Theme")}</span>
+        <div className="theme-options" role="group" aria-label={t("Theme")}>
+          {visibleThemes.map((theme) => (
             <button
               key={theme.value}
               type="button"
-              className={settings.theme === theme.value ? "is-active" : ""}
-              onClick={() => update("theme", theme.value)}
+              className={activeTheme === theme.value ? "is-active" : ""}
+              aria-pressed={activeTheme === theme.value}
+                onClick={() => update("theme", theme.value)}
             >
-              {theme.label}
+              {t(theme.label)}
             </button>
           ))}
         </div>
@@ -411,14 +500,15 @@ function SettingsPanel({
       {showEncoding && (
         <div className="settings-row">
           <label>
-            <span>Encoding</span>
+            <span>{t("Encoding")}</span>
             <select
               value={encoding}
+              aria-label={t("Encoding")}
               onChange={(event) => onEncodingChange(event.target.value)}
             >
               {TXT_ENCODINGS.map((option) => (
                 <option key={option.value} value={option.value}>
-                  {option.label}
+                  {option.label === "Auto" ? t("Auto") : option.label}
                 </option>
               ))}
             </select>
@@ -426,7 +516,7 @@ function SettingsPanel({
         </div>
       )}
       <button type="button" className="settings-close" onClick={onClose}>
-        Done
+        {t("Done")}
       </button>
     </div>
   );
