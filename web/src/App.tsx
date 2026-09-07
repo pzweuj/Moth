@@ -18,6 +18,7 @@ import {
 import { api, type BookSummary, type SessionState } from "./api";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { ReaderPage } from "./reader/ReaderPage";
+import { useOfflineBook } from "./offline/useOfflineBook";
 
 const queryOptions = {
   retry: 1,
@@ -59,6 +60,24 @@ function AppRoutes() {
     enabled: setup.data?.initialized === true,
   });
 
+  useEffect(() => {
+    const onOnline = () => {
+      void (async () => {
+        // A deferred server logout must be attempted before progress writes;
+        // this preserves the user's explicit sign-out boundary after a
+        // reconnect.
+        await api.flushPendingLogout();
+        await api.flushPendingProgress();
+      })();
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, []);
+
+  useEffect(() => {
+    if (session.data?.authenticated && !session.data.offline) void api.flushPendingProgress();
+  }, [session.data?.authenticated, session.data?.offline]);
+
   if (setup.isPending || (setup.data?.initialized && session.isPending)) {
     return <LoadingScreen label="Opening your library" />;
   }
@@ -74,7 +93,9 @@ function AppRoutes() {
   }
 
   return (
-    <Routes>
+    <>
+      <UpdateNotice />
+      <Routes>
       <Route
         path="/setup"
         element={<SetupPage initialized={setup.data.initialized} />}
@@ -105,7 +126,41 @@ function AppRoutes() {
         }
       />
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+    </>
+  );
+}
+
+function UpdateNotice() {
+  const [registration, setRegistration] = useState<ServiceWorkerRegistration | null>(null);
+
+  useEffect(() => {
+    const onUpdate = (event: Event) => {
+      const next = (event as CustomEvent<ServiceWorkerRegistration>).detail;
+      if (next?.waiting) setRegistration(next);
+    };
+    window.addEventListener("moth-sw-update", onUpdate);
+    return () => window.removeEventListener("moth-sw-update", onUpdate);
+  }, []);
+
+  if (!registration?.waiting) return null;
+
+  const apply = () => {
+    const waiting = registration.waiting;
+    if (!waiting) return;
+    const reload = () => {
+      navigator.serviceWorker.removeEventListener("controllerchange", reload);
+      window.location.reload();
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", reload);
+    waiting.postMessage({ type: "SKIP_WAITING" });
+  };
+
+  return (
+    <div className="update-notice" role="status">
+      <span>A new Moth version is ready.</span>
+      <button type="button" onClick={apply}>Refresh</button>
+    </div>
   );
 }
 
@@ -191,7 +246,7 @@ function LoginPage({ initialized, session }: { initialized: boolean; session?: S
   if (!initialized) {
     return <Navigate to="/setup" replace />;
   }
-  if (session?.authenticated) {
+  if (session?.authenticated && !session.offline) {
     return <Navigate to="/" replace />;
   }
 
@@ -253,13 +308,21 @@ function LibraryPage({ session }: { session?: SessionState }) {
   });
   const logout = useMutation({
     mutationFn: api.logout,
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.setQueryData<SessionState>(["session"], {
         authenticated: false,
       });
       navigate("/login", { replace: true });
     },
   });
+
+  const requestLogout = async () => {
+    if (await api.hasPendingProgress()
+      && !window.confirm("Some reading progress has not synced. Sign out and clear this device anyway?")) {
+      return;
+    }
+    logout.mutate();
+  };
 
   useEffect(() => {
     if (!scanStatus.data?.scanning) {
@@ -288,6 +351,11 @@ function LibraryPage({ session }: { session?: SessionState }) {
       <header className="home-nav">
         <span className="wordmark">Moth <span>/</span> personal library</span>
         <div className="home-actions">
+          {session?.offline && (
+            <button className="quiet-button" type="button" onClick={() => navigate("/login")}>
+              Sign in to sync
+            </button>
+          )}
           <button
             className="quiet-button"
             type="button"
@@ -296,7 +364,7 @@ function LibraryPage({ session }: { session?: SessionState }) {
           >
             {scanning ? "Scanning…" : scan.isPending ? "Starting…" : "Rescan library"}
           </button>
-          <button className="quiet-button" type="button" onClick={() => logout.mutate()} disabled={logout.isPending}>
+          <button className="quiet-button" type="button" onClick={() => void requestLogout()} disabled={logout.isPending}>
             {logout.isPending ? "Leaving…" : "Sign out"}
           </button>
         </div>
@@ -329,6 +397,7 @@ function LibraryPage({ session }: { session?: SessionState }) {
             </button>
           ))}
         </div>
+        <OfflineStorageStatus />
       </div>
 
       {scanning && (
@@ -369,12 +438,47 @@ function LibraryPage({ session }: { session?: SessionState }) {
   );
 }
 
+function OfflineStorageStatus() {
+  const [estimate, setEstimate] = useState<StorageEstimate | null>(null);
+
+  useEffect(() => {
+    const storage = typeof navigator !== "undefined" ? navigator.storage : undefined;
+    if (!storage?.estimate) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const next = await storage.estimate();
+        if (!cancelled) setEstimate(next);
+      } catch {
+        // Storage estimates are optional and may be denied in private mode.
+      }
+    };
+    void refresh();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (!estimate?.quota) return null;
+  return (
+    <span className="storage-note" title="Approximate browser storage usage">
+      Offline storage {formatBytes(estimate.usage ?? 0)} / {formatBytes(estimate.quota)}
+    </span>
+  );
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
 function BookCard({ book }: { book: BookSummary }) {
+  const offline = useOfflineBook(book);
+  const coverUrl = offline.state === "available" ? offline.coverUrl : book.cover_url;
   const card = (
     <>
       <div className="book-cover">
-        {book.has_cover && book.cover_url ? (
-          <img src={book.cover_url} alt="" loading="lazy" />
+        {book.has_cover && coverUrl ? (
+          <img src={coverUrl} alt="" loading="lazy" />
         ) : (
           <div className="book-cover-placeholder" aria-hidden="true">
             <span className="cover-format">{book.format.toUpperCase()}</span>
@@ -410,6 +514,20 @@ function BookCard({ book }: { book: BookSummary }) {
       <Link className="book-card-link" to={`/reader/${book.id}`} aria-label={`Read ${book.title}`}>
         {card}
       </Link>
+      <button
+        className={`offline-book-button ${offline.state}`}
+        type="button"
+        onClick={() => void offline.toggle()}
+        disabled={offline.state === "unknown"}
+        aria-label={offline.state === "available"
+          ? `Remove ${book.title} from this device`
+          : offline.state === "downloading"
+            ? `Cancel download of ${book.title}`
+            : `Download ${book.title} for offline reading`}
+      >
+        {offline.state === "available" ? "On this device" : offline.state === "downloading" ? `Cancel download (${Math.round(offline.progress)}%)` : offline.state === "error" ? "Retry download" : "Download for offline"}
+      </button>
+      {offline.errorMessage && <span className="offline-error" role="status">{offline.errorMessage}</span>}
     </li>
   );
 }

@@ -12,6 +12,11 @@ Pinned at commit `78914aef4466eb960965702401634c2cb348e9b1` (2026-09-06).
 - **Additions (not from upstream):** the `*.d.ts` files in this tree. They are
   minimal ambient type declarations for the modules Moth imports; they do not
   change upstream code.
+- **Security patch:** Moth removes `allow-scripts` from the paginator and
+  fixed-layout iframe sandboxes. Book XHTML is untrusted content; reader
+  controls and navigation are implemented by the parent document. The React
+  reader also sanitizes chapter documents and installs a document-level CSP
+  before Foliate lays them out.
 - The vendored `vendor/zip.js` is a trimmed build without `HttpRangeReader`.
   Moth's range-based loading uses the full `@zip.js/zip.js` npm package instead
   (see `web/src/reader/zipLoader.ts`).

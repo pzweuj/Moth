@@ -82,7 +82,12 @@ export class TextPublication {
   async #load(id: string): Promise<string> {
     const cached = this.#blobs.get(id);
     if (cached) return cached;
-    const chapter = await api.getChapter(this.detail.id, Number(id), this.#encoding);
+    const chapter = await api.getChapter(
+      this.detail.id,
+      Number(id),
+      this.#encoding,
+      this.detail.content_version,
+    );
     const html = wrapChapter(chapter.title, chapter.content);
     const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
     this.#blobs.set(id, url);
@@ -107,5 +112,6 @@ function escapeHtml(text: string): string {
 
 function wrapChapter(title: string, content: string): string {
   const heading = title ? `<h1>${escapeHtml(title)}</h1>` : "";
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>${heading}${content}</body></html>`;
+  const csp = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body>${heading}${content}</body></html>`;
 }

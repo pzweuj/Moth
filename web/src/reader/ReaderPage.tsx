@@ -12,10 +12,13 @@ import {
 import { useProgressSaver } from "./useProgressSaver";
 import { FoliateTextReader } from "./FoliateTextReader";
 import { ComicReader } from "./ComicReader";
+import { getLocalProgress, getOfflineTxtEncoding, setOfflineTxtEncoding } from "../offline/db";
 
 const SAVE_LABELS: Record<string, string> = {
   saving: "Saving…",
   saved: "Saved",
+  offline: "Saved on device",
+  "needs-login": "Sign in to sync",
   error: "Save failed",
 };
 
@@ -30,17 +33,38 @@ export const TXT_ENCODINGS = [
   { value: "utf-16be", label: "UTF-16BE" },
 ] as const;
 
+function storedTxtEncoding(bookId: number): string {
+  try {
+    return localStorage.getItem(`moth:txt-encoding:${bookId}`) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 export function ReaderPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const bookId = Number(id);
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [encoding, setEncoding] = useState("");
+  const [encoding, setEncoding] = useState(() => storedTxtEncoding(bookId));
   const [position, setPosition] = useState<ProgressBody | null>(null);
+  const [localProgress, setLocalProgress] = useState<ProgressBody | null>(null);
+  const [localProgressReady, setLocalProgressReady] = useState(false);
+  const [offlineEncodingReady, setOfflineEncodingReady] = useState(true);
 
   const valid = Number.isInteger(bookId) && bookId > 0;
-  const { onProgress, saveState } = useProgressSaver(valid ? bookId : 0);
+  const detail = useQuery({
+    queryKey: ["book", bookId, encoding],
+    queryFn: () => api.getBook(bookId, encoding),
+    enabled: valid,
+  });
+  const { onProgress, saveState } = useProgressSaver(
+    valid ? bookId : 0,
+    detail.data?.content_version,
+    localProgress?.revision ?? detail.data?.progress?.revision ?? 0,
+    detail.data?.format === "txt" ? encoding : undefined,
+  );
 
   const handleProgress = useCallback(
     (progress: ProgressBody) => {
@@ -50,11 +74,83 @@ export function ReaderPage() {
     [onProgress],
   );
 
-  const detail = useQuery({
-    queryKey: ["book", bookId],
-    queryFn: () => api.getBook(bookId),
-    enabled: valid,
-  });
+  useEffect(() => {
+    const value = detail.data;
+    if (!value) {
+      setOfflineEncodingReady(true);
+      setLocalProgressReady(false);
+      return;
+    }
+    let cancelled = false;
+    const expectedEncoding = value.format === "txt" ? encoding : undefined;
+    if (value.format !== "txt" || navigator.onLine) setOfflineEncodingReady(true);
+    setLocalProgress(null);
+    setLocalProgressReady(false);
+    void getLocalProgress(value.id, value.content_version, expectedEncoding).then((progress) => {
+      if (!cancelled) {
+        if (progress && isProgressForVersion(progress, value.content_version, expectedEncoding)) {
+          setLocalProgress(progress);
+          setPosition(progress);
+        } else {
+          setPosition(progressForReader(value.progress, value.content_version, expectedEncoding) ?? null);
+        }
+        setLocalProgressReady(true);
+      }
+    }).catch(() => {
+      // Private browser storage is optional; the server position remains usable.
+      if (!cancelled) {
+        setPosition(progressForReader(value.progress, value.content_version, expectedEncoding) ?? null);
+        setLocalProgressReady(true);
+      }
+    });
+    return () => { cancelled = true; };
+  // Only reload local progress when the book identity, content, or TXT
+  // decoder changes;
+  // ordinary progress refetches must not restart the reader.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail.data?.id, detail.data?.content_version, detail.data?.format, encoding]);
+
+  useEffect(() => {
+    const value = detail.data;
+    if (!value || value.format !== "txt") return;
+    const preferred = storedTxtEncoding(value.id);
+    void getOfflineTxtEncoding(value.id, value.content_version).then((cached) => {
+      if (navigator.onLine) {
+        if (preferred && preferred !== encoding) setEncoding(preferred);
+        setOfflineEncodingReady(true);
+        return;
+      }
+      const cachedEncoding = cached === "auto" ? "" : cached;
+      // While offline, only the encoding whose chapters were downloaded is
+      // available. Prefer it over a stale browser preference so opening a
+      // cached TXT book cannot ask IndexedDB for chapters that do not exist.
+      if (!navigator.onLine && cached && cachedEncoding !== encoding) {
+        setEncoding(cachedEncoding);
+      } else if (preferred && preferred !== encoding) {
+        setEncoding(preferred);
+      } else if (!preferred && cachedEncoding && cachedEncoding !== encoding) {
+        setEncoding(cachedEncoding);
+      }
+      setOfflineEncodingReady(true);
+    }).catch(() => {
+      // The automatic decoder remains the fallback when private storage is unavailable.
+      setOfflineEncodingReady(true);
+    });
+  // The same identity-based dependency rule keeps encoding changes local.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail.data?.id, detail.data?.content_version, detail.data?.format, encoding]);
+
+  const handleEncodingChange = useCallback((value: string) => {
+    setEncoding(value);
+    const book = detail.data;
+    if (!book) return;
+    try {
+      localStorage.setItem(`moth:txt-encoding:${book.id}`, value);
+    } catch {
+      // Keep the in-memory choice when localStorage is unavailable.
+    }
+    void setOfflineTxtEncoding(book.id, book.content_version, value);
+  }, [detail.data]);
 
   useEffect(() => {
     saveSettings(settings);
@@ -97,11 +193,14 @@ export function ReaderPage() {
 
   const book = detail.data;
   if (detail.isError || !book) {
+    const message = detail.error instanceof Error
+      ? detail.error.message
+      : "This book could not be opened.";
     return (
       <main className="state-screen">
         <p className="eyebrow">Moth / reader</p>
         <h1>Book unavailable</h1>
-        <p>This book could not be opened.</p>
+        <p>{message}</p>
         <button
           className="primary-button compact-button"
           type="button"
@@ -113,6 +212,20 @@ export function ReaderPage() {
     );
   }
 
+  if (!localProgressReady || !offlineEncodingReady) {
+    return (
+      <main className="state-screen">
+        <span className="spinner" aria-hidden="true" />
+        <p>Restoring your place…</p>
+      </main>
+    );
+  }
+
+  const expectedEncoding = book.format === "txt" ? encoding : undefined;
+  const serverProgress = progressForReader(book.progress, book.content_version, expectedEncoding);
+  const readerBook = localProgress
+    ? { ...book, progress: localProgress }
+    : { ...book, progress: serverProgress };
   return (
     <main className="reader-shell">
       <header className="reader-top-bar">
@@ -147,11 +260,11 @@ export function ReaderPage() {
           panelRef={settingsPanelRef}
           showEncoding={book.format === "txt"}
           encoding={encoding}
-          onEncodingChange={setEncoding}
+          onEncodingChange={handleEncodingChange}
         />
       )}
       <ErrorBoundary
-        key={book.id}
+        key={`${book.id}:${book.content_version}:${book.format}:${encoding}`}
         fallback={(error) => (
           <div className="reader-error">
             <p>{error.message || "This book could not be displayed."}</p>
@@ -162,10 +275,10 @@ export function ReaderPage() {
         )}
       >
         {book.format === "cbz" ? (
-          <ComicReader detail={book} onProgress={handleProgress} />
+            <ComicReader detail={readerBook} onProgress={handleProgress} />
         ) : (
           <FoliateTextReader
-            detail={book}
+            detail={readerBook}
             settings={settings}
             encoding={encoding}
             onProgress={handleProgress}
@@ -174,6 +287,31 @@ export function ReaderPage() {
       </ErrorBoundary>
     </main>
   );
+}
+
+function isProgressForVersion(
+  progress: ProgressBody,
+  contentVersion: string,
+  expectedEncoding?: string,
+): boolean {
+  // Legacy rows have no content version and are safe to use because the
+  // migration never had a CFI to restore.
+  if (progress.content_version && progress.content_version !== contentVersion) return false;
+  if (expectedEncoding === undefined) return !progress.encoding;
+  const actual = progress.encoding?.trim().toLowerCase() || "auto";
+  const expected = expectedEncoding.trim().toLowerCase() || "auto";
+  return actual === expected;
+}
+
+function progressForReader(
+  progress: ProgressBody | undefined,
+  contentVersion: string,
+  expectedEncoding?: string,
+): ProgressBody | undefined {
+  if (!progress) return undefined;
+  // A CFI, chapter index, and percentage all refer to the decoded publication.
+  // Do not restore a stale location after a file or TXT decoder changes.
+  return isProgressForVersion(progress, contentVersion, expectedEncoding) ? progress : undefined;
 }
 
 function SettingsPanel({

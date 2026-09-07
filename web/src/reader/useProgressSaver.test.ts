@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, type ProgressBody } from "../api";
+import { api, ApiError, type ProgressBody } from "../api";
 import { useProgressSaver } from "./useProgressSaver";
 
 vi.mock("../api", async (importOriginal) => {
@@ -25,12 +25,14 @@ function flushTimers() {
 describe("useProgressSaver", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     putProgress.mockReset();
     putProgress.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it("debounces saves and keeps only the latest location", async () => {
@@ -87,5 +89,15 @@ describe("useProgressSaver", () => {
       percent: 2,
     });
     await vi.waitFor(() => expect(result.current.saveState).toBe("saved"));
+  });
+
+  it("distinguishes an expired session from a transport failure", async () => {
+    putProgress.mockRejectedValueOnce(new ApiError(401, "invalid_credentials", "Sign in again"));
+    const { result } = renderHook(() => useProgressSaver(7));
+    act(() => {
+      result.current.onProgress({ chapter_index: 0, page_index: 0, percent: 1 });
+    });
+    flushTimers();
+    await vi.waitFor(() => expect(result.current.saveState).toBe("needs-login"));
   });
 });

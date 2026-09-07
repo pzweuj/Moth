@@ -1,5 +1,6 @@
 import {
   BlobWriter,
+  BlobReader,
   HttpRangeReader,
   TextWriter,
   ZipReader,
@@ -13,6 +14,7 @@ export interface ZipLoader {
   loadText(filename: string): Promise<string | null>;
   loadBlob(filename: string, type?: string): Promise<Blob | null>;
   getSize(filename: string): number;
+  close(): Promise<void>;
 }
 
 /**
@@ -20,10 +22,31 @@ export interface ZipLoader {
  * fetching only the entries that are actually needed. The server serves the
  * book file with `Accept-Ranges: bytes` and `206` responses.
  */
-export async function makeRangeLoader(url: string): Promise<ZipLoader> {
+export async function makeRangeLoader(
+  url: string,
+  offlineBlob?: Blob,
+  signal?: AbortSignal,
+  contentVersion?: string,
+): Promise<ZipLoader> {
   configure({ useWebWorkers: false });
-  const reader = new ZipReader(new HttpRangeReader(url));
-  const entries = await reader.getEntries();
+  const reader = new ZipReader(
+    offlineBlob
+      ? new BlobReader(offlineBlob)
+      : new HttpRangeReader(url, {
+        fetch: (input, init) => {
+          const headers = new Headers(init?.headers);
+          if (contentVersion) headers.set("If-Match", `"${contentVersion}"`);
+          return fetch(input, { ...init, headers, signal });
+        },
+      }),
+  );
+  let entries: Awaited<ReturnType<typeof reader.getEntries>>;
+  try {
+    entries = await reader.getEntries();
+  } catch (error) {
+    await reader.close().catch(() => undefined);
+    throw error;
+  }
   const byName = new Map<string, FileEntry>();
   for (const entry of entries) {
     if (entry.directory) continue;
@@ -40,5 +63,6 @@ export async function makeRangeLoader(url: string): Promise<ZipLoader> {
       return entry ? entry.getData(new BlobWriter(type)) : null;
     },
     getSize: (name) => byName.get(name)?.uncompressedSize ?? 0,
+    close: () => reader.close(),
   };
 }

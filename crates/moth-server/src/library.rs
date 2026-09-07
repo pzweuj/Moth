@@ -3,6 +3,7 @@
 //! derived content (chapters, resources, cover thumbnails) in the writable
 //! data directory.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use axum::extract::State;
@@ -54,18 +55,37 @@ pub async fn start_scan_on(state: &AppState) -> Result<(), AppError> {
 }
 
 async fn run_scan(state: &AppState) -> Result<(), AppError> {
-    let books_dir = state.config.books_dir.clone();
-    if !books_dir.is_dir() {
-        state.scan_status.lock().await.message =
-            format!("books directory not found: {}", books_dir.display());
-        return Ok(());
-    }
+    state.txt_cache.lock().await.clear();
+    let configured_books_dir = state.config.books_dir.clone();
+    let books_dir = match tokio::fs::canonicalize(&configured_books_dir).await {
+        Ok(path) if path.is_dir() => path,
+        Ok(path) => {
+            state.scan_status.lock().await.message =
+                format!("books directory is not a directory: {}", path.display());
+            return Ok(());
+        }
+        Err(error) => {
+            state.scan_status.lock().await.message = format!(
+                "books directory not found: {} ({error})",
+                configured_books_dir.display()
+            );
+            return Ok(());
+        }
+    };
 
     let books_dir_for_scan = books_dir.clone();
-    let files: Vec<PathBuf> =
-        tokio::task::spawn_blocking(move || collect_books(&books_dir_for_scan))
-            .await
-            .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let collected = tokio::task::spawn_blocking(move || collect_books(&books_dir_for_scan))
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+
+    let CollectedBooks {
+        files,
+        mut complete,
+    } = collected;
+    if !complete {
+        state.scan_status.lock().await.message =
+            "Library scan was incomplete; existing books were kept".to_owned();
+    }
 
     state.scan_status.lock().await.total = files.len() as u64;
 
@@ -95,18 +115,14 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
         let (hash, size) = match hashed {
             Ok(values) => values,
             Err(error) => {
-                // The file could not be read (removed mid-scan, permission
-                // changes, ...). Record it so the shelf shows the failure
-                // instead of silently dropping it.
-                store_parse_error(
-                    state,
-                    &relative,
-                    format,
-                    String::new(),
-                    0,
-                    &error.to_string(),
-                )
-                .await?;
+                // A file can disappear or become unreadable after directory
+                // enumeration. Treat that as an incomplete scan and keep the
+                // previous indexed content and progress; turning it into a
+                // parse error would destroy the only usable representation.
+                complete = false;
+                mark_incomplete(state).await;
+                tracing::warn!(%relative, %error, "book could not be read during scan");
+                state.scan_status.lock().await.errors += 1;
                 bump_processed(state).await;
                 continue;
             }
@@ -117,13 +133,42 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
             continue;
         }
 
-        let parsed =
-            tokio::task::spawn_blocking(move || moth_format::ParsedBook::parse_as(&path, format))
+        let parse_path = path.clone();
+        let parsed = tokio::task::spawn_blocking(move || {
+            moth_format::ParsedBook::parse_as(&parse_path, format)
+        })
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+
+        // Some format libraries wrap an open/read failure in a format error
+        // instead of preserving the underlying IO variant. Re-check the file
+        // before replacing an existing row so a file disappearing during the
+        // parse cannot erase its last good chapters or progress.
+        if parsed.is_err() {
+            let readable_path = path.clone();
+            let readable = tokio::task::spawn_blocking(move || hash_file(&readable_path).is_ok())
                 .await
                 .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+            if !readable {
+                complete = false;
+                mark_incomplete(state).await;
+                tracing::warn!(%relative, "book disappeared or became unreadable during parse");
+                state.scan_status.lock().await.errors += 1;
+                bump_processed(state).await;
+                continue;
+            }
+        }
 
         match parsed {
             Ok(mut book) => store_book(state, &relative, format, hash, size, &mut book).await?,
+            Err(error) if matches!(error, moth_format::ParseError::Io(_)) => {
+                // Parsing may lose a race with a file replacement/removal.
+                // Preserve the previous row and skip pruning for this scan.
+                complete = false;
+                mark_incomplete(state).await;
+                tracing::warn!(%relative, %error, "book disappeared while parsing");
+                state.scan_status.lock().await.errors += 1;
+            }
             Err(error) => {
                 store_parse_error(state, &relative, format, hash, size, &error.to_string()).await?
             }
@@ -131,7 +176,9 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
         bump_processed(state).await;
     }
 
-    prune_missing(state, &seen).await?;
+    if complete {
+        prune_missing(state, &seen).await?;
+    }
     Ok(())
 }
 
@@ -140,31 +187,109 @@ async fn bump_processed(state: &AppState) {
     status.processed += 1;
 }
 
-fn collect_books(dir: &Path) -> Vec<PathBuf> {
+async fn mark_incomplete(state: &AppState) {
+    state.scan_status.lock().await.message =
+        "Library scan was incomplete; existing books were kept".to_owned();
+}
+
+struct CollectedBooks {
+    files: Vec<PathBuf>,
+    complete: bool,
+}
+
+fn collect_books(dir: &Path) -> CollectedBooks {
     let mut out = Vec::new();
+    let mut complete = true;
     let mut stack = vec![dir.to_path_buf()];
+    let mut visited_dirs = HashSet::new();
     while let Some(current) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&current) else {
+        // Canonical paths make directory junctions safe: a junction back to
+        // an ancestor is visited once, and a junction outside the library is
+        // rejected before it can be traversed.
+        let current = match std::fs::canonicalize(&current) {
+            Ok(path) if path.starts_with(dir) => path,
+            Ok(path) => {
+                tracing::warn!(path = %path.display(), root = %dir.display(), "skipping directory outside library");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(path = %current.display(), %error, "could not canonicalize library directory");
+                complete = false;
+                continue;
+            }
+        };
+        if !visited_dirs.insert(current.clone()) {
             continue;
+        }
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(path = %current.display(), %error, "could not read library directory");
+                complete = false;
+                continue;
+            }
         };
         let mut dirs = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(path = %current.display(), %error, "could not inspect library entry");
+                    complete = false;
+                    continue;
+                }
+            };
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
             }
-            if path.is_dir() {
-                dirs.push(path);
-            } else if BookFormat::from_path(&path).is_some() {
-                out.push(path);
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not inspect library entry type");
+                    complete = false;
+                    continue;
+                }
+            };
+            // Never follow symlinks or directory junctions from a read-only
+            // library. They can create loops or expose files outside /books.
+            if file_type.is_symlink() {
+                // A skipped link means the directory contents were not fully
+                // observed. Keep existing rows until a later complete scan so
+                // a link disappearing during a rescan cannot prune a book or
+                // its progress by accident.
+                complete = false;
+                tracing::warn!(path = %path.display(), "skipping symlink in library");
+                continue;
+            }
+            let canonical = match std::fs::canonicalize(&path) {
+                Ok(path) if path.starts_with(dir) => path,
+                Ok(path) => {
+                    complete = false;
+                    tracing::warn!(path = %path.display(), root = %dir.display(), "skipping entry outside library");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not canonicalize library entry");
+                    complete = false;
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                dirs.push(canonical);
+            } else if file_type.is_file() && BookFormat::from_path(&canonical).is_some() {
+                out.push(canonical);
             }
         }
         dirs.reverse();
         stack.extend(dirs);
     }
     out.sort();
-    out
+    CollectedBooks {
+        files: out,
+        complete,
+    }
 }
 
 fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
@@ -357,14 +482,19 @@ async fn store_book(
         {
             tracing::warn!(%error, book_id, "could not write cover");
         }
+    } else {
+        let _ = tokio::fs::remove_file(state.covers_dir().join(format!("{book_id}.jpg"))).await;
     }
+    let resource_dir = state.resources_dir().join(book_id.to_string());
+    let _ = tokio::fs::remove_dir_all(&resource_dir).await;
     for (idx, resource) in book.resources.iter().enumerate() {
-        let dir = state.resources_dir().join(book_id.to_string());
-        if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        if let Err(error) = tokio::fs::create_dir_all(&resource_dir).await {
             tracing::warn!(%error, "could not create resources directory");
             break;
         }
-        if let Err(error) = tokio::fs::write(dir.join(idx.to_string()), &resource.data).await {
+        if let Err(error) =
+            tokio::fs::write(resource_dir.join(idx.to_string()), &resource.data).await
+        {
             tracing::warn!(%error, book_id, idx, "could not write resource");
         }
     }
@@ -388,11 +518,12 @@ async fn store_parse_error(
         .bind(relative)
         .fetch_optional(&mut *tx)
         .await?;
-    match existing {
+    let book_id = match existing {
         Some(id) => {
             sqlx::query(
                 "UPDATE books SET title = ?, format = ?, file_size = ?, sha256 = ?, \
-                 parse_status = 'error', parse_error = ?, updated_at = ? WHERE id = ?",
+                 has_cover = 0, page_count = 0, parse_status = 'error', \
+                 parse_error = ?, updated_at = ? WHERE id = ?",
             )
             .bind(relative.rsplit('/').next().unwrap_or(relative))
             .bind(format.as_str())
@@ -415,12 +546,13 @@ async fn store_parse_error(
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            id
         }
         None => {
-            sqlx::query(
+            let id: i64 = sqlx::query_scalar(
                 "INSERT INTO books (title, author, format, relative_path, file_size, \
                  sha256, has_cover, page_count, parse_status, parse_error, added_at, \
-                 updated_at) VALUES (?, NULL, ?, ?, ?, ?, 0, 0, 'error', ?, ?, ?)",
+                 updated_at) VALUES (?, NULL, ?, ?, ?, ?, 0, 0, 'error', ?, ?, ?) RETURNING id",
             )
             .bind(relative.rsplit('/').next().unwrap_or(relative))
             .bind(format.as_str())
@@ -430,11 +562,16 @@ async fn store_parse_error(
             .bind(message)
             .bind(now)
             .bind(now)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            id
         }
-    }
+    };
     tx.commit().await?;
+    // A failed replacement must not leave the old cover or resource files
+    // addressable after the database row has been marked unreadable.
+    let _ = tokio::fs::remove_file(state.covers_dir().join(format!("{book_id}.jpg"))).await;
+    let _ = tokio::fs::remove_dir_all(state.resources_dir().join(book_id.to_string())).await;
     state.scan_status.lock().await.errors += 1;
     Ok(())
 }

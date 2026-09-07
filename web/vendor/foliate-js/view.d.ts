@@ -25,6 +25,7 @@ export interface FoliateViewElement extends HTMLElement {
   next(distance?: number): Promise<void>;
   prev(distance?: number): Promise<void>;
   goTo(target: unknown): Promise<unknown>;
+  resolveNavigation(target: unknown): unknown;
   goToFraction(fraction: number): Promise<void>;
   goLeft(): void;
   goRight(): void;

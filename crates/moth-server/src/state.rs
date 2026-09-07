@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -21,6 +21,17 @@ pub struct AppState {
     pub config: Config,
     pub db: SqlitePool,
     pub scan_status: Arc<Mutex<ScanStatus>>,
+    pub txt_cache: Arc<Mutex<HashMap<TxtCacheKey, Arc<Vec<moth_format::Chapter>>>>>,
+}
+
+/// Cache key for an explicitly decoded TXT publication. The content hash
+/// prevents a rescan from serving chapters generated from an older file.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TxtCacheKey {
+    pub book_id: i64,
+    pub content_version: String,
+    pub encoding: String,
+    pub parser_version: &'static str,
 }
 
 impl AppState {
@@ -29,6 +40,7 @@ impl AppState {
             config,
             db,
             scan_status: Arc::new(Mutex::new(ScanStatus::default())),
+            txt_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

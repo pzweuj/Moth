@@ -1,0 +1,12 @@
+{
+  "name": "Moth Personal Library",
+  "short_name": "Moth",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101316",
+  "theme_color": "#101316",
+  "description": "A private, offline-first web reader.",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

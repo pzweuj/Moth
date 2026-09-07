@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use moth_server::{config::Config, db, router};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -371,6 +372,47 @@ async fn txt_chapter_supports_manual_encoding_override() {
             .expect("content")
             .contains("编码测试")
     );
+
+    // The detail endpoint uses the same decoder, so its TOC stays aligned
+    // with the manually decoded chapter responses.
+    let detail = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}?encoding=gb18030"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("detail");
+    let detail = response_json(detail).await;
+    assert_eq!(detail["chapters"][0]["title"], "第一章 出发");
+
+    let manifest = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}/offline-manifest?encoding=gb18030"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("encoded offline manifest");
+    let manifest = response_json(manifest).await;
+    assert_eq!(manifest["encoding"], "gb18030");
+    assert_eq!(manifest["parser_version"], "txt-v1");
+
+    let invalid = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}?encoding=latin1"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("invalid encoding");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -449,10 +491,240 @@ async fn txt_chapters_and_progress_roundtrip() {
     assert_eq!(saved["chapter_index"], 1);
     assert_eq!(saved["page_index"], 3);
     assert_eq!(saved["percent"], 42.5);
+    assert_eq!(saved["encoding"], "auto");
 
     // The shelf reflects the progress.
     let books = list_books(&app, &cookie).await;
     assert_eq!(find_book(&books, "txt")["percent"], 42.5);
+}
+
+#[tokio::test]
+async fn progress_sync_is_idempotent_and_keeps_the_farthest_position() {
+    let (_temp, app) = build_app().await;
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+    let books = list_books(&app, &cookie).await;
+    let id = find_book(&books, "txt")["id"].as_i64().expect("id");
+    let version = find_book(&books, "txt")["content_version"]
+        .as_str()
+        .expect("content version");
+
+    let first = serde_json::json!({
+        "chapter_index": 0,
+        "page_index": 1,
+        "percent": 20.0,
+        "content_version": version,
+        "base_revision": 0,
+        "operation_id": "device-a-1"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &first.to_string(),
+        ))
+        .await
+        .expect("first sync");
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = response_json(response).await;
+    assert_eq!(saved["revision"], 1);
+
+    // A retry of the same operation does not advance the revision again.
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &first.to_string(),
+        ))
+        .await
+        .expect("idempotent retry");
+    let saved = response_json(response).await;
+    assert_eq!(saved["revision"], 1);
+
+    // A stale, lower position loses to the current 20% position.
+    let stale = serde_json::json!({
+        "chapter_index": 0,
+        "page_index": 0,
+        "percent": 5.0,
+        "content_version": version,
+        "base_revision": 0,
+        "operation_id": "device-b-1"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &stale.to_string(),
+        ))
+        .await
+        .expect("stale sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["conflict"], true);
+    assert_eq!(saved["progress"]["percent"], 20.0);
+
+    // A retry of the first operation after a newer write reports the current
+    // revision and position, rather than moving the client back to revision 1.
+    let newer = serde_json::json!({
+        "chapter_index": 1,
+        "page_index": 2,
+        "percent": 45.0,
+        "content_version": version,
+        "base_revision": 1,
+        "operation_id": "device-c-1"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &newer.to_string(),
+        ))
+        .await
+        .expect("newer sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["revision"], 3);
+
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &first.to_string(),
+        ))
+        .await
+        .expect("historical retry");
+    let saved = response_json(response).await;
+    assert_eq!(saved["revision"], 3);
+    assert_eq!(saved["progress"]["percent"], 45.0);
+}
+
+#[tokio::test]
+async fn progress_sync_does_not_compare_different_txt_encodings() {
+    let (temp, app) = build_app().await;
+    let cookie = setup_and_login(&app).await;
+    run_scan(&app, &cookie).await;
+    let books = list_books(&app, &cookie).await;
+    let txt = find_book(&books, "txt");
+    let id = txt["id"].as_i64().expect("id");
+    let version = txt["content_version"].as_str().expect("content version");
+
+    let auto = serde_json::json!({
+        "chapter_index": 1,
+        "page_index": 4,
+        "percent": 80.0,
+        "content_version": version,
+        "base_revision": 0,
+        "operation_id": "encoding-auto"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &auto.to_string(),
+        ))
+        .await
+        .expect("auto sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["progress"]["encoding"], "auto");
+    assert_eq!(saved["revision"], 1);
+
+    // A lower position in another decoded representation starts a separate
+    // stream; it must not lose by comparing itself with the auto position.
+    let explicit = serde_json::json!({
+        "chapter_index": 0,
+        "page_index": 1,
+        "percent": 10.0,
+        "content_version": version,
+        "base_revision": 1,
+        "operation_id": "encoding-gbk",
+        "encoding": "GB18030"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &explicit.to_string(),
+        ))
+        .await
+        .expect("explicit sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["conflict"], false);
+    assert_eq!(saved["progress"]["percent"], 10.0);
+    assert_eq!(saved["progress"]["encoding"], "gb18030");
+    assert_eq!(saved["revision"], 2);
+
+    // Once the encoding is the same, the normal stale-write rule applies.
+    let stale = serde_json::json!({
+        "chapter_index": 0,
+        "page_index": 0,
+        "percent": 5.0,
+        "content_version": version,
+        "base_revision": 1,
+        "operation_id": "encoding-gbk-stale",
+        "encoding": "gb18030"
+    });
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &stale.to_string(),
+        ))
+        .await
+        .expect("stale explicit sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["conflict"], true);
+    assert_eq!(saved["progress"]["percent"], 10.0);
+    assert_eq!(saved["progress"]["encoding"], "gb18030");
+
+    // Simulate a row written before the encoding migration. NULL is treated as
+    // the scan-selected auto decoder, so an auto operation can still merge.
+    let database_path = temp.path().join("data").join("moth.db");
+    let pool = SqlitePoolOptions::new()
+        .connect_with(SqliteConnectOptions::new().filename(database_path))
+        .await
+        .expect("open test database");
+    sqlx::query("UPDATE reading_progress SET encoding = NULL WHERE book_id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("clear encoding");
+    pool.close().await;
+
+    let legacy_auto = serde_json::json!({
+        "chapter_index": 1,
+        "page_index": 5,
+        "percent": 20.0,
+        "content_version": version,
+        "base_revision": 3,
+        "operation_id": "encoding-legacy-auto"
+    });
+    let response = app
+        .oneshot(authed_request(
+            Method::POST,
+            &format!("/api/v1/books/{id}/progress/sync"),
+            &cookie,
+            &legacy_auto.to_string(),
+        ))
+        .await
+        .expect("legacy auto sync");
+    let saved = response_json(response).await;
+    assert_eq!(saved["conflict"], false);
+    assert_eq!(saved["progress"]["encoding"], "auto");
+    assert_eq!(saved["progress"]["percent"], 20.0);
 }
 
 #[tokio::test]
@@ -506,6 +778,28 @@ async fn epub_chapters_rewrite_resources_and_serve_cover() {
         .expect("resource");
     assert_eq!(resource.status(), StatusCode::OK);
     assert_eq!(resource.headers()[header::CONTENT_TYPE], "image/png");
+
+    let manifest = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}/offline-manifest"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("offline manifest");
+    let manifest = response_json(manifest).await;
+    assert_eq!(manifest["content_version"], epub["content_version"]);
+    assert_eq!(manifest["parser_version"], serde_json::Value::Null);
+    assert_eq!(manifest["file_url"], format!("/api/v1/books/{id}/file"));
+    assert_eq!(
+        manifest["resource_urls"]
+            .as_array()
+            .expect("resources")
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -565,6 +859,10 @@ async fn raw_file_endpoint_supports_byte_ranges() {
         "application/epub+zip"
     );
     assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+    let etag = response.headers()[header::ETAG]
+        .to_str()
+        .expect("etag")
+        .to_owned();
     let body = response
         .into_body()
         .collect()
@@ -572,6 +870,36 @@ async fn raw_file_endpoint_supports_byte_ranges() {
         .expect("body")
         .to_bytes();
     assert_eq!(body.as_ref(), full.as_slice());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .header(header::COOKIE, &cookie)
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .expect("conditional request"),
+        )
+        .await
+        .expect("conditional response");
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/books/{id}/file"))
+                .header(header::COOKIE, &cookie)
+                .header(header::IF_MATCH, "\"stale-version\"")
+                .body(Body::empty())
+                .expect("precondition request"),
+        )
+        .await
+        .expect("precondition response");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
 
     // A closed range returns 206 with the exact slice.
     let response = app

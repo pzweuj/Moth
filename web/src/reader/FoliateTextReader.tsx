@@ -7,6 +7,8 @@ import { makeRangeLoader } from "./zipLoader";
 import { TextPublication } from "./textPublication";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
+import { getOfflineFile } from "../offline/db";
+import { sanitizeBookDocument } from "./bookSanitizer";
 
 interface FoliateTextReaderProps {
   detail: BookDetail;
@@ -14,6 +16,61 @@ interface FoliateTextReaderProps {
   /** Optional explicit encoding for TXT decoding (reparses on change). */
   encoding?: string;
   onProgress: (progress: ProgressBody) => void;
+}
+
+type TocEntry = { label: string; href: string; level: number };
+
+function flattenToc(value: unknown, level = 0): TocEntry[] {
+  if (!Array.isArray(value)) return [];
+  const result: TocEntry[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as { label?: unknown; href?: unknown; children?: unknown };
+    if (typeof entry.href === "string") {
+      result.push({
+        label: typeof entry.label === "string" ? entry.label : "",
+        href: entry.href,
+        level,
+      });
+    }
+    result.push(...flattenToc(entry.children, level + 1));
+  }
+  return result;
+}
+
+/**
+ * Sanitize Foliate's HTML before it becomes an iframe Blob URL. The later
+ * iframe load listener remains as defense in depth, while this transform
+ * prevents external styles/resources from starting before the CSP is present.
+ */
+function installBookTransformGuards(book: FoliateBook): void {
+  const target = (book as unknown as { transformTarget?: EventTarget }).transformTarget;
+  if (!target) return;
+  target.addEventListener("load", (event: Event) => {
+    const detail = (event as CustomEvent<{ isScript?: boolean; allow?: boolean }>).detail;
+    if (detail?.isScript) detail.allow = false;
+  });
+  target.addEventListener("data", (event: Event) => {
+    const detail = (event as CustomEvent<{ data?: unknown; type?: string }>).detail;
+    if (!detail || typeof detail.data === "undefined") return;
+    const type = detail.type?.toLowerCase() ?? "";
+    if (!type.includes("html") && !type.includes("xhtml")) return;
+    detail.data = Promise.resolve(detail.data).then((value) => {
+      if (typeof value !== "string") return value;
+      let document = new DOMParser().parseFromString(
+        value,
+        type.includes("xhtml") ? "application/xhtml+xml" : "text/html",
+      );
+      // Some MOBI/KF8 records are HTML fragments labelled as XHTML without
+      // being well-formed XML. Falling back to HTML parsing is safer than
+      // returning the unsanitized source in that case.
+      if (document.querySelector("parsererror")) {
+        document = new DOMParser().parseFromString(value, "text/html");
+      }
+      sanitizeBookDocument(document);
+      return new XMLSerializer().serializeToString(document);
+    });
+  });
 }
 
 /**
@@ -35,7 +92,8 @@ export function FoliateTextReader({
   onProgressRef.current = onProgress;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-  const [toc, setToc] = useState<{ label: string; href: string }[]>([]);
+  const restoredRef = useRef(false);
+  const [toc, setToc] = useState<TocEntry[]>([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -44,7 +102,10 @@ export function FoliateTextReader({
     const host = hostRef.current;
     if (!host) return;
     let cancelled = false;
+    const requestController = new AbortController();
+    restoredRef.current = false;
     let view: FoliateViewElement | null = null;
+    let zipLoader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
     const publication =
       detail.format === "txt" ? new TextPublication(detail, encoding) : null;
     publicationRef.current = publication;
@@ -56,6 +117,20 @@ export function FoliateTextReader({
       view = element;
       host.append(element);
 
+      // EPUB/MOBI documents are user-provided HTML. The vendored renderer
+      // already runs them in a sandbox; this second layer removes active
+      // elements, event attributes and dangerous URLs before the document is
+      // exposed to the reader.
+      element.addEventListener("load", (event: Event) => {
+        const document = (event as CustomEvent<{ doc?: Document }>).detail?.doc;
+        if (document) sanitizeBookDocument(document);
+      });
+      // Do not let untrusted book links escape the reader. Internal chapter
+      // links are still handled by Foliate's navigation layer.
+      element.addEventListener("external-link", (event: Event) => {
+        event.preventDefault();
+      });
+
       let book: FoliateBook;
       if (publication) {
         book = publication as unknown as FoliateBook;
@@ -64,15 +139,30 @@ export function FoliateTextReader({
           import("../../vendor/foliate-js/mobi.js"),
           import("../../vendor/foliate-js/vendor/fflate.js"),
         ]);
-        const res = await fetch(bookFileUrl(detail.id));
-        if (!res.ok) throw new Error(`Could not fetch the book (${res.status}).`);
-        const file = new File([await res.blob()], detail.title || "book.mobi");
+        const cached = await getOfflineFile(detail.id, detail.content_version);
+        const res = cached ? null : await fetch(bookFileUrl(detail.id), {
+          signal: requestController.signal,
+          headers: { "If-Match": `"${detail.content_version}"` },
+        });
+        if (res && !res.ok) throw new Error(`Could not fetch the book (${res.status}).`);
+        if (res && res.headers.get("etag")?.trim() !== `"${detail.content_version}"`) {
+          throw new Error("The book changed while it was opening. Refresh and try again.");
+        }
+        const file = new File([cached ?? (await res!.blob())], detail.title || "book.mobi");
         book = await new MOBI({ unzlib: fflate.unzlibSync }).open(file);
       } else {
         const { EPUB } = await import("../../vendor/foliate-js/epub.js");
-        const loader = await makeRangeLoader(bookFileUrl(detail.id));
-        book = await new EPUB(loader).init();
+        const cached = await getOfflineFile(detail.id, detail.content_version);
+        zipLoader = await makeRangeLoader(
+          bookFileUrl(detail.id),
+          cached ?? undefined,
+          requestController.signal,
+          detail.content_version,
+        );
+        book = await new EPUB(zipLoader).init();
       }
+
+      installBookTransformGuards(book);
 
       if (cancelled) {
         publication?.destroy();
@@ -80,6 +170,10 @@ export function FoliateTextReader({
       }
 
       element.addEventListener("relocate", (event: Event) => {
+        // Foliate emits relocation events while opening and restoring a book.
+        // Do not persist those transient start positions before init() has
+        // applied the saved CFI/fraction.
+        if (!restoredRef.current) return;
         const location = (event as CustomEvent).detail ?? {};
         const fraction = typeof location.fraction === "number" ? location.fraction : 0;
         const section = location.section ?? {};
@@ -88,6 +182,7 @@ export function FoliateTextReader({
           chapter_index: typeof section.current === "number" ? section.current : 0,
           page_index: typeof page.current === "number" ? page.current : 0,
           percent: Math.min(100, Math.max(0, fraction * 100)),
+          cfi: typeof location.cfi === "string" ? location.cfi : undefined,
         });
       });
 
@@ -100,20 +195,34 @@ export function FoliateTextReader({
       element.renderer.setAttribute("margin", `${settingsRef.current.margin}px`);
       element.renderer.setStyles(readerCss(settingsRef.current));
 
-      const bookToc = book.toc as unknown;
-      setToc(
-        Array.isArray(bookToc)
-          ? (bookToc as { label: string; href: string }[])
-          : [],
-      );
+      setToc(flattenToc(book.toc));
 
       const progress = detail.progress;
-      if (progress && progress.percent > 0) {
-        await element.init({ lastLocation: { fraction: progress.percent / 100 } });
-      } else {
-        await element.init({ showTextStart: true });
+      let restored = false;
+      if (progress?.cfi) {
+        try {
+          // Foliate resolves malformed or stale CFIs to `undefined` instead
+          // of throwing. Check the navigation target first, then keep a
+          // percentage fallback for a changed publication or broken CFI.
+          if (element.resolveNavigation(progress.cfi)) {
+            await element.init({ lastLocation: progress.cfi });
+            restored = true;
+          }
+        } catch {
+          // Fall through to percentage restoration below.
+        }
       }
-      if (!cancelled) setLoading(false);
+      if (!restored && progress && progress.percent > 0) {
+        await element.init({
+          lastLocation: { fraction: Math.min(1, Math.max(0, progress.percent / 100)) },
+        });
+        restored = true;
+      }
+      if (!restored) await element.init({ showTextStart: true });
+      if (!cancelled) {
+        restoredRef.current = true;
+        setLoading(false);
+      }
     };
 
     setLoading(true);
@@ -127,6 +236,9 @@ export function FoliateTextReader({
 
     return () => {
       cancelled = true;
+      restoredRef.current = false;
+      requestController.abort();
+      void zipLoader?.close().catch(() => undefined);
       view?.close();
       view?.remove();
       viewRef.current = null;
@@ -135,7 +247,10 @@ export function FoliateTextReader({
     };
     // `encoding` reopens the book so a manual TXT encoding change takes effect
     // immediately. `detail` carries the book identity and progress.
-  }, [detail, encoding]);
+    // Progress and metadata refreshes must not tear down an open book. A
+    // content-version or encoding change deliberately reopens it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail.id, detail.format, detail.content_version, encoding]);
 
   // Apply setting changes to the open renderer.
   useEffect(() => {
@@ -151,6 +266,10 @@ export function FoliateTextReader({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (tocOpen) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("button, a, input, select, textarea, [contenteditable], .settings-panel")) {
+        return;
+      }
       const view = viewRef.current;
       if (!view) return;
       if (event.key === "ArrowRight" || event.key === "PageDown") {
@@ -160,10 +279,6 @@ export function FoliateTextReader({
         event.preventDefault();
         void view.prev();
       } else if (event.key === " ") {
-        const target = event.target as HTMLElement | null;
-        if (target?.closest("button, a, input, select, textarea, [contenteditable]")) {
-          return;
-        }
         event.preventDefault();
         void view.next();
       }
@@ -255,6 +370,7 @@ export function FoliateTextReader({
               <li key={index}>
                 <button
                   type="button"
+                  style={{ paddingLeft: `${10 + item.level * 16}px` }}
                   onClick={() => {
                     goTo(item.href);
                     setTocOpen(false);

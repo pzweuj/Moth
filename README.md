@@ -15,9 +15,15 @@ Implemented so far:
   single-user reading progress. Parsing is done by the `moth-format` crate
   (EPUB via `zip` + `quick-xml`, MOBI via `mobi`, CBZ via `zip`, TXT via
   `chardetng`/`encoding_rs`).
+- **Reader and offline MVP** — paginated EPUB/TXT/MOBI reading, lazy CBZ
+  paging, contents navigation, reader settings, TXT encoding overrides, CFI
+  restoration, serialised progress saves, a PWA shell, IndexedDB downloads,
+  offline reading, an authenticated offline manifest, and retryable local-first
+  progress sync.
 
-The reader view (paginated EPUB/TXT/MOBI reading, comic paging) and offline/PWA
-caching are the next milestones.
+The reader view and offline/PWA caching are implemented. Remaining release work
+is browser and Docker acceptance on desktop, Android, and iPhone, plus real
+MOBI/AZW3 fixture validation.
 
 ## Local development
 
@@ -148,6 +154,8 @@ cargo build --release --workspace
 docker compose config
 docker compose build
 ```
+
+The same Rust, frontend, and container checks run in [GitHub Actions](.github/workflows/ci.yml).
 
 When Docker is unavailable locally, the Rust and web checks can still run, and
 CI can build the image. A Phase 0 release is not complete until a

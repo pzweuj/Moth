@@ -10,6 +10,7 @@ beforeEach(() => {
     createObjectURL,
     revokeObjectURL: vi.fn(),
   });
+  vi.mocked(api.getChapter).mockClear();
 });
 
 const detail: BookDetail = {
@@ -22,6 +23,8 @@ const detail: BookDetail = {
   page_count: 0,
   parse_status: "ok",
   percent: 0,
+  content_version: "fixture-version",
+  file_size: 0,
   chapters: [
     { idx: 0, title: "第一章 启程", size: 120 },
     { idx: 1, title: "第二章 路上", size: 200 },
@@ -75,13 +78,13 @@ describe("TextPublication", () => {
     const publication = new TextPublication(detail);
     const url = await publication.sections[1].load();
     expect(url).toBe("blob:mock-url");
-    expect(api.getChapter).toHaveBeenCalledWith(7, 1, undefined);
+    expect(api.getChapter).toHaveBeenCalledWith(7, 1, undefined, "fixture-version");
   });
 
   it("passes an explicit encoding to the chapter API", async () => {
     const publication = new TextPublication(detail, "gb18030");
     await publication.sections[0].load();
-    expect(api.getChapter).toHaveBeenCalledWith(7, 0, "gb18030");
+    expect(api.getChapter).toHaveBeenCalledWith(7, 0, "gb18030", "fixture-version");
   });
 
   it("caches blob URLs across loads and revokes on destroy", async () => {

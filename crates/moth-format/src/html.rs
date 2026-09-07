@@ -64,6 +64,19 @@ pub fn sanitize_and_rewrite(
             .or_else(|| caps.get(4).map(|m| m.as_str()))
             .unwrap_or_default();
         let trimmed = value.trim();
+        let normalized = trimmed
+            .chars()
+            .filter(|character| !character.is_whitespace() && !character.is_control())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.starts_with("javascript:")
+            || normalized.starts_with("vbscript:")
+            || normalized.starts_with("data:text/html")
+            || normalized.starts_with("data:application/xhtml+xml")
+            || normalized.starts_with("file:")
+        {
+            return format!("{attribute}=\"#\"");
+        }
         if trimmed.is_empty()
             || trimmed.starts_with('#')
             || trimmed.starts_with("http://")
@@ -119,5 +132,15 @@ mod tests {
         assert!(!out.contains("<iframe"));
         assert!(!out.contains("onclick"));
         assert!(out.contains("<p>x</p>"));
+    }
+
+    #[test]
+    fn neutralizes_dangerous_urls() {
+        let html = "<a href=\"java\nscript:alert(1)\">x</a><img src=\"data:text/html,<script>x</script>\"><a href=\"file:///etc/passwd\">f</a>";
+        let out = sanitize_and_rewrite(html, "", &HashMap::new(), "/resource");
+        assert!(!out.to_ascii_lowercase().contains("javascript:"));
+        assert!(!out.to_ascii_lowercase().contains("data:text/html"));
+        assert!(!out.to_ascii_lowercase().contains("file:"));
+        assert_eq!(out.matches("href=\"#\"").count(), 2);
     }
 }

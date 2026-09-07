@@ -39,6 +39,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/books", get(books::list_books))
         .route("/books/{id}", get(books::get_book))
+        .route(
+            "/books/{id}/offline-manifest",
+            get(books::get_offline_manifest),
+        )
         .route("/books/{id}/cover", get(books::get_cover))
         .route("/books/{id}/file", get(books::get_file))
         .route("/books/{id}/chapter/{idx}", get(books::get_chapter))
@@ -48,6 +52,10 @@ pub fn router(state: AppState) -> Router {
             "/books/{id}/progress",
             get(books::get_progress).put(books::put_progress),
         )
+        .route(
+            "/books/{id}/progress/sync",
+            axum::routing::post(books::sync_progress),
+        )
         .route("/library/scan", axum::routing::post(library::start_scan))
         .route("/library/scan/status", get(books::scan_status))
         .fallback(api_not_found);
@@ -56,8 +64,30 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", api)
         .route("/api", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
+        .route(
+            "/sw.js",
+            get({
+                let path = web_dir.join("sw.js");
+                move || static_file(path.clone(), "application/javascript; charset=utf-8")
+            }),
+        )
+        .route(
+            "/manifest.webmanifest",
+            get({
+                let path = web_dir.join("manifest.webmanifest");
+                move || static_file(path.clone(), "application/manifest+json")
+            }),
+        )
+        .route(
+            "/favicon.svg",
+            get({
+                let path = web_dir.join("favicon.svg");
+                move || static_file(path.clone(), "image/svg+xml")
+            }),
+        )
         .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         .fallback(spa_fallback)
+        .layer(middleware::from_fn(add_security_headers))
         .layer(middleware::from_fn(add_cache_headers))
         .with_state(state)
 }
@@ -101,6 +131,46 @@ async fn add_cache_headers(request: Request<axum::body::Body>, next: Next) -> Re
             .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
     }
     response
+}
+
+async fn add_security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("SAMEORIGIN"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    response
+}
+
+async fn static_file(path: std::path::PathBuf, content_type: &'static str) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(axum::body::Body::from(body))
+            .expect("static response builder"),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn spa_fallback(
@@ -165,6 +235,7 @@ mod tests {
         let app = router(AppState::new(config, pool));
 
         let response = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/v1/health")
@@ -412,6 +483,18 @@ mod tests {
         tokio::fs::write(assets_dir.join("app.js"), "console.log('moth')")
             .await
             .expect("asset");
+        tokio::fs::write(
+            web_dir.join("sw.js"),
+            "self.addEventListener('install', () => {})",
+        )
+        .await
+        .expect("service worker");
+        tokio::fs::write(web_dir.join("manifest.webmanifest"), "{\"name\":\"Moth\"}")
+            .await
+            .expect("manifest");
+        tokio::fs::write(web_dir.join("favicon.svg"), "<svg />")
+            .await
+            .expect("favicon");
 
         let data_dir = temp.path().join("data");
         let mut config = Config::for_test(data_dir);
@@ -440,6 +523,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("Moth shell"));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/assets/app.js")
@@ -454,5 +538,53 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sw.js")
+                    .body(Body::empty())
+                    .expect("service worker request"),
+            )
+            .await
+            .expect("service worker response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/manifest.webmanifest")
+                    .body(Body::empty())
+                    .expect("manifest request"),
+            )
+            .await
+            .expect("manifest response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.svg")
+                    .body(Body::empty())
+                    .expect("favicon request"),
+            )
+            .await
+            .expect("favicon response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
     }
 }

@@ -81,9 +81,9 @@ export class FixedLayout extends HTMLElement {
             display: 'none',
             overflow: 'hidden',
         })
-        // `allow-scripts` is needed for events because of WebKit bug
-        // https://bugs.webkit.org/show_bug.cgi?id=218086
-        iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
+        // Book documents are untrusted input; reader events are handled by
+        // the parent renderer and do not require scripts in the book iframe.
+        iframe.setAttribute('sandbox', 'allow-same-origin')
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)

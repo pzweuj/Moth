@@ -3,6 +3,7 @@ import type { BookDetail, ProgressBody } from "../api";
 import { bookFileUrl } from "../api";
 import { makeRangeLoader, type ZipLoader } from "./zipLoader";
 import { sortComicEntries } from "./comicPages";
+import { getOfflineFile } from "../offline/db";
 
 interface ComicReaderProps {
   detail: BookDetail;
@@ -25,27 +26,78 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const [fit, setFit] = useState<FitMode>("width");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [, refreshCache] = useState(0);
 
   const loaderRef = useRef<ZipLoader | null>(null);
   const urlsRef = useRef(new Map<number, string>());
+  const inflightRef = useRef(new Map<number, Promise<Blob | null>>());
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const touchHandledRef = useRef(false);
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
-  // The initial page is read once; detail.progress is deliberately excluded
-  // from the effect deps so a progress refetch cannot tear down and reopen
-  // the archive mid-read.
-  const initialPageRef = useRef<number | null>(null);
+  const loadPage = useCallback(async (pageIndex: number): Promise<string | null> => {
+    const cached = urlsRef.current.get(pageIndex);
+    if (cached) return cached;
+    const inflight = inflightRef.current.get(pageIndex);
+    if (inflight) {
+      const blob = await inflight;
+      return blob ? urlsRef.current.get(pageIndex) ?? null : null;
+    }
+    const loader = loaderRef.current;
+    if (!loader || !pages[pageIndex]) return null;
+    const promise = loader.loadBlob(pages[pageIndex]);
+    inflightRef.current.set(pageIndex, promise);
+    try {
+      const blob = await promise;
+      if (!blob) throw new Error("Could not load this page.");
+      if (loaderRef.current !== loader) return null;
+      const url = URL.createObjectURL(blob);
+      urlsRef.current.set(pageIndex, url);
+      refreshCache((value) => value + 1);
+      return url;
+    } finally {
+      inflightRef.current.delete(pageIndex);
+    }
+  }, [pages]);
 
   useEffect(() => {
     let cancelled = false;
+    const requestController = new AbortController();
+    setPages([]);
+    setSrc(null);
+    setIndex(0);
+    setLoading(true);
+    setError(null);
+    setPageError(null);
     const open = async () => {
-      const loader = await makeRangeLoader(bookFileUrl(detail.id));
-      if (cancelled) return;
+      const cached = await getOfflineFile(detail.id, detail.content_version);
+      const loader = await makeRangeLoader(
+        bookFileUrl(detail.id),
+        cached ?? undefined,
+        requestController.signal,
+        detail.content_version,
+      );
+      if (cancelled) {
+        await loader.close().catch(() => undefined);
+        return;
+      }
       loaderRef.current = loader;
       const names = sortComicEntries(loader.entries).map((entry) => entry.filename);
-      if (names.length === 0) throw new Error("No readable pages in this archive.");
+      if (names.length === 0) {
+        loaderRef.current = null;
+        await loader.close().catch(() => undefined);
+        throw new Error("No readable pages in this archive.");
+      }
       setPages(names);
-      const start = initialPageRef.current ?? detail.progress?.page_index ?? 0;
-      initialPageRef.current = start;
+      const progress = detail.progress;
+      const sameContent = !progress?.content_version
+        || progress.content_version === detail.content_version;
+      const start = progress
+        ? sameContent
+          ? progress.page_index
+          : Math.round((Math.min(100, Math.max(0, progress.percent)) / 100) * (names.length - 1))
+        : 0;
       setIndex(Math.min(Math.max(0, start), names.length - 1));
       setLoading(false);
     };
@@ -56,44 +108,44 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       setLoading(false);
     });
     const urls = urlsRef.current;
+    const inflight = inflightRef.current;
     return () => {
       cancelled = true;
+      requestController.abort();
+      void loaderRef.current?.close().catch(() => undefined);
       loaderRef.current = null;
       for (const url of urls.values()) URL.revokeObjectURL(url);
       urls.clear();
+      inflight.clear();
     };
-    // detail.progress is intentionally not a dependency: the archive is only
-    // opened once per book, and a progress refetch must not tear it down.
-    // The initial page is read through initialPageRef instead.
+    // detail.progress is intentionally not a dependency: a progress refetch
+    // must not tear down and reopen the archive mid-read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail.id]);
+  }, [detail.id, detail.content_version]);
 
   // Load the current page image into an object URL.
   useEffect(() => {
     if (pages.length === 0) return;
     let cancelled = false;
-    const cached = urlsRef.current.get(index);
-    if (cached) {
-      setSrc(cached);
-      return;
-    }
-    setSrc(null);
-    const name = pages[index];
-    const loader = loaderRef.current;
-    if (!loader) return;
-    loader
-      .loadBlob(name)
-      .then((blob) => {
-        if (cancelled || !blob) return;
-        const url = URL.createObjectURL(blob);
-        urlsRef.current.set(index, url);
-        setSrc(url);
+    setSrc(urlsRef.current.get(index) ?? null);
+    loadPage(index)
+      .then((url) => {
+        if (!cancelled && url) {
+          setPageError(null);
+          setSrc(url);
+        }
       })
-      .catch((err: unknown) => console.error("page load failed", err));
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          console.error("page load failed", err);
+          setPageError(err instanceof Error ? err.message : "Could not load this page.");
+          setSrc(null);
+        }
+      });
     return () => {
       cancelled = true;
     };
-  }, [pages, index]);
+  }, [pages, index, loadPage]);
 
   // Preload the adjacent page and the thumbnail window around the current one.
   useEffect(() => {
@@ -105,19 +157,18 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       if (i >= 0 && i < pages.length) wanted.add(i);
     }
     for (const i of wanted) {
-      if (i < 0 || i >= pages.length || urlsRef.current.has(i)) continue;
-      loader
-        .loadBlob(pages[i])
-        .then((blob) => {
-          if (blob && !urlsRef.current.has(i)) {
-            urlsRef.current.set(i, URL.createObjectURL(blob));
-          }
-        })
-        .catch(() => {
-          // A failing adjacent page is not fatal; it is retried on demand.
-        });
+      if (i >= 0 && i < pages.length) void loadPage(i).catch(() => {
+        // Adjacent and thumbnail failures are retried when selected.
+      });
     }
-  }, [pages, index]);
+    for (const [cachedIndex, url] of urlsRef.current) {
+      if (cachedIndex < index - THUMB_RADIUS || cachedIndex > index + THUMB_RADIUS) {
+        URL.revokeObjectURL(url);
+        urlsRef.current.delete(cachedIndex);
+      }
+    }
+    refreshCache((value) => value + 1);
+  }, [pages, index, loadPage]);
 
   // Report progress whenever the page changes.
   useEffect(() => {
@@ -139,10 +190,22 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const prev = useCallback(() => goTo(index - 1), [goTo, index]);
   const next = useCallback(() => goTo(index + 1), [goTo, index]);
 
+  const retryPage = useCallback(() => {
+    setPageError(null);
+    setSrc(null);
+    void loadPage(index).catch((err: unknown) => {
+      setPageError(err instanceof Error ? err.message : "Could not load this page.");
+    });
+  }, [index, loadPage]);
+
   // Keyboard navigation. Space only pages when nothing interactive is focused
   // so it still activates buttons.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("button, a, input, select, textarea, [contenteditable], .settings-panel")) {
+        return;
+      }
       if (event.key === "ArrowRight" || event.key === "PageDown") {
         event.preventDefault();
         next();
@@ -150,10 +213,6 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
         event.preventDefault();
         prev();
       } else if (event.key === " ") {
-        const target = event.target as HTMLElement | null;
-        if (target?.closest("button, a, input, select, textarea, [contenteditable]")) {
-          return;
-        }
         event.preventDefault();
         next();
       }
@@ -171,7 +230,29 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     <div className="reader-stage">
       <div
         className={`comic-viewport comic-fit-${fit}`}
+        onPointerDown={(event) => {
+          if (event.pointerType === "touch") {
+            touchStartRef.current = { x: event.clientX, y: event.clientY };
+            touchHandledRef.current = false;
+          }
+        }}
+        onPointerUp={(event) => {
+          if (event.pointerType !== "touch" || !touchStartRef.current) return;
+          const start = touchStartRef.current;
+          touchStartRef.current = null;
+          const deltaX = event.clientX - start.x;
+          const deltaY = event.clientY - start.y;
+          if (Math.abs(deltaX) > 44 && Math.abs(deltaX) > Math.abs(deltaY)) {
+            touchHandledRef.current = true;
+            if (deltaX < 0) next();
+            else prev();
+          }
+        }}
         onClick={(event) => {
+          if (touchHandledRef.current) {
+            touchHandledRef.current = false;
+            return;
+          }
           const rect = event.currentTarget.getBoundingClientRect();
           if (event.clientX < rect.left + rect.width / 2) prev();
           else next();
@@ -179,6 +260,11 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       >
         {src ? (
           <img src={src} alt={`Page ${index + 1} of ${pages.length}`} />
+        ) : pageError ? (
+          <div className="reader-error">
+            <p>{pageError}</p>
+            <button type="button" onClick={retryPage}>Retry page</button>
+          </div>
         ) : (
           !error && <div className="reader-loading">Loading page…</div>
         )}
