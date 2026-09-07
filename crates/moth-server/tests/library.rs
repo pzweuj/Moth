@@ -778,6 +778,29 @@ async fn epub_chapters_rewrite_resources_and_serve_cover() {
         .expect("resource");
     assert_eq!(resource.status(), StatusCode::OK);
     assert_eq!(resource.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        resource.headers()["x-moth-resource-path"],
+        "OEBPS/Images/cover.png"
+    );
+    let version = epub["content_version"].as_str().expect("version");
+    assert_eq!(
+        resource.headers()[header::ETAG].to_str().expect("etag"),
+        format!("\"{version}\"")
+    );
+
+    let stale_resource = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/books/{id}/resource/0"))
+        .header(header::COOKIE, &cookie)
+        .header(header::IF_MATCH, "\"stale-version\"")
+        .body(Body::empty())
+        .expect("stale resource request");
+    let stale_resource = app
+        .clone()
+        .oneshot(stale_resource)
+        .await
+        .expect("stale resource response");
+    assert_eq!(stale_resource.status(), StatusCode::PRECONDITION_FAILED);
 
     let manifest = app
         .clone()
@@ -812,6 +835,22 @@ async fn cbz_pages_are_served_from_the_archive() {
     let cbz = find_book(&books, "cbz");
     let id = cbz["id"].as_i64().expect("id");
 
+    let detail = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/v1/books/{id}"),
+            &cookie,
+            "",
+        ))
+        .await
+        .expect("cbz detail");
+    let detail = response_json(detail).await;
+    assert_eq!(
+        detail["pages"],
+        serde_json::json!(["page_1.png", "page_2.png", "page_10.png"])
+    );
+
     for idx in 0..3 {
         let page = app
             .clone()
@@ -828,6 +867,35 @@ async fn cbz_pages_are_served_from_the_archive() {
         let bytes = page.into_body().collect().await.expect("body").to_bytes();
         assert!(!bytes.is_empty());
     }
+
+    let version = cbz["content_version"].as_str().expect("version");
+    let stale_page = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/books/{id}/page/0"))
+        .header(header::COOKIE, &cookie)
+        .header(header::IF_MATCH, "\"stale-version\"")
+        .body(Body::empty())
+        .expect("stale page request");
+    let stale_page = app
+        .clone()
+        .oneshot(stale_page)
+        .await
+        .expect("stale page response");
+    assert_eq!(stale_page.status(), StatusCode::PRECONDITION_FAILED);
+
+    let page = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/books/{id}/page/0"))
+        .header(header::COOKIE, &cookie)
+        .header(header::IF_MATCH, format!("\"{version}\""))
+        .body(Body::empty())
+        .expect("matching page request");
+    let page = app.oneshot(page).await.expect("matching page response");
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        page.headers()[header::ETAG].to_str().expect("etag"),
+        format!("\"{version}\"")
+    );
 }
 
 #[tokio::test]

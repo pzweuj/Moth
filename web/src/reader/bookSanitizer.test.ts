@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeBookDocument } from "./bookSanitizer";
+import { sanitizeBookDocument, sanitizeCssText } from "./bookSanitizer";
 
 describe("sanitizeBookDocument", () => {
   it("removes active elements, handlers, and dangerous URLs while keeping resources", () => {
@@ -43,5 +43,13 @@ describe("sanitizeBookDocument", () => {
     expect(document.querySelector("a")?.hasAttribute("href")).toBe(false);
     expect(document.querySelector("img")?.hasAttribute("src")).toBe(false);
     expect(document.querySelector("div")?.hasAttribute("style")).toBe(false);
+  });
+
+  it("removes external CSS imports and URLs while keeping materialized resources", () => {
+    const css = sanitizeCssText(
+      `@import url("https://evil.example/style.css"); .remote { background: url(https://evil.example/x.png) } .local { background: url(blob:local) }`,
+    );
+    expect(css).not.toContain("evil.example");
+    expect(css).toContain("url(blob:local)");
   });
 });

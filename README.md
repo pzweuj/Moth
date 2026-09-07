@@ -1,8 +1,10 @@
 # Moth
 
-Moth is a self-hosted, offline-first web reader for EPUB, TXT, CBZ, and MOBI
+Moth is a self-hosted, online-first web reader for EPUB, TXT, CBZ, and MOBI
 books. The original library is mounted read-only; the database, metadata,
-covers, indexes, and caches belong in the writable data directory.
+covers, indexes, verified snapshots, and caches belong in the writable data
+directory. Reading units are cached automatically after they are opened, so a
+short loss of connectivity does not interrupt rereading those units.
 
 Implemented so far:
 
@@ -15,13 +17,14 @@ Implemented so far:
   single-user reading progress. Parsing is done by the `moth-format` crate
   (EPUB via `zip` + `quick-xml`, MOBI via `mobi`, CBZ via `zip`, TXT via
   `chardetng`/`encoding_rs`).
-- **Reader and offline MVP** — paginated EPUB/TXT/MOBI reading, lazy CBZ
+- **Reader and local cache** — paginated EPUB/TXT/MOBI reading, lazy CBZ
   paging, contents navigation, reader settings, TXT encoding overrides, CFI
-  restoration, serialised progress saves, a PWA shell, IndexedDB downloads,
-  offline reading, an authenticated offline manifest, and retryable local-first
-  progress sync.
+  restoration, serialised progress saves, a PWA shell, and IndexedDB storage
+  for visited chapters, comic pages, resources, and local-first progress.
+  Whole-book downloads are not part of the product flow; an uncached chapter
+  or page clearly asks for a connection.
 
-The reader view and offline/PWA caching are implemented. Remaining release work
+The reader view and online-first cache are implemented. Remaining release work
 is browser and Docker acceptance on desktop, Android, and iPhone, plus real
 MOBI/AZW3 fixture validation.
 

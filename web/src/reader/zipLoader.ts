@@ -7,6 +7,7 @@ import {
   configure,
   type FileEntry,
 } from "@zip.js/zip.js";
+import { fetchWithTimeout } from "../api";
 
 /** Loader interface consumed by foliate-js `epub.js` and `comic-book.js`. */
 export interface ZipLoader {
@@ -27,6 +28,7 @@ export async function makeRangeLoader(
   offlineBlob?: Blob,
   signal?: AbortSignal,
   contentVersion?: string,
+  onBlob?: (filename: string, blob: Blob) => void,
 ): Promise<ZipLoader> {
   configure({ useWebWorkers: false });
   const reader = new ZipReader(
@@ -36,7 +38,7 @@ export async function makeRangeLoader(
         fetch: (input, init) => {
           const headers = new Headers(init?.headers);
           if (contentVersion) headers.set("If-Match", `"${contentVersion}"`);
-          return fetch(input, { ...init, headers, signal });
+          return fetchWithTimeout(input, { ...init, headers, signal, credentials: "same-origin" });
         },
       }),
   );
@@ -60,7 +62,10 @@ export async function makeRangeLoader(
     },
     loadBlob: async (name, type) => {
       const entry = byName.get(name);
-      return entry ? entry.getData(new BlobWriter(type)) : null;
+      if (!entry) return null;
+      const blob = await entry.getData(new BlobWriter(type));
+      onBlob?.(name, blob);
+      return blob;
     },
     getSize: (name) => byName.get(name)?.uncompressedSize ?? 0,
     close: () => reader.close(),

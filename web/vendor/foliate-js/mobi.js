@@ -13,6 +13,43 @@ const MIME = {
     SVG: 'image/svg+xml',
 }
 
+// Moth patch: MOBI6/KF8 sections are user supplied HTML. Sanitize before a
+// Blob URL is created so scripts and event handlers cannot run in the iframe
+// before the host's load listener has a chance to inspect the document.
+const sanitizeMothDocument = doc => {
+    doc.querySelectorAll('script, iframe, object, embed, form, base, meta[http-equiv]').forEach(el => el.remove())
+    for (const el of doc.querySelectorAll('*')) {
+        for (const attr of [...el.attributes]) {
+            const name = attr.name.toLowerCase()
+            const value = attr.value.replace(/[\u0000-\u0020\u007f\ufffd]/g, '').toLowerCase()
+            if (name.startsWith('on')) el.removeAttribute(attr.name)
+            const values = name === 'srcset'
+                ? value.split(',').map(candidate => candidate.trim().split(/\s+/, 1)[0] ?? '')
+                : [value]
+            if (['href', 'src', 'xlink:href', 'action', 'formaction', 'poster', 'data', 'srcset'].includes(name)
+                && values.some(item => /^(javascript:|vbscript:|file:|filesystem:|data:(text\/html|application\/xhtml\+xml))/i.test(item)))
+                el.removeAttribute(attr.name)
+            if (name === 'style') {
+                if (/url\s*\(\s*['"]?\s*(javascript:|vbscript:|file:|filesystem:|data:(text\/html|application\/xhtml\+xml))/i.test(attr.value))
+                    el.removeAttribute(attr.name)
+                else
+                    el.setAttribute(attr.name, attr.value.replace(/@import\s+(?:url\(\s*)?(["']?)(https?:|\/\/)[^;]*;?/gi, ''))
+            }
+        }
+    }
+    for (const style of doc.querySelectorAll('style')) {
+        style.textContent = style.textContent
+            .replace(/@import\s+(?:url\(\s*)?(["']?)(https?:|\/\/)[^;]*;?/gi, '')
+            .replace(/url\(\s*(["']?)(https?:|\/\/)[^)]*\1\s*\)/gi, 'url("")')
+    }
+    const head = doc.head || doc.documentElement
+    const meta = doc.createElement('meta')
+    meta.httpEquiv = 'Content-Security-Policy'
+    meta.content = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    head.prepend(meta)
+    return doc
+}
+
 const PDB_HEADER = {
     name: [0, 32, 'string'],
     type: [60, 4, 'string'],
@@ -864,6 +901,7 @@ class MOBI6 {
         }`))
 
         await this.replaceResources(doc)
+        sanitizeMothDocument(doc)
         const result = this.serializer.serializeToString(doc)
         const url = URL.createObjectURL(new Blob([result], { type: this.#type }))
         this.#cache.set(section, url)
@@ -1184,6 +1222,7 @@ class KF8 {
             for (const el of doc.querySelectorAll(`img[src="${url}"]`))
                 el.replaceWith(node)
         }
+        sanitizeMothDocument(doc)
         const url = URL.createObjectURL(
             new Blob([this.serializer.serializeToString(doc)], { type: this.#type }))
         this.#cache.set(section, url)

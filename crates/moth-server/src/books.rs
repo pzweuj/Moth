@@ -1,8 +1,11 @@
 //! Book API handlers: the library shelf, reading content, and progress.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use axum::{
     Json,
@@ -12,6 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio_util::io::ReaderStream;
@@ -19,9 +23,11 @@ use zip::ZipArchive;
 
 use crate::auth::Authenticated;
 use crate::error::AppError;
+use crate::library::hash_file;
 use crate::state::{AppState, TxtCacheKey};
 
 const TXT_PARSER_VERSION: &str = "txt-v1";
+static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 pub struct BookListItem {
@@ -96,9 +102,15 @@ pub struct BookDetail {
     pub parse_status: String,
     pub parse_error: Option<String>,
     pub chapters: Vec<ChapterInfo>,
+    /// Server order of CBZ image entries. The browser uses this mapping when
+    /// its locale-aware filename sort produces a different display order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<String>,
     pub progress: Option<ProgressBody>,
     pub content_version: String,
     pub file_size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -106,6 +118,10 @@ pub struct ChapterContent {
     pub idx: i64,
     pub title: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -150,7 +166,9 @@ pub async fn list_books(
 ) -> Result<Json<Vec<BookListItem>>, AppError> {
     let rows = sqlx::query(
         "SELECT b.id, b.title, b.author, b.format, b.has_cover, b.page_count, \
-         b.parse_status, b.sha256, b.file_size, COALESCE(p.percent, 0.0) AS percent \
+         b.parse_status, b.sha256, b.file_size, \
+         COALESCE(CASE WHEN p.content_version IS NULL OR p.content_version = b.sha256 \
+         THEN p.percent ELSE 0.0 END, 0.0) AS percent \
          FROM books b LEFT JOIN reading_progress p ON p.book_id = b.id \
          ORDER BY b.title COLLATE NOCASE",
     )
@@ -213,7 +231,7 @@ pub async fn get_book(
         if !valid_encoding(encoding) {
             return Err(AppError::Validation("Unsupported text encoding".to_owned()));
         }
-        let path = resolve_library_file(&state, &relative_path).await?;
+        let path = ensure_snapshot(&state, id, &relative_path, &content_version).await?;
         cached_txt_chapters(&state, id, &content_version, encoding, path)
             .await?
             .iter()
@@ -234,6 +252,14 @@ pub async fn get_book(
         .into_iter()
         .map(|(idx, title, size)| ChapterInfo { idx, title, size })
         .collect()
+    };
+    let pages = if format == "cbz" {
+        sqlx::query_scalar::<_, String>("SELECT path FROM pages WHERE book_id = ? ORDER BY idx")
+            .bind(id)
+            .fetch_all(&state.db)
+            .await?
+    } else {
+        Vec::new()
     };
 
     let progress = sqlx::query_as::<
@@ -271,16 +297,18 @@ pub async fn get_book(
         id,
         title,
         author,
-        format,
+        format: format.clone(),
         has_cover,
         cover_url: cover_url(id, has_cover, &content_version),
         page_count,
         parse_status,
         parse_error,
         chapters,
+        pages,
         progress,
         content_version,
         file_size,
+        parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
     }))
 }
 
@@ -288,13 +316,21 @@ pub async fn get_cover(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<VersionQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let version: String = sqlx::query_scalar("SELECT sha256 FROM books WHERE id = ?")
+    let current_version: String = sqlx::query_scalar("SELECT sha256 FROM books WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // Cover URLs include `?v=<sha256>`. Retain old versioned thumbnails for
+    // an active reader while a rescan installs a new version, but ignore
+    // malformed values so they cannot become filesystem path components.
+    let version = query
+        .v
+        .filter(|value| is_content_version(value))
+        .unwrap_or(current_version);
     let etag = format!("\"{version}\"");
     if if_match_misses(&headers, &etag) {
         return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
@@ -302,7 +338,7 @@ pub async fn get_cover(
     if if_none_match_hits(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
-    let path = state.covers_dir().join(format!("{id}.jpg"));
+    let path = state.cover_path(id, &version);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(_) => return Err(AppError::NotFound),
@@ -347,7 +383,7 @@ pub async fn get_offline_manifest(
         if !valid_encoding(encoding) {
             return Err(AppError::Validation("Unsupported text encoding".to_owned()));
         }
-        let path = resolve_library_file(&state, &relative_path).await?;
+        let path = ensure_snapshot(&state, id, &relative_path, &content_version).await?;
         cached_txt_chapters(&state, id, &content_version, encoding, path)
             .await?
             .iter()
@@ -502,7 +538,7 @@ pub async fn get_file(
     .await?
     .ok_or_else(|| AppError::NotFound)?;
 
-    let full_path = resolve_library_file(&state, &relative_path).await?;
+    let full_path = ensure_snapshot(&state, id, &relative_path, &version).await?;
     let metadata = tokio::fs::metadata(&full_path).await?;
     let size = metadata.len();
     let content_type = content_type_for_format(&format);
@@ -603,6 +639,10 @@ fn content_type_for_format(format: &str) -> &'static str {
     }
 }
 
+fn is_content_version(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Deserialize)]
 pub struct ChapterQuery {
     /// Optional explicit encoding label for TXT books (`utf-8`, `gb18030`,
@@ -610,6 +650,11 @@ pub struct ChapterQuery {
     /// re-decoded from the original file with that encoding instead of the
     /// auto-detected one the scan used.
     pub encoding: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct VersionQuery {
+    pub v: Option<String>,
 }
 
 /// Empty and `auto` select the encoding detected during the library scan.
@@ -698,6 +743,134 @@ async fn cached_txt_chapters(
     Ok(chapters)
 }
 
+/// Make a verified immutable copy of a source file. The database hash is the
+/// content version advertised to clients; if the source changed underneath a
+/// scan, serving it with the old ETag would make Range readers mix bytes.
+async fn ensure_snapshot(
+    state: &AppState,
+    book_id: i64,
+    relative: &str,
+    version: &str,
+) -> Result<PathBuf, AppError> {
+    let source = resolve_library_file(state, relative).await?;
+    let snapshots = state.snapshots_dir().join(book_id.to_string());
+    let target = snapshots.join(format!("{version}.bin"));
+    let version = version.to_owned();
+    let result = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&snapshots).map_err(|error| error.to_string())?;
+
+        // A snapshot is immutable once its SHA-256 matches the database
+        // version. Reusing it avoids copying and hashing the read-only source
+        // for every HTTP Range request. If it is missing or corrupt, rebuild
+        // it atomically below.
+        if target.is_file()
+            && hash_file(&target)
+                .map(|(hash, _)| hash == version)
+                .unwrap_or(false)
+        {
+            return Ok(target);
+        }
+
+        let mut input = std::fs::File::open(&source).map_err(|error| error.to_string())?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = snapshots.join(format!(".{}.{}.{}.tmp", version, nonce, sequence));
+        // `create_new` keeps concurrent requests from ever writing the same
+        // temporary file, even on filesystems whose clock has coarse
+        // resolution.
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            let read = input.read(&mut buffer).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
+            hasher.update(&buffer[..read]);
+        }
+        output.sync_all().map_err(|error| error.to_string())?;
+        let actual = hex::encode(hasher.finalize());
+        if actual != version {
+            let _ = std::fs::remove_file(&temporary);
+            return Err("content_changed".to_owned());
+        }
+
+        let existing_valid = if target.exists() {
+            let mut file = std::fs::File::open(&target).map_err(|error| error.to_string())?;
+            let mut digest = Sha256::new();
+            let mut buf = [0_u8; 128 * 1024];
+            loop {
+                let read = file.read(&mut buf).map_err(|error| error.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buf[..read]);
+            }
+            hex::encode(digest.finalize()) == version
+        } else {
+            false
+        };
+        if existing_valid {
+            let _ = std::fs::remove_file(&temporary);
+        } else {
+            match std::fs::rename(&temporary, &target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Windows does not replace an existing destination. A
+                    // competing writer either installed the same valid hash
+                    // or left a corrupt partial target; retain/replace it
+                    // accordingly.
+                    let target_valid = std::fs::File::open(&target)
+                        .ok()
+                        .and_then(|mut file| {
+                            let mut digest = Sha256::new();
+                            let mut buf = [0_u8; 128 * 1024];
+                            loop {
+                                match file.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(read) => digest.update(&buf[..read]),
+                                    Err(_) => return None,
+                                }
+                            }
+                            Some(hex::encode(digest.finalize()) == version)
+                        })
+                        .unwrap_or(false);
+                    if target_valid {
+                        let _ = std::fs::remove_file(&temporary);
+                    } else {
+                        std::fs::remove_file(&target).map_err(|error| error.to_string())?;
+                        std::fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(target)
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    result.map_err(|error| {
+        if error == "content_changed" {
+            AppError::Conflict {
+                code: "content_changed",
+                message: "The source file changed; rescan the library before reading it",
+            }
+        } else {
+            AppError::Io(std::io::Error::other(error))
+        }
+    })
+}
+
 /// Resolve a database relative path without allowing traversal or symlink
 /// escapes from the configured read-only library directory.
 async fn resolve_library_file(state: &AppState, relative: &str) -> Result<PathBuf, AppError> {
@@ -743,7 +916,12 @@ pub async fn get_chapter(
     .await?
     .ok_or_else(|| AppError::NotFound)?;
     let format: String = row.try_get("format")?;
+    let relative_path: String = row.try_get("relative_path")?;
     let content_version: String = row.try_get("sha256")?;
+    // Validate the immutable snapshot before conditional responses too. A
+    // client that sends If-None-Match must not receive 304 for bytes that
+    // changed underneath the last scan.
+    let snapshot_path = ensure_snapshot(&state, book_id, &relative_path, &content_version).await?;
     let etag = format!("\"{content_version}\"");
     if if_match_misses(&headers, &etag) {
         return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
@@ -759,12 +937,11 @@ pub async fn get_chapter(
         // The stored chapters were rendered with the detected encoding. For a
         // manual override, re-read the original file, re-decode it, and serve
         // the requested chapter so a wrong guess is fixed without a rescan.
-        let relative_path: String = row.try_get("relative_path")?;
-        let path = resolve_library_file(&state, &relative_path).await?;
         if !valid_encoding(encoding) {
             return Err(AppError::Validation("Unsupported text encoding".to_owned()));
         }
-        let book = cached_txt_chapters(&state, book_id, &content_version, encoding, path).await?;
+        let book =
+            cached_txt_chapters(&state, book_id, &content_version, encoding, snapshot_path).await?;
         let chapter = book.get(idx as usize).ok_or_else(|| AppError::NotFound)?;
         (chapter.title.clone(), chapter.content.clone())
     } else {
@@ -777,6 +954,12 @@ pub async fn get_chapter(
             idx,
             title,
             content,
+            encoding: (format == "txt").then(|| {
+                requested_encoding
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_else(|| "auto".to_owned())
+            }),
+            parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
         }),
     )
         .into_response())
@@ -786,55 +969,89 @@ pub async fn get_resource(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = sqlx::query("SELECT mime FROM resources WHERE book_id = ? AND idx = ?")
-        .bind(book_id)
-        .bind(idx)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound)?;
-    let mime: String = row.try_get("mime")?;
-    let path = state
-        .resources_dir()
-        .join(book_id.to_string())
-        .join(idx.to_string());
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(AppError::NotFound),
-    };
-    Ok((
-        [
-            (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "no-cache".to_owned()),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-
-pub async fn get_page(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
-) -> Result<Response, AppError> {
-    let (entry_name, mime, file_path) = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT p.path, p.mime, b.relative_path FROM pages p \
-         JOIN books b ON b.id = p.book_id WHERE p.book_id = ? AND p.idx = ?",
+    let row = sqlx::query(
+        "SELECT r.mime, r.path AS source_path, b.relative_path, b.sha256 FROM resources r JOIN books b ON b.id = r.book_id \
+         WHERE r.book_id = ? AND r.idx = ?",
     )
     .bind(book_id)
     .bind(idx)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound)?;
+    let mime: String = row.try_get("mime")?;
+    let source_path: String = row.try_get("source_path")?;
+    let relative_path: String = row.try_get("relative_path")?;
+    let version: String = row.try_get("sha256")?;
+    ensure_snapshot(&state, book_id, &relative_path, &version).await?;
+    let etag = format!("\"{version}\"");
+    if if_match_misses(&headers, &etag) {
+        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
+    }
+    if if_none_match_hits(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+    let path = state.resource_path(book_id, &version, idx);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(AppError::NotFound),
+    };
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache".to_owned()),
+        ],
+        bytes,
+    )
+        .into_response();
+    // The client uses the original archive path to rebuild CSS dependencies
+    // from cached blobs. Invalid/non-ASCII paths are simply omitted; the
+    // numeric resource remains usable without dependency rewriting.
+    if let Ok(value) = source_path.parse() {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-moth-resource-path"),
+            value,
+        );
+    }
+    Ok(response)
+}
 
-    let full_path = resolve_library_file(&state, &file_path).await?;
-    let bytes = tokio::task::spawn_blocking(move || read_cbz_page(&full_path, &entry_name))
+pub async fn get_page(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let (entry_name, mime, file_path, version) =
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT p.path, p.mime, b.relative_path, b.sha256 FROM pages p \
+         JOIN books b ON b.id = p.book_id WHERE p.book_id = ? AND p.idx = ?",
+        )
+        .bind(book_id)
+        .bind(idx)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound)?;
+
+    let etag = format!("\"{version}\"");
+    let snapshot_path = ensure_snapshot(&state, book_id, &file_path, &version).await?;
+    if if_match_misses(&headers, &etag) {
+        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
+    }
+    if if_none_match_hits(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
+    let bytes = tokio::task::spawn_blocking(move || read_cbz_page(&snapshot_path, &entry_name))
         .await
         .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
 
     Ok((
         [
             (header::CONTENT_TYPE, mime),
+            (header::ETAG, format!("\"{version}\"")),
             (
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable".to_owned(),

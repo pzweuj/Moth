@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api";
+import { api, fetchWithTimeout } from "./api";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -10,6 +10,7 @@ function jsonResponse(body: unknown, status = 200) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("api client", () => {
@@ -67,5 +68,19 @@ describe("api client", () => {
   it("rejects non-JSON success responses", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>", { status: 200 })));
     await expect(api.getBooks()).rejects.toBeInstanceOf(SyntaxError);
+  });
+
+  it("aborts a server request that never responds", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const rejection = expect(fetchWithTimeout("/api/v1/books/1/file", {}))
+      .rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

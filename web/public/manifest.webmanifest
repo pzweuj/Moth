@@ -7,6 +7,6 @@
   "orientation": "any",
   "background_color": "#101316",
   "theme_color": "#101316",
-  "description": "A private, offline-first web reader.",
+  "description": "A private, online-first web reader with a cache of visited content.",
   "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
 }

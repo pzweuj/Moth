@@ -17,7 +17,10 @@ self.addEventListener("install", (event) => {
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((key) => ![SHELL, RUNTIME].includes(key)).map((key) => caches.delete(key)))).then(() => self.clients.claim()),
+    // Cache Storage is shared by every app on an origin. Remove only Moth's
+    // own versioned caches so a co-hosted application is never wiped during
+    // an update.
+    caches.keys().then((keys) => Promise.all(keys.filter((key) => (key.startsWith("moth-shell-") || key.startsWith("moth-runtime-")) && ![SHELL, RUNTIME].includes(key)).map((key) => caches.delete(key)))).then(() => self.clients.claim()),
   );
 });
 

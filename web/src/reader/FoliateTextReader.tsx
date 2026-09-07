@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BookDetail, ProgressBody } from "../api";
-import { bookFileUrl } from "../api";
+import { bookFileUrl, fetchWithTimeout } from "../api";
 import type { FoliateBook, FoliateViewElement } from "../../vendor/foliate-js/view.js";
 import "../../vendor/foliate-js/view.js";
 import { makeRangeLoader } from "./zipLoader";
-import { TextPublication } from "./textPublication";
+import { FOLIATE_PARSER_VERSION, TextPublication } from "./textPublication";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
-import { getOfflineFile } from "../offline/db";
+import { getOfflineChapterIndices, saveOfflineChapter, saveOfflineResource } from "../offline/db";
 import { sanitizeBookDocument } from "./bookSanitizer";
 
 interface FoliateTextReaderProps {
@@ -18,22 +18,26 @@ interface FoliateTextReaderProps {
   onProgress: (progress: ProgressBody) => void;
 }
 
-type TocEntry = { label: string; href: string; level: number };
+type TocEntry = { label: string; href?: string; level: number };
 
 function flattenToc(value: unknown, level = 0): TocEntry[] {
   if (!Array.isArray(value)) return [];
   const result: TocEntry[] = [];
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
-    const entry = item as { label?: unknown; href?: unknown; children?: unknown };
+    const entry = item as { label?: unknown; href?: unknown; children?: unknown; subitems?: unknown };
     if (typeof entry.href === "string") {
       result.push({
         label: typeof entry.label === "string" ? entry.label : "",
         href: entry.href,
         level,
       });
+    } else if (typeof entry.label === "string") {
+      // Foliate uses linkless entries as directory/group headings. Preserve
+      // those labels while still recursing into their descendants.
+      result.push({ label: entry.label, level });
     }
-    result.push(...flattenToc(entry.children, level + 1));
+    result.push(...flattenToc(entry.subitems ?? entry.children, level + 1));
   }
   return result;
 }
@@ -73,6 +77,127 @@ function installBookTransformGuards(book: FoliateBook): void {
   });
 }
 
+type FoliateSection = {
+  id?: unknown;
+  load?: () => Promise<unknown>;
+};
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function blobDataUrl(blob: Blob): Promise<string> {
+  const mime = blob.type || "application/octet-stream";
+  return `data:${mime};base64,${base64FromBytes(new Uint8Array(await blob.arrayBuffer()))}`;
+}
+
+/**
+ * Foliate replaces archive resources with temporary blob URLs. Persisting
+ * those URLs would make a cached section unusable after reload, so materialize
+ * the small set of URLs referenced by the section before writing IndexedDB.
+ * CSS is expanded recursively so fonts and background images survive too.
+ */
+async function materializeBlobUrls(value: string, seen = new Set<string>(), signal?: AbortSignal): Promise<string | null> {
+  const urls = [...new Set(value.match(/blob:[^"'\s)<>]+/g) ?? [])];
+  let result = value;
+  for (const url of urls) {
+    if (seen.has(url)) return null;
+    seen.add(url);
+    try {
+      const response = await fetch(url, { signal });
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      let replacement: string;
+      if (blob.type.toLowerCase().split(";", 1)[0] === "text/css") {
+        const css = await materializeBlobUrls(await blob.text(), seen, signal);
+        if (css === null) return null;
+        replacement = await blobDataUrl(new Blob([css], { type: blob.type || "text/css" }));
+      } else {
+        replacement = await blobDataUrl(blob);
+      }
+      result = result.split(url).join(replacement);
+    } finally {
+      seen.delete(url);
+    }
+  }
+  return result;
+}
+
+async function cacheFoliateSection(
+  detail: BookDetail,
+  index: number,
+  url: string,
+  fallbackTitle: string,
+  pending: Set<number>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (pending.has(index)) return;
+  pending.add(index);
+  try {
+    const response = await fetch(url, { signal });
+    if (!response.ok) throw new Error(`Could not read rendered section (${response.status}).`);
+    const materialized = await materializeBlobUrls(await response.text(), new Set<string>(), signal);
+    if (materialized === null) throw new Error("A rendered section resource could not be cached.");
+    const document = new DOMParser().parseFromString(materialized, "text/html");
+    sanitizeBookDocument(document);
+    const title = document.querySelector("title")?.textContent?.trim()
+      || fallbackTitle
+      || `Chapter ${index + 1}`;
+    // Keep stylesheet elements from the rendered head while storing a body
+    // fragment; TextPublication will add the per-unit CSP on reconstruction.
+    const head = document.head
+      ? Array.from(document.head.children)
+        .filter((element) => element.tagName.toLowerCase() === "style" || element.tagName.toLowerCase() === "link")
+        .map((element) => element.outerHTML)
+        .join("")
+      : "";
+    const content = `${head}${document.body?.innerHTML ?? materialized}`;
+    await saveOfflineChapter(
+      detail.id,
+      detail.content_version,
+      index,
+      "",
+      { title, content },
+      FOLIATE_PARSER_VERSION,
+    );
+  } catch {
+    // Caching is best effort. The online section remains usable, and a later
+    // visit can retry the same unit after its resources are available.
+  } finally {
+    pending.delete(index);
+  }
+}
+
+/** Cache the actual Foliate section instead of guessing a server chapter. */
+function installFoliateSectionCache(book: FoliateBook, detail: BookDetail, signal: AbortSignal): void {
+  const sections = (book as unknown as { sections?: FoliateSection[] }).sections;
+  if (!Array.isArray(sections)) return;
+  const pending = new Set<number>();
+  sections.forEach((section, index) => {
+    if (typeof section.load !== "function") return;
+    const original = section.load.bind(section);
+    section.load = async () => {
+      const loaded = await original();
+      if (typeof loaded === "string" && loaded.startsWith("blob:")) {
+        void cacheFoliateSection(
+          detail,
+          index,
+          loaded,
+          detail.chapters[index]?.title || (typeof section.id === "string" ? section.id : ""),
+          pending,
+          signal,
+        );
+      }
+      return loaded;
+    };
+  });
+}
+
 /**
  * Reflowable reader (EPUB / MOBI / TXT) built on the vendored foliate-js
  * `foliate-view` element. EPUB and MOBI parse the raw file client-side (EPUB
@@ -106,8 +231,14 @@ export function FoliateTextReader({
     restoredRef.current = false;
     let view: FoliateViewElement | null = null;
     let zipLoader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
-    const publication =
-      detail.format === "txt" ? new TextPublication(detail, encoding) : null;
+    const reportPublicationError = (error: unknown) => {
+      if (cancelled) return;
+      setError(error instanceof Error ? error.message : "This chapter is not cached yet. Connect to the server to continue reading.");
+    };
+    let publication: TextPublication | null = detail.format === "txt"
+      ? new TextPublication(detail, encoding)
+      : null;
+    if (publication) publication.onError = reportPublicationError;
     publicationRef.current = publication;
 
     const open = async () => {
@@ -134,35 +265,100 @@ export function FoliateTextReader({
       let book: FoliateBook;
       if (publication) {
         book = publication as unknown as FoliateBook;
-      } else if (detail.format === "mobi") {
-        const [{ MOBI }, fflate] = await Promise.all([
-          import("../../vendor/foliate-js/mobi.js"),
-          import("../../vendor/foliate-js/vendor/fflate.js"),
-        ]);
-        const cached = await getOfflineFile(detail.id, detail.content_version);
-        const res = cached ? null : await fetch(bookFileUrl(detail.id), {
-          signal: requestController.signal,
-          headers: { "If-Match": `"${detail.content_version}"` },
-        });
-        if (res && !res.ok) throw new Error(`Could not fetch the book (${res.status}).`);
-        if (res && res.headers.get("etag")?.trim() !== `"${detail.content_version}"`) {
-          throw new Error("The book changed while it was opening. Refresh and try again.");
-        }
-        const file = new File([cached ?? (await res!.blob())], detail.title || "book.mobi");
-        book = await new MOBI({ unzlib: fflate.unzlibSync }).open(file);
       } else {
-        const { EPUB } = await import("../../vendor/foliate-js/epub.js");
-        const cached = await getOfflineFile(detail.id, detail.content_version);
-        zipLoader = await makeRangeLoader(
-          bookFileUrl(detail.id),
-          cached ?? undefined,
-          requestController.signal,
+        // When the server is unavailable, a partial chapter cache can still
+        // provide a usable Foliate publication. It intentionally exposes only
+        // the units that have already been read; a missing unit reports the
+        // explicit "needs internet" error from TextPublication.
+        let cachedParserVersion = detail.format === "txt" ? undefined : FOLIATE_PARSER_VERSION;
+        let cachedIndices = await getOfflineChapterIndices(
+          detail.id,
           detail.content_version,
+          detail.format === "txt" ? encoding : "",
+          cachedParserVersion,
+        ).catch(() => []);
+        // Older builds stored server-rendered EPUB/MOBI chapters under the
+        // TXT parser key. Keep those units readable during the transition,
+        // while all new Foliate sections use their own cache schema.
+        if (!cachedIndices.length && detail.format !== "txt") {
+          const legacyIndices = await getOfflineChapterIndices(
+            detail.id,
+            detail.content_version,
+            "",
+            "txt-v1",
+          ).catch(() => []);
+          if (legacyIndices.length) {
+            cachedIndices = legacyIndices;
+            cachedParserVersion = "txt-v1";
+          }
+        }
+        const useCachedPublication = cachedIndices.length > 0 && (
+          typeof navigator === "undefined" || !navigator.onLine
         );
-        book = await new EPUB(zipLoader).init();
+        if (useCachedPublication) {
+          publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, cachedParserVersion);
+          publication.onError = reportPublicationError;
+          publicationRef.current = publication;
+          book = publication as unknown as FoliateBook;
+        } else {
+          try {
+            if (detail.format === "mobi") {
+              const [{ MOBI }, fflate] = await Promise.all([
+                import("../../vendor/foliate-js/mobi.js"),
+                import("../../vendor/foliate-js/vendor/fflate.js"),
+              ]);
+              const res = await fetchWithTimeout(bookFileUrl(detail.id), {
+                signal: requestController.signal,
+                headers: { "If-Match": `"${detail.content_version}"` },
+              });
+              if (!res.ok) throw new Error(`Could not fetch the book (${res.status}).`);
+              if (res.headers.get("etag")?.trim() !== `"${detail.content_version}"`) {
+                throw new Error("The book changed while it was opening. Refresh and try again.");
+              }
+              const file = new File([await res.blob()], detail.title || "book.mobi");
+              book = await new MOBI({ unzlib: fflate.unzlibSync }).open(file);
+            } else {
+              const { EPUB } = await import("../../vendor/foliate-js/epub.js");
+              zipLoader = await makeRangeLoader(
+                bookFileUrl(detail.id),
+                undefined,
+                requestController.signal,
+                detail.content_version,
+                (filename, blob) => {
+                  if (requestController.signal.aborted) return;
+                  void saveOfflineResource(detail.id, detail.content_version, filename, blob, blob.type, filename).catch(() => undefined);
+                },
+              );
+              book = await new EPUB(zipLoader).init();
+            }
+          } catch (error) {
+            let fallbackParserVersion = detail.format === "txt" ? undefined : FOLIATE_PARSER_VERSION;
+            let fallbackIndices = await getOfflineChapterIndices(
+              detail.id,
+              detail.content_version,
+              detail.format === "txt" ? encoding : "",
+              fallbackParserVersion,
+            ).catch(() => []);
+            if (!fallbackIndices.length && detail.format !== "txt") {
+              fallbackIndices = await getOfflineChapterIndices(
+                detail.id,
+                detail.content_version,
+                "",
+                "txt-v1",
+              ).catch(() => []);
+              if (fallbackIndices.length) fallbackParserVersion = "txt-v1";
+            }
+            if (!fallbackIndices.length) throw error;
+            publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, fallbackParserVersion);
+            publication.onError = reportPublicationError;
+            publicationRef.current = publication;
+            book = publication as unknown as FoliateBook;
+          }
+        }
       }
 
       installBookTransformGuards(book);
+      if (detail.format !== "txt" && !publication) installFoliateSectionCache(book, detail, requestController.signal);
 
       if (cancelled) {
         publication?.destroy();
@@ -178,8 +374,9 @@ export function FoliateTextReader({
         const fraction = typeof location.fraction === "number" ? location.fraction : 0;
         const section = location.section ?? {};
         const page = location.location ?? {};
+        const chapterIndex = typeof section.current === "number" ? section.current : 0;
         onProgressRef.current({
-          chapter_index: typeof section.current === "number" ? section.current : 0,
+          chapter_index: chapterIndex,
           page_index: typeof page.current === "number" ? page.current : 0,
           percent: Math.min(100, Math.max(0, fraction * 100)),
           cfi: typeof location.cfi === "string" ? location.cfi : undefined,
@@ -372,9 +569,10 @@ export function FoliateTextReader({
                   type="button"
                   style={{ paddingLeft: `${10 + item.level * 16}px` }}
                   onClick={() => {
-                    goTo(item.href);
+                    if (item.href) goTo(item.href);
                     setTocOpen(false);
                   }}
+                  disabled={!item.href}
                 >
                   {item.label || `Chapter ${index + 1}`}
                 </button>

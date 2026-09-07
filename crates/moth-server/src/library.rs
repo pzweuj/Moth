@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use image::codecs::jpeg::JpegEncoder;
@@ -292,7 +293,7 @@ fn collect_books(dir: &Path) -> CollectedBooks {
     }
 }
 
-fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
@@ -474,26 +475,15 @@ async fn store_book(
     tx.commit().await?;
 
     // Derived files are a cache; failures here do not fail the book.
-    if let Some(jpeg) = cover_jpeg {
-        let dir = state.covers_dir();
-        if let Err(error) = tokio::fs::create_dir_all(&dir).await {
-            tracing::warn!(%error, "could not create covers directory");
-        } else if let Err(error) = tokio::fs::write(dir.join(format!("{book_id}.jpg")), jpeg).await
-        {
-            tracing::warn!(%error, book_id, "could not write cover");
-        }
-    } else {
-        let _ = tokio::fs::remove_file(state.covers_dir().join(format!("{book_id}.jpg"))).await;
+    if let Some(jpeg) = cover_jpeg
+        && let Err(error) = write_derived_file(&state.cover_path(book_id, &hash), &jpeg).await
+    {
+        tracing::warn!(%error, book_id, "could not write cover");
     }
-    let resource_dir = state.resources_dir().join(book_id.to_string());
-    let _ = tokio::fs::remove_dir_all(&resource_dir).await;
+    let resource_dir = state.resources_dir().join(book_id.to_string()).join(&hash);
     for (idx, resource) in book.resources.iter().enumerate() {
-        if let Err(error) = tokio::fs::create_dir_all(&resource_dir).await {
-            tracing::warn!(%error, "could not create resources directory");
-            break;
-        }
         if let Err(error) =
-            tokio::fs::write(resource_dir.join(idx.to_string()), &resource.data).await
+            write_derived_file(&resource_dir.join(idx.to_string()), &resource.data).await
         {
             tracing::warn!(%error, book_id, idx, "could not write resource");
         }
@@ -570,8 +560,8 @@ async fn store_parse_error(
     tx.commit().await?;
     // A failed replacement must not leave the old cover or resource files
     // addressable after the database row has been marked unreadable.
-    let _ = tokio::fs::remove_file(state.covers_dir().join(format!("{book_id}.jpg"))).await;
-    let _ = tokio::fs::remove_dir_all(state.resources_dir().join(book_id.to_string())).await;
+    let _ = tokio::fs::remove_dir_all(state.book_covers_dir(book_id)).await;
+    let _ = tokio::fs::remove_dir_all(state.book_resources_dir(book_id)).await;
     state.scan_status.lock().await.errors += 1;
     Ok(())
 }
@@ -588,12 +578,38 @@ async fn prune_missing(state: &AppState, seen: &[String]) -> Result<(), AppError
                 .bind(id)
                 .execute(&state.db)
                 .await?;
-            let cover = state.covers_dir().join(format!("{id}.jpg"));
-            let _ = tokio::fs::remove_file(cover).await;
-            let resources = state.resources_dir().join(id.to_string());
-            let _ = tokio::fs::remove_dir_all(resources).await;
+            let _ = tokio::fs::remove_dir_all(state.book_covers_dir(id)).await;
+            let _ = tokio::fs::remove_dir_all(state.book_resources_dir(id)).await;
             tracing::info!(book_id = id, %relative, "removed missing book");
         }
+    }
+    Ok(())
+}
+
+/// Install generated data by rename so a reader can never observe a partially
+/// written cover or resource. Versioned destinations also let an active reader
+/// finish using the previous scan while the new scan is being committed.
+async fn write_derived_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("derived path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temporary = parent.join(format!(".{file_name}.{stamp}.tmp"));
+    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
     }
     Ok(())
 }

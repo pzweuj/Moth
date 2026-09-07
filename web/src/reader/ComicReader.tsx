@@ -3,7 +3,7 @@ import type { BookDetail, ProgressBody } from "../api";
 import { bookFileUrl } from "../api";
 import { makeRangeLoader, type ZipLoader } from "./zipLoader";
 import { sortComicEntries } from "./comicPages";
-import { getOfflineFile } from "../offline/db";
+import { getOfflinePage, getOfflinePages, saveOfflinePage } from "../offline/db";
 
 interface ComicReaderProps {
   detail: BookDetail;
@@ -13,6 +13,19 @@ interface ComicReaderProps {
 type FitMode = "width" | "height";
 
 const THUMB_RADIUS = 3;
+
+function mapPageNumbers(names: string[], serverPages?: string[]): number[] {
+  if (!serverPages?.length) return names.map((_, index) => index);
+  // Keep duplicate archive names deterministic by consuming each matching
+  // server position once instead of using indexOf for every entry.
+  const positions = new Map<string, number[]>();
+  serverPages.forEach((name, index) => {
+    const values = positions.get(name);
+    if (values) values.push(index);
+    else positions.set(name, [index]);
+  });
+  return names.map((name, index) => positions.get(name)?.shift() ?? index);
+}
 
 /**
  * CBZ reader. The archive is read over HTTP Range via zip.js and pages are
@@ -32,10 +45,16 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const loaderRef = useRef<ZipLoader | null>(null);
   const urlsRef = useRef(new Map<number, string>());
   const inflightRef = useRef(new Map<number, Promise<Blob | null>>());
+  const offlineOnlyRef = useRef(false);
+  const generationRef = useRef(0);
+  const restoredRef = useRef(false);
+  const currentIndexRef = useRef(0);
+  const pageNumbersRef = useRef<number[]>([]);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const touchHandledRef = useRef(false);
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
+  currentIndexRef.current = index;
   const loadPage = useCallback(async (pageIndex: number): Promise<string | null> => {
     const cached = urlsRef.current.get(pageIndex);
     if (cached) return cached;
@@ -45,13 +64,29 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
       return blob ? urlsRef.current.get(pageIndex) ?? null : null;
     }
     const loader = loaderRef.current;
-    if (!loader || !pages[pageIndex]) return null;
-    const promise = loader.loadBlob(pages[pageIndex]);
+    if (!loader && !offlineOnlyRef.current) return null;
+    if (!pages[pageIndex]) return null;
+    const generation = generationRef.current;
+    const actualIndex = pageNumbersRef.current[pageIndex] ?? pageIndex;
+    const promise = loader
+      ? loader.loadBlob(pages[pageIndex])
+      : getOfflinePage(detail.id, detail.content_version, actualIndex).then((page) => page?.data ?? null);
     inflightRef.current.set(pageIndex, promise);
     try {
       const blob = await promise;
-      if (!blob) throw new Error("Could not load this page.");
-      if (loaderRef.current !== loader) return null;
+      if (!blob) {
+        throw new Error(
+          offlineOnlyRef.current || (typeof navigator !== "undefined" && !navigator.onLine)
+            ? "This page is not cached yet. Connect to the server to continue reading."
+            : "Could not load this page.",
+        );
+      }
+      if (generationRef.current !== generation) return null;
+      if (loader && loaderRef.current !== loader) return null;
+      if (Math.abs(pageIndex - currentIndexRef.current) > THUMB_RADIUS) return null;
+      // A successful display is the cache boundary. Preloaded pages may also
+      // be stored, but they never affect the progress percentage.
+      void saveOfflinePage(detail.id, detail.content_version, actualIndex, blob, pages[pageIndex], blob.type).catch(() => undefined);
       const url = URL.createObjectURL(blob);
       urlsRef.current.set(pageIndex, url);
       refreshCache((value) => value + 1);
@@ -59,7 +94,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     } finally {
       inflightRef.current.delete(pageIndex);
     }
-  }, [pages]);
+  }, [detail.content_version, detail.id, pages]);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,35 +105,68 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     setLoading(true);
     setError(null);
     setPageError(null);
+    offlineOnlyRef.current = false;
+    restoredRef.current = false;
+    generationRef.current += 1;
+    const generation = generationRef.current;
     const open = async () => {
-      const cached = await getOfflineFile(detail.id, detail.content_version);
-      const loader = await makeRangeLoader(
-        bookFileUrl(detail.id),
-        cached ?? undefined,
-        requestController.signal,
-        detail.content_version,
-      );
+      const cachedPages = await getOfflinePages(detail.id, detail.content_version).catch(() => []);
+      let loader: ZipLoader | null = null;
+      try {
+        if (typeof navigator === "undefined" || navigator.onLine) {
+          loader = await makeRangeLoader(
+            bookFileUrl(detail.id),
+            undefined,
+            requestController.signal,
+            detail.content_version,
+          );
+        }
+      } catch (error) {
+        if (cachedPages.length === 0) throw error;
+      }
+      if (!loader) {
+        if (cachedPages.length === 0) throw new Error("This comic has no cached pages. Connect to the server to begin reading.");
+        offlineOnlyRef.current = true;
+      }
       if (cancelled) {
-        await loader.close().catch(() => undefined);
+        await loader?.close().catch(() => undefined);
         return;
       }
       loaderRef.current = loader;
-      const names = sortComicEntries(loader.entries).map((entry) => entry.filename);
+      const sortedEntries = loader ? sortComicEntries(loader.entries) : [];
+      const names = loader
+        ? sortedEntries.map((entry) => entry.filename)
+        : (() => {
+          // Keep the complete page sequence in the offline reader. Cached
+          // pages remain selectable while a gap produces the explicit
+          // "needs internet" error instead of silently jumping over an
+          // uncached page (for example when progress came from another
+          // device).
+          const cachedByIndex = new Map(cachedPages.map((page) => [page.idx, page.name || String(page.idx)]));
+          const total = Math.max(detail.page_count, detail.pages?.length ?? 0, ...cachedPages.map((page) => page.idx + 1), 0);
+          return Array.from({ length: total }, (_, pageIndex) => detail.pages?.[pageIndex] ?? cachedByIndex.get(pageIndex) ?? String(pageIndex));
+        })();
+      pageNumbersRef.current = mapPageNumbers(names, detail.pages);
       if (names.length === 0) {
         loaderRef.current = null;
-        await loader.close().catch(() => undefined);
+        await loader?.close().catch(() => undefined);
         throw new Error("No readable pages in this archive.");
       }
       setPages(names);
       const progress = detail.progress;
       const sameContent = !progress?.content_version
         || progress.content_version === detail.content_version;
+      const restoredIndex = progress && sameContent
+        ? pageNumbersRef.current.indexOf(progress.page_index)
+        : -1;
       const start = progress
         ? sameContent
-          ? progress.page_index
+          ? (restoredIndex >= 0 ? restoredIndex : 0)
           : Math.round((Math.min(100, Math.max(0, progress.percent)) / 100) * (names.length - 1))
         : 0;
       setIndex(Math.min(Math.max(0, start), names.length - 1));
+      if (generationRef.current !== generation) return;
+      restoredRef.current = true;
       setLoading(false);
     };
     open().catch((err: unknown) => {
@@ -111,6 +179,8 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
     const inflight = inflightRef.current;
     return () => {
       cancelled = true;
+      restoredRef.current = false;
+      generationRef.current += 1;
       requestController.abort();
       void loaderRef.current?.close().catch(() => undefined);
       loaderRef.current = null;
@@ -151,7 +221,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   useEffect(() => {
     if (pages.length === 0) return;
     const loader = loaderRef.current;
-    if (!loader) return;
+    if (!loader && !offlineOnlyRef.current) return;
     const wanted = new Set<number>([index - 1, index + 1]);
     for (let i = index - THUMB_RADIUS; i <= index + THUMB_RADIUS; i++) {
       if (i >= 0 && i < pages.length) wanted.add(i);
@@ -172,13 +242,14 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
 
   // Report progress whenever the page changes.
   useEffect(() => {
-    if (pages.length === 0) return;
+    if (pages.length === 0 || !restoredRef.current) return;
+    const totalPages = detail.page_count > 0 ? detail.page_count : pages.length;
     onProgressRef.current({
       chapter_index: 0,
-      page_index: index,
-      percent: ((index + 1) / pages.length) * 100,
+      page_index: pageNumbersRef.current[index] ?? index,
+      percent: (((pageNumbersRef.current[index] ?? index) + 1) / totalPages) * 100,
     });
-  }, [pages, index]);
+  }, [detail.page_count, pages, index]);
 
   const goTo = useCallback(
     (target: number) => {
@@ -193,7 +264,13 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
   const retryPage = useCallback(() => {
     setPageError(null);
     setSrc(null);
-    void loadPage(index).catch((err: unknown) => {
+    void loadPage(index).then((url) => {
+      if (url) {
+        setSrc(url);
+        return;
+      }
+      setPageError("Could not load this page.");
+    }).catch((err: unknown) => {
       setPageError(err instanceof Error ? err.message : "Could not load this page.");
     });
   }, [index, loadPage]);
@@ -259,11 +336,11 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
         }}
       >
         {src ? (
-          <img src={src} alt={`Page ${index + 1} of ${pages.length}`} />
+          <img src={src} alt={`Page ${(pageNumbersRef.current[index] ?? index) + 1} of ${detail.page_count || pages.length}`} />
         ) : pageError ? (
           <div className="reader-error">
             <p>{pageError}</p>
-            <button type="button" onClick={retryPage}>Retry page</button>
+            <button type="button" onClick={(event) => { event.stopPropagation(); retryPage(); }}>Retry page</button>
           </div>
         ) : (
           !error && <div className="reader-loading">Loading page…</div>
@@ -278,19 +355,19 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
         )}
       </div>
       <div className="reader-bottom-bar">
-        <button type="button" onClick={prev} disabled={index <= 0}>
+        <button type="button" onClick={(event) => { event.stopPropagation(); prev(); }} disabled={index <= 0}>
           ← Prev
         </button>
         <span className="comic-counter">
-          {pages.length === 0 ? "—" : `${index + 1} / ${pages.length}`}
+          {pages.length === 0 ? "—" : `${(pageNumbersRef.current[index] ?? index) + 1} / ${detail.page_count || pages.length}`}
         </span>
         <button
           type="button"
-          onClick={() => setFit((mode) => (mode === "width" ? "height" : "width"))}
+          onClick={(event) => { event.stopPropagation(); setFit((mode) => (mode === "width" ? "height" : "width")); }}
         >
           Fit {fit === "width" ? "width" : "height"}
         </button>
-        <button type="button" onClick={next} disabled={index >= pages.length - 1}>
+        <button type="button" onClick={(event) => { event.stopPropagation(); next(); }} disabled={index >= pages.length - 1}>
           Next →
         </button>
       </div>
@@ -304,7 +381,7 @@ export function ComicReader({ detail, onProgress }: ComicReaderProps) {
                 key={name}
                 type="button"
                 className={`comic-thumb ${i === index ? "is-active" : ""}`}
-                onClick={() => goTo(i)}
+                onClick={(event) => { event.stopPropagation(); goTo(i); }}
                 role="listitem"
                 aria-label={`Go to page ${i + 1}`}
                 aria-current={i === index ? "page" : undefined}

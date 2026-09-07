@@ -12,7 +12,7 @@ use crate::resolve_reference;
 fn element_regex(name: &str) -> &'static Regex {
     static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| {
-        ["script", "iframe", "object", "embed"]
+        ["script", "iframe", "object", "embed", "form"]
             .into_iter()
             .map(|name| {
                 let pattern = format!(r"(?is)<{name}\b[^>]*>.*?</{name}\s*>");
@@ -28,7 +28,24 @@ fn strip_elements(html: &str, names: &[&str]) -> String {
     for name in names {
         out = element_regex(name).replace_all(&out, "").into_owned();
     }
-    out
+    // Malformed chapters sometimes omit a closing tag. Remove any remaining
+    // active-element tags as well; leaving their text is preferable to
+    // allowing a browser to reinterpret the rest of the chapter as markup.
+    static ACTIVE_TAGS: OnceLock<Regex> = OnceLock::new();
+    out = ACTIVE_TAGS
+        .get_or_init(|| {
+            Regex::new(r"(?is)</?(?:script|iframe|object|embed|form)\b[^>]*>")
+                .expect("active element tag regex")
+        })
+        .replace_all(&out, "")
+        .into_owned();
+    // `meta` and `base` are normally void elements, so the paired expression
+    // above cannot match them. Neither is needed inside a reader chapter.
+    static VOID_ELEMENTS: OnceLock<Regex> = OnceLock::new();
+    VOID_ELEMENTS
+        .get_or_init(|| Regex::new(r"(?is)<(?:meta|base)\b[^>]*?/?>").expect("void element regex"))
+        .replace_all(&out, "")
+        .into_owned()
 }
 
 fn strip_event_handlers(html: &str) -> String {
@@ -49,12 +66,12 @@ pub fn sanitize_and_rewrite(
     resources: &HashMap<String, usize>,
     prefix: &str,
 ) -> String {
-    let stripped = strip_elements(html, &["script", "iframe", "object", "embed"]);
+    let stripped = strip_elements(html, &["script", "iframe", "object", "embed", "form"]);
     let stripped = strip_event_handlers(&stripped);
 
     static URL_ATTRIBUTE: OnceLock<Regex> = OnceLock::new();
     let re = URL_ATTRIBUTE.get_or_init(|| {
-        Regex::new(r#"(?i)(src|href)\s*=\s*("([^"]*)"|'([^']*)')"#).expect("url attribute regex")
+        Regex::new(r#"(?i)(src|href|xlink:href|action|formaction|poster|data|srcset)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))"#).expect("url attribute regex")
     });
     re.replace_all(&stripped, |caps: &regex::Captures<'_>| {
         let attribute = &caps[1];
@@ -62,6 +79,7 @@ pub fn sanitize_and_rewrite(
             .get(3)
             .map(|m| m.as_str())
             .or_else(|| caps.get(4).map(|m| m.as_str()))
+            .or_else(|| caps.get(5).map(|m| m.as_str()))
             .unwrap_or_default();
         let trimmed = value.trim();
         let normalized = trimmed
@@ -74,6 +92,25 @@ pub fn sanitize_and_rewrite(
             || normalized.starts_with("data:text/html")
             || normalized.starts_with("data:application/xhtml+xml")
             || normalized.starts_with("file:")
+            || normalized.starts_with("filesystem:")
+        {
+            return format!("{attribute}=\"#\"");
+        }
+        if attribute.eq_ignore_ascii_case("srcset")
+            && value.split(',').any(|candidate| {
+                let candidate = candidate.split_whitespace().next().unwrap_or_default();
+                let normalized = candidate
+                    .chars()
+                    .filter(|character| !character.is_whitespace() && !character.is_control())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                normalized.starts_with("javascript:")
+                    || normalized.starts_with("vbscript:")
+                    || normalized.starts_with("data:text/html")
+                    || normalized.starts_with("data:application/xhtml+xml")
+                    || normalized.starts_with("file:")
+                    || normalized.starts_with("filesystem:")
+            })
         {
             return format!("{attribute}=\"#\"");
         }
@@ -142,5 +179,16 @@ mod tests {
         assert!(!out.to_ascii_lowercase().contains("data:text/html"));
         assert!(!out.to_ascii_lowercase().contains("file:"));
         assert_eq!(out.matches("href=\"#\"").count(), 2);
+    }
+
+    #[test]
+    fn strips_forms_metadata_and_dangerous_srcsets() {
+        let html = r#"<meta http-equiv="refresh" content="0;url=https://evil"><base href="https://evil/"><form action="https://evil"><input></form><img srcset="filesystem:secret 1x, ../ok.png 2x"><img src=javascript:alert(1)><svg><use xlink:href="javascript:alert(1)"/></svg>"#;
+        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/resource");
+        assert!(!out.to_ascii_lowercase().contains("<meta"));
+        assert!(!out.to_ascii_lowercase().contains("<base"));
+        assert!(!out.to_ascii_lowercase().contains("<form"));
+        assert!(!out.to_ascii_lowercase().contains("filesystem:"));
+        assert!(!out.to_ascii_lowercase().contains("javascript:"));
     }
 }

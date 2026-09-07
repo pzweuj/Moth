@@ -53,15 +53,17 @@ function AppRoutes() {
   const setup = useQuery({
     queryKey: ["setup-status"],
     queryFn: api.getSetupStatus,
+    networkMode: "always",
   });
   const session = useQuery({
     queryKey: ["session"],
     queryFn: api.getSession,
     enabled: setup.data?.initialized === true,
+    networkMode: "always",
   });
 
   useEffect(() => {
-    const onOnline = () => {
+    const flushServerWork = () => {
       void (async () => {
         // A deferred server logout must be attempted before progress writes;
         // this preserves the user's explicit sign-out boundary after a
@@ -70,8 +72,17 @@ function AppRoutes() {
         await api.flushPendingProgress();
       })();
     };
-    window.addEventListener("online", onOnline);
-    return () => window.removeEventListener("online", onOnline);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") flushServerWork();
+    };
+    window.addEventListener("online", flushServerWork);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pagehide", flushServerWork);
+    return () => {
+      window.removeEventListener("online", flushServerWork);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pagehide", flushServerWork);
+    };
   }, []);
 
   useEffect(() => {
@@ -294,7 +305,7 @@ function LibraryPage({ session }: { session?: SessionState }) {
   const [search, setSearch] = useState("");
   const [format, setFormat] = useState<"all" | BookSummary["format"]>("all");
 
-  const books = useQuery({ queryKey: ["books"], queryFn: api.getBooks });
+  const books = useQuery({ queryKey: ["books"], queryFn: api.getBooks, networkMode: "always" });
   const scan = useMutation({
     mutationFn: api.scanLibrary,
     onSuccess: () => {
@@ -308,7 +319,17 @@ function LibraryPage({ session }: { session?: SessionState }) {
   });
   const logout = useMutation({
     mutationFn: api.logout,
-    onSettled: () => {
+    onSettled: async () => {
+      // Logout clears the durable account cache in api.logout. Remove the
+      // corresponding in-memory queries as well so a later login (or a
+      // different server instance at the same origin) cannot briefly render
+      // the previous shelf or book detail while it refetches.
+      await queryClient.cancelQueries({
+        predicate: (query) => query.queryKey[0] !== "setup-status",
+      });
+      queryClient.removeQueries({ queryKey: ["books"] });
+      queryClient.removeQueries({ queryKey: ["book"] });
+      queryClient.removeQueries({ queryKey: ["scan-status"] });
       queryClient.setQueryData<SessionState>(["session"], {
         authenticated: false,
       });
@@ -440,6 +461,7 @@ function LibraryPage({ session }: { session?: SessionState }) {
 
 function OfflineStorageStatus() {
   const [estimate, setEstimate] = useState<StorageEstimate | null>(null);
+  const [quotaWarning, setQuotaWarning] = useState(false);
 
   useEffect(() => {
     const storage = typeof navigator !== "undefined" ? navigator.storage : undefined;
@@ -457,6 +479,23 @@ function OfflineStorageStatus() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    const onStorage = (event: Event) => {
+      const type = (event as CustomEvent<{ type?: string }>).detail?.type;
+      if (type === "quota") setQuotaWarning(true);
+      if (type === "cleared") setQuotaWarning(false);
+    };
+    window.addEventListener("moth-offline-storage", onStorage);
+    return () => window.removeEventListener("moth-offline-storage", onStorage);
+  }, []);
+
+  if (quotaWarning) {
+    return (
+      <span className="storage-note storage-warning" role="status">
+        Offline storage is full · clear cached content
+      </span>
+    );
+  }
   if (!estimate?.quota) return null;
   return (
     <span className="storage-note" title="Approximate browser storage usage">
@@ -473,7 +512,10 @@ function formatBytes(value: number): string {
 
 function BookCard({ book }: { book: BookSummary }) {
   const offline = useOfflineBook(book);
-  const coverUrl = offline.state === "available" ? offline.coverUrl : book.cover_url;
+  const isOnline = typeof navigator === "undefined" || navigator.onLine;
+  const coverUrl = offline.state === "partial"
+    ? offline.coverUrl ?? (isOnline ? book.cover_url : undefined)
+    : book.cover_url;
   const card = (
     <>
       <div className="book-cover">
@@ -514,20 +556,22 @@ function BookCard({ book }: { book: BookSummary }) {
       <Link className="book-card-link" to={`/reader/${book.id}`} aria-label={`Read ${book.title}`}>
         {card}
       </Link>
-      <button
-        className={`offline-book-button ${offline.state}`}
-        type="button"
-        onClick={() => void offline.toggle()}
-        disabled={offline.state === "unknown"}
-        aria-label={offline.state === "available"
-          ? `Remove ${book.title} from this device`
-          : offline.state === "downloading"
-            ? `Cancel download of ${book.title}`
-            : `Download ${book.title} for offline reading`}
-      >
-        {offline.state === "available" ? "On this device" : offline.state === "downloading" ? `Cancel download (${Math.round(offline.progress)}%)` : offline.state === "error" ? "Retry download" : "Download for offline"}
-      </button>
-      {offline.errorMessage && <span className="offline-error" role="status">{offline.errorMessage}</span>}
+      {offline.state === "partial" && (
+        <div className="offline-cache-row">
+          <span className="offline-cache-indicator" role="status">
+            Partial cache{offline.chapterCount ? ` · ${offline.chapterCount} chapters` : ""}{offline.pageCount ? ` · ${offline.pageCount} pages` : ""}
+          </span>
+          <button
+            className="offline-clear-button"
+            type="button"
+            onClick={(event) => { event.stopPropagation(); void offline.clearCache(); }}
+            aria-label={`Clear cached content for ${book.title}`}
+          >
+            Clear cache
+          </button>
+        </div>
+      )}
+      {offline.state === "error" && <span className="offline-error" role="status">Cache status unavailable</span>}
     </li>
   );
 }

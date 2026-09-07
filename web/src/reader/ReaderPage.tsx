@@ -15,11 +15,13 @@ import { ComicReader } from "./ComicReader";
 import { getLocalProgress, getOfflineTxtEncoding, setOfflineTxtEncoding } from "../offline/db";
 
 const SAVE_LABELS: Record<string, string> = {
+  "local-saved": "Saved on device",
   saving: "Saving…",
   saved: "Saved",
   offline: "Saved on device",
   "needs-login": "Sign in to sync",
   error: "Save failed",
+  "local-error": "Could not save on device",
 };
 
 /** TXT encoding options offered to the reader when auto-detection is wrong. */
@@ -58,6 +60,7 @@ export function ReaderPage() {
     queryKey: ["book", bookId, encoding],
     queryFn: () => api.getBook(bookId, encoding),
     enabled: valid,
+    networkMode: "always",
   });
   const { onProgress, saveState } = useProgressSaver(
     valid ? bookId : 0,
@@ -121,7 +124,7 @@ export function ReaderPage() {
         return;
       }
       const cachedEncoding = cached === "auto" ? "" : cached;
-      // While offline, only the encoding whose chapters were downloaded is
+      // While offline, only the encoding whose chapters were visited is
       // available. Prefer it over a stale browser preference so opening a
       // cached TXT book cannot ask IndexedDB for chapters that do not exist.
       if (!navigator.onLine && cached && cachedEncoding !== encoding) {

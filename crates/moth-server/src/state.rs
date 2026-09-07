@@ -53,4 +53,34 @@ impl AppState {
     pub fn resources_dir(&self) -> std::path::PathBuf {
         self.config.data_dir.join("resources")
     }
+
+    /// Verified immutable copies of source files used by range readers.
+    pub fn snapshots_dir(&self) -> std::path::PathBuf {
+        self.config.data_dir.join("snapshots")
+    }
+
+    /// Versioned cover thumbnails. A scan can install a new version without
+    /// replacing bytes that an existing reader is still using.
+    pub fn cover_path(&self, book_id: i64, version: &str) -> std::path::PathBuf {
+        self.covers_dir()
+            .join(book_id.to_string())
+            .join(format!("{version}.jpg"))
+    }
+
+    /// Versioned extracted resources for one book.
+    pub fn resource_path(&self, book_id: i64, version: &str, index: i64) -> std::path::PathBuf {
+        self.resources_dir()
+            .join(book_id.to_string())
+            .join(version)
+            .join(index.to_string())
+    }
+
+    /// All generated files for one book, including obsolete content versions.
+    pub fn book_covers_dir(&self, book_id: i64) -> std::path::PathBuf {
+        self.covers_dir().join(book_id.to_string())
+    }
+
+    pub fn book_resources_dir(&self, book_id: i64) -> std::path::PathBuf {
+        self.resources_dir().join(book_id.to_string())
+    }
 }

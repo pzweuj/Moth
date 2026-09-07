@@ -342,6 +342,26 @@ mod tests {
         let session = response_json(response).await;
         assert_eq!(session["authenticated"], true);
         assert_eq!(session["username"], "moth");
+        assert!(
+            session["instance_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(session["account_id"], "1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/session")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let anonymous_session = response_json(response).await;
+        assert_eq!(anonymous_session["authenticated"], false);
+        assert_eq!(anonymous_session["instance_id"], session["instance_id"]);
 
         let response = app
             .clone()

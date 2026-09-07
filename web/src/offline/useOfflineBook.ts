@@ -1,89 +1,69 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { BookSummary } from "../api";
-import { api } from "../api";
-import { deleteOfflineBook, downloadBook, getOfflineBook, getOfflineCover } from "./db";
+import { clearOfflineBookContent, getOfflineContentStatus, getOfflineCover } from "./db";
 
-export type OfflineBookState = "unknown" | "available" | "downloading" | "unavailable" | "error";
+export type OfflineBookState = "unknown" | "partial" | "none" | "error";
 
-export function useOfflineBook(book: BookSummary) {
+/**
+ * Read-only cache status for a shelf card. Content is cached automatically by
+ * the reader; there is intentionally no whole-book download action here.
+ */
+export function useOfflineBook(book: BookSummary): {
+  state: OfflineBookState;
+  chapterCount: number;
+  pageCount: number;
+  coverUrl?: string;
+  refresh: () => void;
+  clearCache: () => Promise<void>;
+} {
   const [state, setState] = useState<OfflineBookState>("unknown");
-  const [progress, setProgress] = useState(0);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [coverUrl, setCoverUrl] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const coverUrlRef = useRef<string | null>(null);
-
-  const replaceCover = useCallback((cover: Blob | null) => {
-    if (coverUrlRef.current) URL.revokeObjectURL(coverUrlRef.current);
-    const next = cover ? URL.createObjectURL(cover) : null;
-    coverUrlRef.current = next;
-    setCoverUrl(next);
-  }, []);
+  const [chapterCount, setChapterCount] = useState(0);
+  const [pageCount, setPageCount] = useState(0);
+  const [coverUrl, setCoverUrl] = useState<string | undefined>(undefined);
+  const [refreshToken, redraw] = useState(0);
+  const coverUrlRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
-    replaceCover(null);
-    void Promise.all([
-      getOfflineBook(book.id),
-      book.has_cover ? getOfflineCover(book.id, book.content_version) : Promise.resolve(null),
-    ]).then(([cached, cover]) => {
-      if (cancelled) return;
-      const available = cached?.content_version === book.content_version;
-      setState(available ? "available" : "unavailable");
-      if (available) replaceCover(cover);
-    }).catch(() => {
-      if (!cancelled) setState("unavailable");
-    });
+    setState("unknown");
+    if (coverUrlRef.current) URL.revokeObjectURL(coverUrlRef.current);
+    coverUrlRef.current = undefined;
+    setCoverUrl(undefined);
+    void (async () => {
+      try {
+        const status = await getOfflineContentStatus(book.id, book.content_version);
+        if (cancelled) return;
+        setChapterCount(status.chapterCount);
+        setPageCount(status.pageCount);
+        setState(status.hasContent ? "partial" : "none");
+        if (book.has_cover) {
+          const cover = await getOfflineCover(book.id, book.content_version);
+          if (!cancelled && cover) {
+            const next = URL.createObjectURL(cover);
+            coverUrlRef.current = next;
+            setCoverUrl(next);
+          }
+        }
+      } catch {
+        if (!cancelled) setState("error");
+      }
+    })();
     return () => {
       cancelled = true;
-      if (coverUrlRef.current) {
-        URL.revokeObjectURL(coverUrlRef.current);
-        coverUrlRef.current = null;
-      }
+      if (coverUrlRef.current) URL.revokeObjectURL(coverUrlRef.current);
+      coverUrlRef.current = undefined;
     };
-  }, [book.id, book.content_version, book.has_cover, replaceCover]);
+  }, [book.id, book.content_version, book.has_cover, refreshToken]);
 
-  const toggle = useCallback(async () => {
-    if (state === "downloading") {
-      abortRef.current?.abort();
-      return;
-    }
-    if (state === "available") {
-      await deleteOfflineBook(book.id);
-      replaceCover(null);
-      setState("unavailable");
-      return;
-    }
-    setState("downloading");
-    setProgress(0);
-    setErrorMessage(null);
-    const controller = new AbortController();
-    abortRef.current = controller;
-    try {
-      let encoding = "";
-      if (book.format === "txt") {
-        try {
-          encoding = localStorage.getItem(`moth:txt-encoding:${book.id}`) ?? "";
-        } catch {
-          // Use the server's automatic detection when localStorage is unavailable.
-        }
-      }
-      const detail = await api.getBook(book.id, encoding);
-      await downloadBook(book, detail, controller.signal, setProgress, encoding);
-      const cover = book.has_cover ? await getOfflineCover(book.id, book.content_version) : null;
-      replaceCover(cover);
-      setProgress(100);
-      setErrorMessage(null);
-      setState("available");
-    } catch (error) {
-      if ((error as DOMException)?.name !== "AbortError") console.error("offline download failed", error);
-      const cancelled = (error as DOMException)?.name === "AbortError";
-      setErrorMessage(cancelled ? null : error instanceof Error ? error.message : "Download failed. Try again.");
-      setState(cancelled ? "unavailable" : "error");
-    } finally {
-      abortRef.current = null;
-    }
-  }, [book, replaceCover, state]);
-
-  return { state, progress, coverUrl, errorMessage, toggle };
+  return {
+    state,
+    chapterCount,
+    pageCount,
+    coverUrl,
+    refresh: () => redraw((value) => value + 1),
+    clearCache: async () => {
+      await clearOfflineBookContent(book.id);
+      redraw((value) => value + 1);
+    },
+  };
 }
