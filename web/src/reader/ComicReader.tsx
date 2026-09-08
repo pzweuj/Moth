@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BookDetail, ProgressBody, ReadingPosition } from "../api";
+import type { ReaderNavigationRequest } from "./navigation";
 
 type ComicSettings = { mode: "single" | "double" | "webtoon"; direction: "ltr" | "rtl"; fit: "screen" | "width" | "height" };
-type Props = { detail: BookDetail; progress?: ProgressBody | null; settings: ComicSettings; onProgress: (position: ReadingPosition, contentVersion?: string) => void; onBack: () => void };
+type Props = { detail: BookDetail; progress?: ProgressBody | null; settings: ComicSettings; navigationRequest: ReaderNavigationRequest | null; onCurrentPageChange: (page: number) => void; onProgress: (position: ReadingPosition, contentVersion?: string) => void };
 
-export function ComicReader({ detail, progress, settings, onProgress, onBack }: Props) {
+export function ComicReader({ detail, progress, settings, navigationRequest, onCurrentPageChange, onProgress }: Props) {
   const saved = progress?.content_version === detail.content_version && progress.position.type === "cbz" ? progress.position : null;
   const initialPage = Math.min(Math.max(0, saved?.page_index ?? 0), Math.max(0, detail.pages.length - 1));
   const [index, setIndex] = useState(initialPage);
@@ -15,9 +16,16 @@ export function ComicReader({ detail, progress, settings, onProgress, onBack }: 
   const indexRef = useRef(initialPage);
   const initialSavedRef = useRef(saved);
   const restoreProgressRef = useRef(0);
-  const touchStart = useRef<number | null>(null);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => { indexRef.current = index; }, [index]);
+  useEffect(() => { onCurrentPageChange(index); }, [index, onCurrentPageChange]);
+
+  useEffect(() => {
+    if (!navigationRequest) return;
+    const target = Number(navigationRequest.id);
+    if (Number.isInteger(target)) setIndex(Math.min(Math.max(0, target), Math.max(0, detail.pages.length - 1)));
+  }, [detail.pages.length, navigationRequest]);
 
   const pageUrl = (page: number) => `/api/v1/publications/${detail.id}/pages/${page}`;
   const markLoaded = useCallback((page: number) => {
@@ -105,6 +113,13 @@ export function ComicReader({ detail, progress, settings, onProgress, onBack }: 
 
   useEffect(() => {
     if (settings.mode !== "webtoon") return;
+    restoreProgressRef.current = 0;
+    const frame = window.requestAnimationFrame(restoreWebtoonPosition);
+    return () => window.cancelAnimationFrame(frame);
+  }, [index, restoreWebtoonPosition, settings.mode]);
+
+  useEffect(() => {
+    if (settings.mode !== "webtoon") return;
     const savedPosition = initialSavedRef.current;
     restoreProgressRef.current = savedPosition?.page_index === indexRef.current ? (savedPosition.page_progress ?? 0) : 0;
     const frame = window.requestAnimationFrame(restoreWebtoonPosition);
@@ -118,19 +133,28 @@ export function ComicReader({ detail, progress, settings, onProgress, onBack }: 
       ? [index, index + 1].filter((page) => page < detail.pages.length)
       : [index], [detail.pages, index, settings.mode]);
 
+  const step = settings.mode === "double" ? 2 : 1;
   return <div className={`reader-stage comic-reader comic-${settings.mode} comic-${settings.fit}`} dir={settings.direction}>
     <div className="reader-content" ref={contentRef}>
-      <button className="reader-back-link" type="button" onClick={onBack}>← 返回书库</button>
       {error && <div className="reader-error"><p>{error}</p><button type="button" onClick={() => setError("")}>关闭</button></div>}
-      <div className="comic-pages" onTouchStart={(event) => { touchStart.current = event.changedTouches[0]?.clientX ?? null; }} onTouchEnd={(event) => {
+      <div className="comic-pages" onTouchStart={(event) => { const touch = event.changedTouches[0]; touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null; }} onTouchEnd={(event) => {
         const start = touchStart.current;
         touchStart.current = null;
-        const end = event.changedTouches[0]?.clientX;
-        if (start === null || end === undefined || settings.mode === "webtoon") return;
-        const distance = end - start;
-        if (Math.abs(distance) < 48) return;
-        const forward = settings.direction === "rtl" ? distance > 0 : distance < 0;
-        move(forward ? (settings.mode === "double" ? 2 : 1) : -1);
+        const touch = event.changedTouches[0];
+        if (!start || !touch || settings.mode === "webtoon") return;
+        const distance = touch.clientX - start.x;
+        const verticalDistance = touch.clientY - start.y;
+        if (Math.abs(distance) >= 48 && Math.abs(distance) >= Math.abs(verticalDistance)) {
+          const forward = settings.direction === "rtl" ? distance > 0 : distance < 0;
+          move(forward ? step : -step);
+          return;
+        }
+        if (Math.abs(distance) > 12 || Math.abs(verticalDistance) > 12) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const forward = settings.direction === "rtl"
+          ? touch.clientX < rect.left + rect.width * 0.3
+          : touch.clientX > rect.left + rect.width * 0.7;
+        if (touch.clientX < rect.left + rect.width * 0.3 || touch.clientX > rect.left + rect.width * 0.7) move(forward ? step : -step);
       }}>
         {visible.map((page) => <div className="comic-page" data-page={page} key={page} ref={(node) => {
           if (node) pageRefs.current.set(page, node);
@@ -142,7 +166,7 @@ export function ComicReader({ detail, progress, settings, onProgress, onBack }: 
         </div>)}
       </div>
     </div>
-    <div className="reader-bottom-bar"><button type="button" onClick={() => move(-1)} disabled={index <= 0}>上一页</button><span>{index + 1} / {detail.pages.length}</span><button type="button" onClick={() => move(settings.mode === "double" ? 2 : 1)} disabled={index >= detail.pages.length - 1}>下一页</button></div>
+    <div className="reader-bottom-bar"><button type="button" onClick={() => move(-step)} disabled={index <= 0}>上一页</button><span>{index + 1} / {detail.pages.length}</span><button type="button" onClick={() => move(step)} disabled={index >= detail.pages.length - 1}>下一页</button></div>
   </div>;
 }
 

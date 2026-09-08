@@ -5,7 +5,7 @@ Moth 是一个单用户、filesystem-first 自托管 PWA 阅读器。它只读�
 ## 产品边界
 
 - `MOTH_BOOKS_DIR` 是唯一书库根目录，子目录就是分类。
-- 首页只有继续阅读、最近添加和目录；没有搜索、作者筛选、系列管理或文件整理。
+- 首页显示继续阅读和按“分类/系列/作品”层级组织的目录预览；没有搜索、作者筛选、系列管理或文件整理。
 - EPUB 使用 HTTP Range 和 CFI；TXT 使用编码检测、中文章节索引和 UTF-16 字符定位；CBZ 按页解压；MOBI 首次打开时转成 EPUB 缓存。
 - PWA 只缓存应用外壳和构建资源。阅读资源和进度请求需要连接服务器。
 - 设置保存在浏览器 `localStorage`；登录会话使用 HttpOnly cookie。
@@ -66,11 +66,11 @@ Compose 将宿主机的 `MOTH_BOOKS_PATH` 挂载到 `/books:ro`，将 `./data` �
 
 | 端点 | 用途 |
 | --- | --- |
-| `GET /home` | 继续阅读和最近添加 |
+| `GET /home` | 继续阅读和分类/系列目录预览 |
 | `GET /browse?path=...` | 面包屑、子目录和当前目录的书 |
 | `POST /scan`、`GET /scan/status` | 启动扫描和读取全局扫描状态 |
 | `GET /publications/{id}` | Publication 元数据、TXT 章节或 CBZ 页索引 |
-| `GET /publications/{id}/cover`、`/file`、`/chapters/{idx}`、`/pages/{idx}` | 阅读资源 |
+| `GET /publications/{id}/cover`、`/file`、`/chapters/{idx}`、`/pages/{idx}`、`/pages/{idx}/thumbnail` | 阅读资源 |
 | `GET/POST /publications/{id}/conversion` | 查询或启动 MOBI→EPUB 转换 |
 | `GET/PUT /publications/{id}/progress` | 读取或保存服务端进度 |
 

@@ -47,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         .route("/publications/{id}/chapters/{idx}", get(books::get_chapter))
         .route("/publications/{id}/pages/{idx}", get(books::get_page))
         .route(
+            "/publications/{id}/pages/{idx}/thumbnail",
+            get(books::get_page_thumbnail),
+        )
+        .route(
             "/publications/{id}/progress",
             get(books::get_progress).put(books::put_progress),
         )

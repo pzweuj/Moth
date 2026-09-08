@@ -26,6 +26,20 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".local/books"));
     std::fs::create_dir_all(&target).expect("create target directory");
+    let text_dir = target.join("小说").join("夜色入海");
+    let legacy_dir = target.join("小说").join("Legacy GBK");
+    let cbz_dir = target.join("漫画").join("晨光短篇");
+    let fixture_dir = target.join("英文").join("The Fixture Novel");
+    let no_cover_dir = target.join("英文").join("No Cover Novel");
+    for directory in [
+        &text_dir,
+        &legacy_dir,
+        &cbz_dir,
+        &fixture_dir,
+        &no_cover_dir,
+    ] {
+        std::fs::create_dir_all(directory).expect("create nested fixture directory");
+    }
 
     // Original, redistributable text long enough to exercise pagination.
     let mut text = String::new();
@@ -37,14 +51,14 @@ fn main() {
             ));
         }
     }
-    std::fs::write(target.join("夜色入海.txt"), &text).expect("write txt");
+    std::fs::write(text_dir.join("第一部.txt"), &text).expect("write txt");
     let legacy_text = text.replace("第一章 夜色入海", "第一章 Legacy GBK");
     let (gbk, _, _) = encoding_rs::GBK.encode(&legacy_text);
-    std::fs::write(target.join("Legacy GBK.txt"), gbk).expect("write gbk");
-    std::fs::write(target.join("Broken.epub"), b"not a zip").expect("broken epub");
+    std::fs::write(legacy_dir.join("第一部.txt"), gbk).expect("write gbk");
+    std::fs::write(fixture_dir.join("Broken.epub"), b"not a zip").expect("broken epub");
 
     // CBZ: three pages exercising natural sort order.
-    let cbz = std::fs::File::create(target.join("晨光短篇.cbz")).expect("create cbz");
+    let cbz = std::fs::File::create(cbz_dir.join("第一部.cbz")).expect("create cbz");
     let mut zip = zip::ZipWriter::new(cbz);
     let options = zip::write::SimpleFileOptions::default();
     for number in [1, 2, 3, 4, 5, 6, 10, 11] {
@@ -57,7 +71,7 @@ fn main() {
     zip.finish().expect("finish cbz");
 
     // EPUB with two chapters, a cover image, and CSS.
-    let epub = std::fs::File::create(target.join("The Fixture Novel.epub")).expect("create epub");
+    let epub = std::fs::File::create(fixture_dir.join("第一部.epub")).expect("create epub");
     let mut zip = zip::ZipWriter::new(epub);
     let stored =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -142,7 +156,7 @@ fn main() {
     // placeholder and keeps the missing-cover state distinct from a parse
     // failure.
     let no_cover =
-        std::fs::File::create(target.join("No Cover Novel.epub")).expect("create no-cover epub");
+        std::fs::File::create(no_cover_dir.join("第一部.epub")).expect("create no-cover epub");
     let mut zip = zip::ZipWriter::new(no_cover);
     zip.start_file("mimetype", stored).expect("mimetype");
     zip.write_all(b"application/epub+zip").expect("mimetype");

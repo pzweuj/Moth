@@ -45,6 +45,15 @@ impl AppState {
         self.covers_dir().join(format!("{version}.jpg"))
     }
 
+    /// Directory holding generated CBZ page thumbnails.
+    pub fn thumbnails_dir(&self, version: &str) -> std::path::PathBuf {
+        self.config.data_dir.join("thumbnails").join(version)
+    }
+
+    pub fn thumbnail_path(&self, version: &str, page: i64) -> std::path::PathBuf {
+        self.thumbnails_dir(version).join(format!("{page}.jpg"))
+    }
+
     pub fn txt_dir(&self, version: &str, encoding: &str) -> std::path::PathBuf {
         self.config
             .data_dir

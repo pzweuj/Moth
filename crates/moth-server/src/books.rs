@@ -110,7 +110,22 @@ pub struct ProgressBody {
 #[derive(Debug, Serialize)]
 pub struct HomeResponse {
     pub continue_reading: Vec<PublicationSummary>,
-    pub recently_added: Vec<PublicationSummary>,
+    pub directories: Vec<HomeDirectoryPreview>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HomeDirectoryPreview {
+    pub name: String,
+    pub path: String,
+    pub series: Vec<HomeSeriesPreview>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HomeSeriesPreview {
+    pub name: String,
+    pub path: String,
+    pub publication_count: i64,
+    pub representative: Option<PublicationSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,12 +158,95 @@ pub async fn home(
     let mut continue_reading = fetch_publications(&state.db, None, Some("progress")).await?;
     continue_reading.retain(|book| book.progress > 0.0 && book.progress < 1.0);
     continue_reading.truncate(12);
-    let mut recently_added = fetch_publications(&state.db, None, Some("added")).await?;
-    recently_added.truncate(12);
+    let directories = fetch_home_directories(&state.db).await?;
     Ok(Json(HomeResponse {
         continue_reading,
-        recently_added,
+        directories,
     }))
+}
+
+struct SeriesCandidate {
+    preview: HomeSeriesPreview,
+    active_at: Option<i64>,
+}
+
+async fn fetch_home_directories(db: &SqlitePool) -> Result<Vec<HomeDirectoryPreview>, AppError> {
+    let Some(root_id) =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM directories WHERE relative_path=''")
+            .fetch_optional(db)
+            .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let categories = sqlx::query(
+        "SELECT id,name,relative_path FROM directories WHERE parent_id=? ORDER BY name COLLATE NOCASE",
+    )
+    .bind(root_id)
+    .fetch_all(db)
+    .await?;
+    let mut output = Vec::with_capacity(categories.len());
+    for category in categories {
+        let category_id: i64 = category.try_get("id")?;
+        let series_rows = sqlx::query(
+            "SELECT id,name,relative_path FROM directories WHERE parent_id=? ORDER BY name COLLATE NOCASE",
+        )
+        .bind(category_id)
+        .fetch_all(db)
+        .await?;
+        let mut candidates = Vec::with_capacity(series_rows.len());
+        for series in series_rows {
+            let series_id: i64 = series.try_get("id")?;
+            let publications = fetch_publications(db, Some(series_id), Some("filename")).await?;
+            let active_at: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(r.updated_at) FROM publications p JOIN reading_progress r ON r.publication_id=p.id WHERE p.directory_id=? AND r.progress>0 AND r.progress<1",
+            )
+            .bind(series_id)
+            .fetch_one(db)
+            .await?;
+            candidates.push(SeriesCandidate {
+                preview: HomeSeriesPreview {
+                    name: series.try_get("name")?,
+                    path: series.try_get("relative_path")?,
+                    publication_count: publications.len() as i64,
+                    representative: publications
+                        .iter()
+                        .find(|publication| publication.parse_status == "ok")
+                        .cloned()
+                        .or_else(|| publications.first().cloned()),
+                },
+                active_at,
+            });
+        }
+        order_home_series(&mut candidates);
+        output.push(HomeDirectoryPreview {
+            name: category.try_get("name")?,
+            path: category.try_get("relative_path")?,
+            series: candidates
+                .into_iter()
+                .map(|candidate| candidate.preview)
+                .collect(),
+        });
+    }
+    Ok(output)
+}
+
+fn order_home_series(candidates: &mut Vec<SeriesCandidate>) {
+    candidates.sort_by(|left, right| match (left.active_at, right.active_at) {
+        (Some(left_at), Some(right_at)) => right_at.cmp(&left_at).then_with(|| {
+            left.preview
+                .name
+                .to_lowercase()
+                .cmp(&right.preview.name.to_lowercase())
+        }),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left
+            .preview
+            .name
+            .to_lowercase()
+            .cmp(&right.preview.name.to_lowercase()),
+    });
+    candidates.truncate(4);
 }
 
 pub(crate) async fn fetch_publications(
@@ -159,6 +257,7 @@ pub(crate) async fn fetch_publications(
     let order = match sort {
         Some("added") => "p.added_at DESC, p.title COLLATE NOCASE",
         Some("progress") => "COALESCE(r.updated_at, 0) DESC, p.title COLLATE NOCASE",
+        Some("filename") => "p.filename COLLATE NOCASE, p.title COLLATE NOCASE",
         _ => "p.title COLLATE NOCASE",
     };
     let query = format!(
@@ -429,6 +528,69 @@ pub async fn get_page(
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("page response"))
+}
+
+pub async fn get_page_thumbnail(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath((id, idx)): AxumPath<(i64, i64)>,
+) -> Result<Response, AppError> {
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    if row.format != "cbz" {
+        return Err(AppError::Validation(
+            "page thumbnails are available only for CBZ publications".to_owned(),
+        ));
+    }
+    let source = ensure_source_current(&row).await?;
+    let page: Option<(String,)> =
+        sqlx::query_as("SELECT path FROM cbz_pages WHERE publication_id=? AND idx=?")
+            .bind(id)
+            .bind(idx)
+            .fetch_optional(&state.db)
+            .await?;
+    let (entry,) = page.ok_or(AppError::NotFound)?;
+    let version = current_content_version(&row, None);
+    let target = state.thumbnail_path(&version, idx);
+    if !target.exists() {
+        let target_dir = state.thumbnails_dir(&version);
+        tokio::fs::create_dir_all(&target_dir).await?;
+        let raw = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(source)?;
+            let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
+            let mut item = zip.by_name(&entry).map_err(std::io::Error::other)?;
+            let mut bytes = Vec::new();
+            item.read_to_end(&mut bytes)?;
+            Ok::<_, std::io::Error>(bytes)
+        })
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
+        let encoded = tokio::task::spawn_blocking(move || encode_page_thumbnail(&raw))
+            .await
+            .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
+        let temp = target.with_extension("tmp");
+        tokio::fs::write(&temp, encoded).await?;
+        tokio::fs::rename(&temp, &target).await?;
+    }
+    let bytes = tokio::fs::read(&target).await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::ETAG, format!("\"{version}-page-{idx}-thumbnail\""))
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("thumbnail response"))
+}
+
+fn encode_page_thumbnail(raw: &[u8]) -> Result<Vec<u8>, AppError> {
+    let image = image::load_from_memory(raw)
+        .map_err(|error| AppError::Validation(format!("invalid CBZ page: {error}")))?
+        .thumbnail(240, 240);
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 78)
+        .encode_image(&image)
+        .map_err(|error| AppError::Validation(format!("could not encode thumbnail: {error}")))?;
+    Ok(output)
 }
 
 pub async fn get_progress(
@@ -1059,6 +1221,52 @@ mod tests {
         assert_eq!(parse_range("bytes=-4", 20), Some((16, 19)));
         assert_eq!(parse_range("bytes=20-", 20), None);
         assert_eq!(parse_range("bytes=0-1,4-5", 20), Some((0, 1)));
+    }
+
+    #[test]
+    fn home_series_prioritizes_active_reading_and_limits_to_four() {
+        let mut candidates = [
+            ("z-active", Some(20)),
+            ("delta", None),
+            ("alpha", None),
+            ("echo", None),
+            ("bravo", None),
+            ("charlie", None),
+        ]
+        .into_iter()
+        .map(|(name, active_at)| SeriesCandidate {
+            preview: HomeSeriesPreview {
+                name: name.to_owned(),
+                path: name.to_owned(),
+                publication_count: 1,
+                representative: None,
+            },
+            active_at,
+        })
+        .collect::<Vec<_>>();
+
+        order_home_series(&mut candidates);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.preview.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-active", "alpha", "bravo", "charlie"]
+        );
+    }
+
+    #[test]
+    fn page_thumbnail_is_jpeg_with_maximum_edge() {
+        let source = image::RgbImage::from_pixel(480, 300, image::Rgb([20, 80, 140]));
+        let mut raw = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(&mut raw, image::ImageFormat::Png)
+            .expect("encode source image");
+        let thumbnail = encode_page_thumbnail(raw.get_ref()).expect("encode thumbnail");
+        let decoded = image::load_from_memory(&thumbnail).expect("decode thumbnail");
+        assert_eq!(decoded.width(), 240);
+        assert_eq!(decoded.height(), 150);
     }
 
     #[test]

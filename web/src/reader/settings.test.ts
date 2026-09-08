@@ -12,7 +12,6 @@ describe("reader settings persistence", () => {
     expect(loadSettings()).toEqual({
       fontSize: 18,
       lineHeight: 1.7,
-      theme: "light",
       flow: "paginated",
     });
   });
@@ -21,7 +20,6 @@ describe("reader settings persistence", () => {
     const settings: ReaderSettings = {
       fontSize: 22,
       lineHeight: 2.0,
-      theme: "dark",
       flow: "scrolled",
     };
     saveSettings(settings);
@@ -29,11 +27,12 @@ describe("reader settings persistence", () => {
   });
 
   it("merges partial stored settings over defaults", () => {
-    localStorage.setItem(KEY, JSON.stringify({ fontSize: 24 }));
+    localStorage.setItem(KEY, JSON.stringify({ fontSize: 24, theme: "dark" }));
     const settings = loadSettings();
     expect(settings.fontSize).toBe(24);
     expect(settings.lineHeight).toBe(1.7);
-    expect(settings.theme).toBe("light");
+    expect(settings.flow).toBe("paginated");
+    expect("theme" in settings).toBe(false);
   });
 
   it("falls back to defaults on corrupt storage", () => {
@@ -41,7 +40,6 @@ describe("reader settings persistence", () => {
     expect(loadSettings()).toEqual({
       fontSize: 18,
       lineHeight: 1.7,
-      theme: "light",
       flow: "paginated",
     });
   });
@@ -50,7 +48,7 @@ describe("reader settings persistence", () => {
     const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
     });
-    expect(() => saveSettings({ ...loadSettings(), theme: "dark" })).not.toThrow();
+    expect(() => saveSettings(loadSettings())).not.toThrow();
     spy.mockRestore();
   });
 });

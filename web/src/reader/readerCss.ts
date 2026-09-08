@@ -8,8 +8,7 @@ import type { ReaderSettings } from "./settings";
 export function readerCss({
   fontSize,
   lineHeight,
-  theme,
-}: ReaderSettings): string {
+}: ReaderSettings, theme: "light" | "dark"): string {
   const dark = theme === "dark";
   const foreground = dark ? "#d8d3cc" : "#1f2328";
   const background = dark ? "#14161a" : "#fbfaf7";

@@ -19,9 +19,10 @@ export const test = base.extend<{ app: { url: string; books: string; web: string
     const books = resolve(directory, "books");
     const web = resolve(directory, "web");
     await mkdir(books, { recursive: true });
+    await mkdir(resolve(books, "经典", "Alice"), { recursive: true });
     await cp(resolve(root, "web/dist"), web, { recursive: true });
     execFileSync(resolve(cargoTarget, `debug/examples/make_books${suffix}`), [books], { windowsHide: true });
-    await cp(resolve(root, "crates/moth-format/tests/fixtures/alice.mobi"), resolve(books, "alice.mobi"));
+    await cp(resolve(root, "crates/moth-format/tests/fixtures/alice.mobi"), resolve(books, "经典", "Alice", "第一部.mobi"));
     const listener = createServer();
     await new Promise<void>((done) => listener.listen(0, "127.0.0.1", done));
     const port = (listener.address() as { port: number }).port;

@@ -1,14 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import type { BookDetail, ProgressBody, ReadingPosition } from "../api";
 import { api, bookFileUrl } from "../api";
 import { makeRangeLoader } from "./zipLoader";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
+import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
 import type { FoliateBook, FoliateViewElement } from "../../vendor/foliate-js/view.js";
 import "../../vendor/foliate-js/view.js";
 
-type Props = { detail: BookDetail; progress?: ProgressBody | null; settings: ReaderSettings; onProgress: (position: ReadingPosition, contentVersion?: string) => void; onBack: () => void };
+type Props = { detail: BookDetail; progress?: ProgressBody | null; settings: ReaderSettings; theme: "light" | "dark"; encoding: string; navigationRequest: ReaderNavigationRequest | null; onProgress: (position: ReadingPosition, contentVersion?: string) => void; onNavigationChange: (items: ReaderNavigationItem[], activeId: string) => void };
 type TocItem = { label: string; href: string; depth: number };
+
+function toNavigationItems(items: TocItem[]): ReaderNavigationItem[] {
+  return items.map((item) => ({ id: item.href, label: item.label, depth: item.depth }));
+}
 
 function flattenToc(value: unknown): TocItem[] {
   if (!Array.isArray(value)) return [];
@@ -97,7 +102,7 @@ function offsetRange(doc: Document, offset: number): Range {
   range.selectNodeContents(doc.body); range.collapse(false); return range;
 }
 
-export function FoliateTextReader({ detail, progress, settings, onProgress, onBack }: Props) {
+export function FoliateTextReader({ detail, progress, settings, theme, encoding, navigationRequest, onProgress, onNavigationChange }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<FoliateViewElement | null>(null);
   const publicationRef = useRef<TextPublication | null>(null);
@@ -105,15 +110,14 @@ export function FoliateTextReader({ detail, progress, settings, onProgress, onBa
   const settingsRef = useRef(settings);
   const onProgressRef = useRef(onProgress);
   const textVersionRef = useRef(detail.content_version);
-  const [toc, setToc] = useState<TocItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [encoding, setEncoding] = useState(() => progress?.position.type === "txt" ? progress.position.encoding : "auto");
-  const savedEncoding = progress?.position.type === "txt" ? progress.position.encoding : "";
+  const tocRef = useRef<TocItem[]>([]);
+  const onNavigationChangeRef = useRef(onNavigationChange);
 
   useEffect(() => { progressRef.current = progress; }, [progress]);
-  useEffect(() => { if (savedEncoding) setEncoding(savedEncoding); }, [detail.id, savedEncoding]);
-  useEffect(() => { settingsRef.current = settings; const renderer = viewRef.current?.renderer; if (renderer) { renderer.setAttribute("flow", settings.flow); renderer.setStyles(readerCss(settings)); } }, [settings]);
+  useEffect(() => { onNavigationChangeRef.current = onNavigationChange; }, [onNavigationChange]);
+  useEffect(() => { settingsRef.current = settings; const renderer = viewRef.current?.renderer; if (renderer) { renderer.setAttribute("flow", settings.flow); renderer.setStyles(readerCss(settings, theme)); } }, [settings, theme]);
   useEffect(() => { onProgressRef.current = onProgress; }, [onProgress]);
 
   useEffect(() => {
@@ -122,22 +126,29 @@ export function FoliateTextReader({ detail, progress, settings, onProgress, onBa
     let cancelled = false;
     let loader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
     let view: FoliateViewElement | null = null;
+    const cleanups: Array<() => void> = [];
     const saved = progressRef.current;
     const txtSaved = saved?.position.type === "txt" ? saved.position : null;
     const open = async () => {
+      setLoading(true);
+      setError("");
       const isTxt = detail.source_format === "txt";
       let book: FoliateBook;
       if (isTxt) {
         const publication = new TextPublication(detail, encoding, (version) => { textVersionRef.current = version; });
         publicationRef.current = publication;
         book = publication as unknown as FoliateBook;
-        setToc(publication.toc.map((item) => ({ ...item, depth: 0 })));
+        const items = publication.toc.map((item) => ({ ...item, depth: 0 }));
+        tocRef.current = items;
+        onNavigationChangeRef.current(toNavigationItems(items), "");
       } else {
         loader = await makeRangeLoader(bookFileUrl(detail.id), undefined, detail.content_version);
         const { EPUB } = await import("../../vendor/foliate-js/epub.js");
         const epub = await new EPUB(loader).init();
         book = epub as unknown as FoliateBook;
-        setToc(flattenToc((epub as { toc?: unknown }).toc));
+        const items = flattenToc((epub as { toc?: unknown }).toc);
+        tocRef.current = items;
+        onNavigationChangeRef.current(toNavigationItems(items), "");
       }
       view = document.createElement("foliate-view") as unknown as FoliateViewElement;
       host.append(view); viewRef.current = view;
@@ -155,10 +166,17 @@ export function FoliateTextReader({ detail, progress, settings, onProgress, onBa
           const href = typeof location.href === "string" ? location.href : String(location.tocItem?.href ?? section.current ?? "");
           if (cfi) onProgressRef.current({ type: "epub", href, cfi, progress: fraction });
         }
+        const href = isTxt ? `#${index}` : typeof location.href === "string" ? location.href : String(location.tocItem?.href ?? section.current ?? "");
+        const active = tocRef.current.find((item) => item.href === href || (href && item.href.startsWith(href.split("#")[0])))?.href ?? (isTxt ? `#${index}` : "");
+        onNavigationChangeRef.current(toNavigationItems(tocRef.current), active);
       });
+      view.addEventListener("load", ((event: Event) => {
+        const doc = (event as CustomEvent<{ doc?: Document }>).detail?.doc;
+        if (doc) cleanups.push(installMobileTapNavigation(doc, view!, settingsRef));
+      }) as EventListener);
       await view.open(book);
       view.renderer.setAttribute("flow", settingsRef.current.flow);
-      view.renderer.setStyles(readerCss(settingsRef.current));
+      view.renderer.setStyles(readerCss(settingsRef.current, theme));
       if (isTxt && txtSaved && txtSaved.encoding === encoding && saved?.content_version) {
         const index = txtSaved.chapter_index;
         await view.renderer.goTo({ index, anchor: (doc: Document) => offsetRange(doc, txtSaved.character_offset) });
@@ -172,9 +190,49 @@ export function FoliateTextReader({ detail, progress, settings, onProgress, onBa
       if (!cancelled) setLoading(false);
     };
     void open().catch((reason) => { if (!cancelled) { setError(reason instanceof Error ? reason.message : "打开书籍失败"); setLoading(false); } });
-    return () => { cancelled = true; view?.close(); view?.remove(); viewRef.current = null; publicationRef.current?.destroy(); publicationRef.current = null; void loader?.close(); };
-  }, [detail, encoding]);
+    return () => { cancelled = true; cleanups.forEach((cleanup) => cleanup()); view?.close(); view?.remove(); viewRef.current = null; publicationRef.current?.destroy(); publicationRef.current = null; void loader?.close(); };
+  }, [detail, encoding, theme]);
 
-  const goToToc = (href: string) => { void viewRef.current?.goTo(href); };
-  return <div className={`reader-stage text-reader theme-${settings.theme}`}><div className="reader-content"><button className="reader-back-link" type="button" onClick={onBack}>← 返回书库</button><div className="reader-inline-tools">{detail.source_format === "txt" && <label className="reader-encoding">编码 <select value={encoding} onChange={(event) => setEncoding(event.target.value)}><option value="auto">自动检测</option><option value="utf-8">UTF-8</option><option value="utf-16le">UTF-16 LE</option><option value="utf-16be">UTF-16 BE</option><option value="gbk">GBK</option><option value="gb18030">GB18030</option><option value="big5">Big5</option></select></label>}{toc.length > 0 && <label className="reader-encoding">目录 <select aria-label="目录" defaultValue="" onChange={(event) => { if (event.target.value) goToToc(event.target.value); }}><option value="">选择章节</option>{toc.map((item) => <option key={item.href} value={item.href}>{`${"　".repeat(Math.min(item.depth, 4))}${item.label}`}</option>)}</select></label>}</div><div ref={hostRef} className="reader-host" />{loading && <p>正在打开书籍…</p>}{error && <div className="reader-error"><p>{error}</p><button type="button" onClick={onBack}>返回书库</button></div>}</div><div className="reader-bottom-bar"><button type="button" onClick={() => void viewRef.current?.prev()}>上一页</button><button type="button" onClick={() => void viewRef.current?.next()}>下一页</button></div></div>;
+  useEffect(() => {
+    if (!navigationRequest || !viewRef.current) return;
+    void viewRef.current.goTo(navigationRequest.id);
+  }, [navigationRequest]);
+
+  return <div className={`reader-stage text-reader theme-${theme}`}><div className="reader-content"><div ref={hostRef} className="reader-host" />{loading && <p>正在打开书籍…</p>}{error && <div className="reader-error"><p>{error}</p></div>}</div><div className="reader-bottom-bar"><button type="button" onClick={() => void viewRef.current?.prev()}>上一页</button><button type="button" onClick={() => void viewRef.current?.next()}>下一页</button></div></div>;
+}
+
+function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>): () => void {
+  let startX: number | null = null;
+  let moved = false;
+  const touchStart = (event: TouchEvent) => {
+    startX = event.changedTouches[0]?.clientX ?? null;
+    moved = false;
+  };
+  const touchMove = (event: TouchEvent) => {
+    if (startX === null) return;
+    const x = event.changedTouches[0]?.clientX;
+    if (x !== undefined && Math.abs(x - startX) > 12) moved = true;
+  };
+  const touchEnd = (event: TouchEvent) => {
+    const start = startX;
+    startX = null;
+    if (start === null || moved || settingsRef.current.flow !== "paginated" || !window.matchMedia("(max-width: 760px)").matches) return;
+    if (event.changedTouches.length !== 1) return;
+    const target = event.target as Element | null;
+    if (target instanceof Element && target.closest("a,button,input,select,textarea,video,img")) return;
+    const selection = doc.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    const x = event.changedTouches[0]?.clientX ?? start;
+    const width = doc.documentElement.clientWidth || window.innerWidth;
+    if (x < width * 0.3) view.goLeft();
+    else if (x > width * 0.7) view.goRight();
+  };
+  doc.addEventListener("touchstart", touchStart, { capture: true, passive: true });
+  doc.addEventListener("touchmove", touchMove, { capture: true, passive: true });
+  doc.addEventListener("touchend", touchEnd, { capture: true, passive: true });
+  return () => {
+    doc.removeEventListener("touchstart", touchStart, true);
+    doc.removeEventListener("touchmove", touchMove, true);
+    doc.removeEventListener("touchend", touchEnd, true);
+  };
 }

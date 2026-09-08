@@ -39,7 +39,9 @@ export type BrowseResponse = {
   publication_count: number;
   directory_count: number;
 };
-export type HomeResponse = { continue_reading: PublicationSummary[]; recently_added: PublicationSummary[] };
+export type HomeSeriesPreview = { name: string; path: string; publication_count: number; representative: PublicationSummary | null };
+export type HomeDirectoryPreview = { name: string; path: string; series: HomeSeriesPreview[] };
+export type HomeResponse = { continue_reading: PublicationSummary[]; directories: HomeDirectoryPreview[] };
 export type ChapterContent = { idx: number; title: string; content: string; text: string; encoding: string; content_version: string; character_count: number };
 export type ConversionResponse = { status: "pending" | "preparing" | "ready" | "failed" | "not_required"; file_url?: string; error?: string };
 export type ScanStatus = { scanning: boolean; processed: number; total: number; errors: number; message: string };
@@ -91,3 +93,4 @@ export const api = {
 };
 
 export const bookFileUrl = (id: number) => `/api/v1/publications/${id}/file`;
+export const pageThumbnailUrl = (id: number, page: number) => `/api/v1/publications/${id}/pages/${page}/thumbnail`;
