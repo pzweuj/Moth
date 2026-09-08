@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { sanitizeBookDocument, sanitizeCssText } from "./bookSanitizer";
 
 describe("sanitizeBookDocument", () => {
+  it("removes external resource attributes before the browser can request them", () => {
+    const document = new DOMParser().parseFromString('<html><head><link rel="stylesheet" href="https://remote.invalid/style"></head><body><img src="https://remote.invalid/image"><img srcset="//remote.invalid/x 2x"><a href="https://example.com">Reference</a></body></html>', "text/html");
+    sanitizeBookDocument(document);
+    expect(document.querySelector("img[src], img[srcset], link[href]")).toBeNull();
+    expect(document.querySelector("a")?.getAttribute("href")).toBe("https://example.com");
+  });
   it("removes active elements, handlers, and dangerous URLs while keeping resources", () => {
     const document = new DOMParser().parseFromString(
       `<html><head></head><body onload="evil()"><script>evil()</script><form action="javascript:evil()"><input></form><img src="javascript:evil()"><img srcset="javascript:evil() 1x"><div style="background:url(javascript:evil())"></div><img src="blob:cover"></body></html>`,

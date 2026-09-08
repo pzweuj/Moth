@@ -7,8 +7,8 @@ import { makeRangeLoader } from "./zipLoader";
 import { FOLIATE_PARSER_VERSION, TextPublication } from "./textPublication";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
-import { getOfflineChapterIndices, saveOfflineChapter, saveOfflineResource } from "../offline/db";
-import { sanitizeBookDocument } from "./bookSanitizer";
+import { getOfflineChapter, getOfflineChapterIndices, saveOfflineChapter, saveOfflineResource } from "../offline/db";
+import { sanitizeBookDocument, sanitizeCssText } from "./bookSanitizer";
 import { installTapNavigation } from "./readerInteractions";
 import { translateError, useUi } from "../i18n";
 import { ReaderTapHint } from "./ReaderTapHint";
@@ -64,6 +64,10 @@ function installBookTransformGuards(book: FoliateBook): void {
     const detail = (event as CustomEvent<{ data?: unknown; type?: string }>).detail;
     if (!detail || typeof detail.data === "undefined") return;
     const type = detail.type?.toLowerCase() ?? "";
+    if (type.includes("text/css")) {
+      detail.data = Promise.resolve(detail.data).then((value) => typeof value === "string" ? sanitizeCssText(value) : value);
+      return;
+    }
     if (!type.includes("html") && !type.includes("xhtml")) return;
     detail.data = Promise.resolve(detail.data).then((value) => {
       if (typeof value !== "string") return value;
@@ -86,6 +90,7 @@ function installBookTransformGuards(book: FoliateBook): void {
 type FoliateSection = {
   id?: unknown;
   load?: () => Promise<unknown>;
+  unload?: () => void;
 };
 
 function base64FromBytes(bytes: Uint8Array): string {
@@ -112,16 +117,41 @@ async function materializeBlobUrls(value: string, seen = new Set<string>(), sign
   const urls = [...new Set(value.match(/blob:[^"'\s)<>]+/g) ?? [])];
   let result = value;
   for (const url of urls) {
-    if (seen.has(url)) return null;
+    // Some MOBI files contain empty/malformed resource references such as
+    // `blob:;`. They do not make the text unreadable; remove only that
+    // reference so the rest of the section can still be cached.
+    if (url === "blob:" || url.startsWith("blob:;")) {
+      result = result.split(url).join("");
+      continue;
+    }
+    if (seen.has(url)) {
+      result = result.split(url).join("");
+      continue;
+    }
     seen.add(url);
     try {
-      const response = await fetch(url, { signal });
-      if (!response.ok) return null;
+      let response: Response;
+      try {
+        response = await fetch(url, { signal });
+      } catch (error) {
+        // A stale blob URL is a missing optional resource. Abort still means
+        // the reader is being torn down, so propagate that cancellation.
+        if (signal?.aborted) throw error;
+        result = result.split(url).join("");
+        continue;
+      }
+      if (!response.ok) {
+        result = result.split(url).join("");
+        continue;
+      }
       const blob = await response.blob();
       let replacement: string;
       if (blob.type.toLowerCase().split(";", 1)[0] === "text/css") {
         const css = await materializeBlobUrls(await blob.text(), seen, signal);
-        if (css === null) return null;
+        if (css === null) {
+          result = result.split(url).join("");
+          continue;
+        }
         replacement = await blobDataUrl(new Blob([css], { type: blob.type || "text/css" }));
       } else {
         replacement = await blobDataUrl(blob);
@@ -187,10 +217,34 @@ function installFoliateSectionCache(book: FoliateBook, detail: BookDetail, signa
   sections.forEach((section, index) => {
     if (typeof section.load !== "function") return;
     const original = section.load.bind(section);
+    const originalUnload = section.unload?.bind(section);
+    let offlineUrl: string | undefined;
     section.load = async () => {
+      // WebKit can retain the parsed archive in its HTTP cache after the
+      // network goes offline. Prefer the committed unit cache in that case so
+      // a chapter jump never falls back to a resource that cannot be fetched.
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        const cached = await getOfflineChapter(
+          detail.id,
+          detail.content_version,
+          index,
+          "",
+          FOLIATE_PARSER_VERSION,
+        ).catch(() => null);
+        if (cached) {
+          if (!offlineUrl) {
+            const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>${cached.content}</body></html>`;
+            offlineUrl = `moth-srcdoc:${html}`;
+          }
+          return offlineUrl;
+        }
+      }
       const loaded = await original();
       if (typeof loaded === "string" && loaded.startsWith("blob:")) {
-        void cacheFoliateSection(
+        // Read the blob before Foliate is allowed to unload and revoke it.
+        // This is especially important for MOBI, whose section cache owns the
+        // temporary URL and can release it as soon as the paginator advances.
+        await cacheFoliateSection(
           detail,
           index,
           loaded,
@@ -200,6 +254,13 @@ function installFoliateSectionCache(book: FoliateBook, detail: BookDetail, signa
         );
       }
       return loaded;
+    };
+    section.unload = () => {
+      if (offlineUrl?.startsWith("blob:")) {
+        URL.revokeObjectURL(offlineUrl);
+      }
+      offlineUrl = undefined;
+      originalUnload?.();
     };
   });
 }
@@ -229,6 +290,7 @@ export function FoliateTextReader({
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const restoredRef = useRef(false);
+  const ignoreInitialRelocationRef = useRef(false);
   const [toc, setToc] = useState<TocEntry[]>([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -314,7 +376,7 @@ export function FoliateTextReader({
           typeof navigator === "undefined" || !navigator.onLine
         );
         if (useCachedPublication) {
-          publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, cachedParserVersion);
+          publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, cachedParserVersion, cachedIndices);
           publication.onError = reportPublicationError;
           publicationRef.current = publication;
           book = publication as unknown as FoliateBook;
@@ -367,7 +429,7 @@ export function FoliateTextReader({
               if (fallbackIndices.length) fallbackParserVersion = "txt-v1";
             }
             if (!fallbackIndices.length) throw error;
-            publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, fallbackParserVersion);
+            publication = new TextPublication(detail, detail.format === "txt" ? encoding : undefined, fallbackParserVersion, fallbackIndices);
             publication.onError = reportPublicationError;
             publicationRef.current = publication;
             book = publication as unknown as FoliateBook;
@@ -390,6 +452,13 @@ export function FoliateTextReader({
         // Do not persist those transient start positions before init() has
         // applied the saved CFI/fraction.
         if (!restoredRef.current) return;
+        if (ignoreInitialRelocationRef.current) {
+          // A post-init layout pass can report the end of a sparse cached
+          // section. The saved progress is already visible in ReaderPage;
+          // ignore that one transient event before accepting user movement.
+          ignoreInitialRelocationRef.current = false;
+          return;
+        }
         const location = (event as CustomEvent).detail ?? {};
         const fraction = typeof location.fraction === "number" ? location.fraction : 0;
         const section = location.section ?? {};
@@ -421,16 +490,37 @@ export function FoliateTextReader({
       setToc(flattenToc(book.toc));
 
       const progress = detail.progress;
+      const sectionCount = (book as unknown as { sections?: unknown[] }).sections?.length ?? 0;
+      const hasRenderedDocument = () => {
+        const contents = (renderer as typeof renderer & {
+          getContents?: () => Array<{ doc?: Document }>;
+        }).getContents?.();
+        return Boolean(contents?.some((content) => content.doc?.body));
+      };
       let restored = false;
+      ignoreInitialRelocationRef.current = Boolean(progress);
       if (progress?.cfi) {
         try {
           // Foliate resolves malformed or stale CFIs to `undefined` instead
           // of throwing. Check the navigation target first, then keep a
           // percentage fallback for a changed publication or broken CFI.
-          if (element.resolveNavigation(progress.cfi)) {
+          const target = element.resolveNavigation(progress.cfi) as { index?: unknown } | undefined;
+          const targetIndex = typeof target?.index === "number" ? target.index : -1;
+          if (targetIndex >= 0 && targetIndex < sectionCount) {
             await element.init({ lastLocation: progress.cfi });
-            restored = true;
+            restored = hasRenderedDocument();
           }
+        } catch {
+          // A CFI can point at a node that is absent from a cached/sanitized
+          // section. The section itself may still have loaded successfully;
+          // retry at its coarse chapter index before using a global fraction.
+        }
+      }
+      if (!restored && progress && Number.isInteger(progress.chapter_index)
+        && progress.chapter_index >= 0 && progress.chapter_index < sectionCount) {
+        try {
+          await element.init({ lastLocation: progress.chapter_index });
+          restored = hasRenderedDocument();
         } catch {
           // Fall through to percentage restoration below.
         }
@@ -439,7 +529,7 @@ export function FoliateTextReader({
         await element.init({
           lastLocation: { fraction: Math.min(1, Math.max(0, progress.percent / 100)) },
         });
-        restored = true;
+        restored = hasRenderedDocument();
       }
       if (!restored) await element.init({ showTextStart: true });
       if (!cancelled) {

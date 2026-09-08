@@ -13,7 +13,13 @@ pub async fn connect(config: &Config) -> Result<SqlitePool, AppError> {
     let database_path = config.data_dir.join("moth.db");
     let options = connect_options(&database_path);
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        // SQLite permits concurrent readers, but only one writer.  Moth is a
+        // single-user application and the scanner performs multi-statement
+        // write transactions while the UI may issue setup/organization
+        // mutations at the same time.  A single pooled connection queues
+        // those operations at the connection boundary, avoiding transient
+        // `database is locked` errors during the initial scan.
+        .max_connections(1)
         .connect_with(options)
         .await?;
 

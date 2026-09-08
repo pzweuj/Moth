@@ -37,15 +37,26 @@ export class TextPublication {
     private readonly detail: BookDetail,
     encoding?: string,
     parserVersion?: string,
+    cachedSectionIndices?: number[],
   ) {
     this.#encoding = encoding;
     this.#parserVersion = parserVersion;
     this.metadata = { title: detail.title };
-    this.sections = detail.chapters.map((chapter) => {
-      const id = String(chapter.idx);
+    // Foliate's MOBI/KF8 section numbers are byte-layout units and do not
+    // necessarily match the server's heuristic chapter list. Preserve the
+    // highest cached index when reopening offline so a saved CFI can still
+    // resolve to the cached section (with uncached gaps reporting the normal
+    // "connect to continue" error).
+    const chapterByIndex = new Map(detail.chapters.map((chapter) => [chapter.idx, chapter]));
+    const sectionCount = cachedSectionIndices?.length
+      ? Math.max(detail.chapters.length, Math.max(...cachedSectionIndices) + 1)
+      : detail.chapters.length;
+    this.sections = Array.from({ length: sectionCount }, (_, index) => {
+      const chapter = chapterByIndex.get(index);
+      const id = String(index);
       return {
         id,
-        size: Math.max(chapter.size, 1),
+        size: Math.max(chapter?.size ?? 1, 1),
         linear: "yes",
         load: () => this.#load(id),
         unload: (url) => this.#unload(url),
@@ -208,7 +219,7 @@ function escapeHtml(text: string): string {
 
 function wrapChapter(title: string, content: string): string {
   const heading = title ? `<h1>${escapeHtml(title)}</h1>` : "";
-  const csp = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
+  const csp = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob: data:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
   // Sanitize before serializing the iframe document. CSP is defense in depth;
   // removing active elements first also protects browsers that delay applying
   // a meta policy to a blob URL.

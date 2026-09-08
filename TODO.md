@@ -1,6 +1,6 @@
 # Moth 待办计划(TODO)
 
-当前状态：Phase 0(基础)+ 单用户重构 + Phase 1(图书馆基础)+ Phase 2(阅读器)+ 在线优先缓存 + M5/M6 栏目与书籍系列整理 + M7 中文界面与阅读体验优化已实现，待真实浏览器与容器验收。
+当前状态：Phase 0(基础)+ 单用户重构 + Phase 1(图书馆基础)+ Phase 2(阅读器)+ 在线优先缓存 + M5/M6 栏目与书籍系列整理 + M7 中文界面与阅读体验优化已实现。Chromium/WebKit 与真实无 DRM MOBI 的自动化验收已通过；Docker、Edge、移动设备和真实配额仍待外部环境验收。详细记录见 `docs/offline-mvp-acceptance.md`。
 
 ## M5/M6 — 栏目、书籍系列与单本书（已实现）
 
@@ -13,7 +13,7 @@
 - [x] 缓存容量提示提供清理入口，清理内容保留阅读进度和待同步队列
 - [x] 书库默认中文并支持 English、日间/夜间主题；阅读器保留返回前的栏目、系列和筛选状态
 - [x] 文本字号 12–36px、CBZ 适应屏幕/宽度/自定义缩放及移动端点击翻页
-- [ ] Playwright 浏览器夹具与真机验收
+- [x] Playwright Chromium/WebKit 浏览器夹具；[ ] Edge 与真机验收
 
 ## M2 — Phase 2:阅读引擎 + 阅读器 UI(已实现)
 
@@ -36,9 +36,9 @@
 - [x] 缩略图页导航与按页进度
 
 ### 验收
-- [ ] 四格式各完整读一遍(翻页、跳章、进度恢复)
+- [x] EPUB/TXT/CBZ/无 DRM MOBI 各完成阅读、导航和进度恢复自动化闭环
 - [x] 前端 lint、单测与生产构建
-- [ ] 浏览器验证
+- [x] Chromium/WebKit 生产环境浏览器验证；[ ] Edge 与真机验证
 
 ## M3 — 在线优先缓存 / PWA（已实现，待真机验收）
 
@@ -48,20 +48,21 @@
 - [x] 离线启动显示已有缓存，未缓存单元明确提示需要联网
 - [x] 进度在 IndexedDB 中立即保存，联网后按书串行同步并按较大百分比解决冲突
 - [x] 认证响应不进入 Service Worker；退出冻结在途写入并清理 Moth 自有缓存
-- [ ] 清理缓存入口、容量统计及真实配额不足提示的浏览器验收
+- [x] 清理缓存入口、容量统计及模拟配额异常回归
+- [ ] 真实浏览器配额不足提示
 
 ## M4 — Phase 4:打磨与收尾(进行中)
 
-- [ ] 损坏文件、无封面、未知编码、AZW3/KF8 等边缘状态在 UI 的优雅展示
+- [x] 损坏文件、有效无封面、GBK/UTF-8 编码和 MOBI 实样在自动化浏览器中的可理解状态与恢复入口
+- [ ] AZW3/KF8 完整兼容性（保持实验性，失败时提示转换为 EPUB）
 - [x] 重新扫描失败保护、文件变更检测、data 目录备份说明
-- [x] Rust/API/前端单测与 CI（Rust 48 tests，前端 49 tests）；[ ] Playwright 浏览器夹具与真机验收
-- [x] README/TODO 更新；[ ] Docker 与移动端验收记录
+- [x] Rust/API/前端单测与 CI（Rust 51 tests，前端 62 tests）；[x] Playwright Chromium/WebKit 浏览器夹具
+- [x] README/TODO 与首版验收记录更新；[ ] Docker、Edge 与移动端验收记录
 
-## 待验证项(不阻塞主流程,但需在对应里程碑补齐)
+## 待验证项（外部环境，仍是首版发布门槛）
 
-- [ ] **MOBI 实样验证**:需要一个真实 MOBI/AZW3 文件测试 `mobi` crate 解析。
-      `mobi` crate 不带测试夹具,当前仅验证了损坏文件的错误路径;若对 AZW3/KF8
-      支持不足,UI 需提示"建议转 EPUB/AZW3"。
+- [x] **MOBI 实样验证**：加入 Project Gutenberg ebook 11 的无 DRM MOBI，记录来源、许可、大小和 SHA-256，并通过 `mobi` crate 与 Foliate 浏览器阅读闭环。
+      该样本不代表 AZW3/KF8 兼容性。
 - [ ] **Phase 0 遗留的 Docker 验收**(需 Docker 环境,`docs/phase-0-acceptance.md`
       中标记 PENDING 的项目):
   - [ ] `docker compose config` / `docker compose build` / `docker compose up -d`
@@ -69,8 +70,8 @@
   - [ ] `/books` 以只读挂载、进程 UID 非 0、`/data` 可写
   - [ ] 优雅停机(SIGTERM,无 panic、无残留进程)
 
-- [ ] **在线优先浏览器夹具**：仓库当前未安装 Playwright，需在具备浏览器运行时的环境
-      中补充 Chromium/WebKit 的断网、缓存版本隔离、进度乱序和退出清理测试。
+- [x] **在线优先浏览器夹具**：Chromium/WebKit 使用 Axum 生产构建、独立数据和样书目录，覆盖断网、缓存版本隔离、进度乱序、编码切换、Service Worker 更新和退出清理。
+- [ ] **真机与容器验收**：桌面 Edge、Android Chrome、iPhone Safari/PWA、可信 HTTPS、真实配额以及 Docker 非 root/只读书库/可写数据/重启/SIGTERM。
 
 ## 已完成(供参考,不再处理)
 

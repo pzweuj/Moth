@@ -1318,6 +1318,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64",
+ "encoding_rs",
  "hex",
  "http-body-util",
  "image",

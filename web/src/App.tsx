@@ -187,6 +187,30 @@ function UpdateNotice() {
     return () => window.removeEventListener("moth-sw-update", onUpdate);
   }, []);
 
+  // Some WebKit versions update a registration to `waiting` without sending
+  // the installing worker's statechange event to the page. A short local poll
+  // closes that notification gap and also covers the initial registration
+  // event racing the React effect above.
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    let disposed = false;
+    const check = async () => {
+      try {
+        const current = await navigator.serviceWorker.getRegistration();
+        if (!disposed) setRegistration(current?.waiting ? current : null);
+      } catch {
+        // Service Worker access can fail while a private browsing context is
+        // shutting down; the rest of the app remains usable in that case.
+      }
+    };
+    void check();
+    const interval = window.setInterval(() => void check(), 500);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
   if (!registration?.waiting) return null;
 
   const apply = () => {

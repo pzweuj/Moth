@@ -356,18 +356,28 @@ async function transaction<T>(stores: string[], mode: IDBTransactionMode, run: (
   if (isWrite) activeWriteTransactions += 1;
   let db: IDBDatabase | undefined;
   let tx: IDBTransaction | undefined;
+  let completion: Promise<Error | DOMException | null> | undefined;
   try {
     db = await database();
     const activeTx = db.transaction(stores, mode);
     tx = activeTx;
-    const result = await run(activeTx);
-    await new Promise<void>((resolve, reject) => {
-      activeTx.oncomplete = () => resolve();
-      activeTx.onerror = () => reject(activeTx.error ?? new Error("IndexedDB transaction failed"));
-      activeTx.onabort = () => reject(activeTx.error ?? new Error("IndexedDB transaction aborted"));
+    // Observe completion before running requests. A synchronous put() failure
+    // does not abort IndexedDB automatically, so explicitly roll back below.
+    // Resolve errors as values to avoid an unhandled rejection while run waits.
+    completion = new Promise((resolve) => {
+      activeTx.oncomplete = () => resolve(null);
+      activeTx.onabort = () => resolve(activeTx.error ?? new Error("IndexedDB transaction aborted"));
+      activeTx.onerror = () => { /* The abort event is the transaction boundary. */ };
     });
+    const result = await run(activeTx);
+    const failure = await completion;
+    if (failure) throw failure;
     return result;
   } catch (error) {
+    if (tx) {
+      try { tx.abort(); } catch { /* Already completed or aborted. */ }
+      await completion;
+    }
     if (isQuotaError(error) || isQuotaError(tx?.error)) announceStorageEvent("quota");
     throw error;
   } finally {

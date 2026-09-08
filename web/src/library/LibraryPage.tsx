@@ -623,14 +623,6 @@ function BookCard({
     </>
   );
 
-  if (book.parse_status !== "ok") {
-    return (
-      <li className="book-card">
-        {onToggle && <BookSelection book={book} selected={selected} onToggle={onToggle} />}
-        {card}
-      </li>
-    );
-  }
   return (
     <li className="book-card">
       {onToggle && <BookSelection book={book} selected={selected} onToggle={onToggle} />}

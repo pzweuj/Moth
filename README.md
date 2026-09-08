@@ -31,9 +31,11 @@ Implemented so far:
   touch-first layouts, the reader hides the previous/next buttons and uses
   short taps in the outer 30% of the page for navigation.
 
-The reader view, online-first cache, and manual library organization are
-implemented. Remaining release work is browser and Docker acceptance on
-desktop, Android, and iPhone, plus real MOBI/AZW3 fixture validation.
+The reader view, online-first cache, manual library organization, Chromium/WebKit
+browser acceptance, and a real DRM-free MOBI fixture validation are complete.
+Remaining release work is Docker acceptance, desktop Edge, Android Chrome,
+iPhone Safari/PWA, trusted HTTPS, and real storage-quota validation. AZW3/KF8
+remains experimental and is not part of the complete-format promise.
 
 ## Local development
 
@@ -156,23 +158,27 @@ both API and web requests.
 Run the same checks used by CI before committing:
 
 ```powershell
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --release --workspace
 pnpm --dir web lint
 pnpm --dir web test --run
 pnpm --dir web build
-cargo build --release --workspace
+pnpm --dir web test:e2e
 docker compose config
 docker compose build
+python3 scripts/container-smoke.py
 ```
 
-The same Rust, frontend, and container checks run in [GitHub Actions](.github/workflows/ci.yml).
+The same Rust, frontend, Chromium/WebKit, and container checks run in [GitHub Actions](.github/workflows/ci.yml). Playwright installs its browsers separately with `node web/node_modules/@playwright/test/cli.js install --with-deps chromium webkit` when the runtime is not already present.
 
-When Docker is unavailable locally, the Rust and web checks can still run, and
-CI can build the image. A Phase 0 release is not complete until a
-Docker-capable environment also performs the setup → login → restart → logout
-smoke test, mount-permission checks, and graceful stop described in
-[`docs/phase-0-acceptance.md`](docs/phase-0-acceptance.md).
+When Docker is unavailable locally, the Rust, web, and browser checks can still
+run, and CI can build the image and execute the container smoke test. The
+release gate remains open until a Docker-capable environment performs the setup
+→ login → restart → logout smoke test, mount-permission checks, and graceful
+stop, and real Edge/mobile/PWA checks are recorded. See the current matrix in
+[`docs/offline-mvp-acceptance.md`](docs/offline-mvp-acceptance.md) and the
+Phase 0 checklist in [`docs/phase-0-acceptance.md`](docs/phase-0-acceptance.md).
 
 Moth is licensed under Apache-2.0.

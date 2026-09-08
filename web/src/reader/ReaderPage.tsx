@@ -225,15 +225,16 @@ export function ReaderPage() {
   }
 
   const book = detail.data;
-  if (detail.isError || !book) {
+  if (detail.isError || !book || book.parse_status === "error") {
     const message = detail.error instanceof Error
       ? detail.error.message
-      : "This book could not be opened.";
+      : "This book could not be opened. Check the source file and rescan the library.";
     return (
       <main className="state-screen">
         <p className="eyebrow">{t("Moth / reader")}</p>
         <h1>{t("Book unavailable")}</h1>
         <p>{translateError(message, t)}</p>
+        {book?.format === "mobi" && <p>{t("AZW3/KF8 support is experimental. If this book cannot be opened, convert a DRM-free copy to EPUB.")}</p>}
         <button
           className="primary-button compact-button"
           type="button"
@@ -275,6 +276,7 @@ export function ReaderPage() {
           </span>
         )}
         <span className="format-badge">{book.format}</span>
+        {book.format === "mobi" && <span className="format-badge" title={t("AZW3/KF8 support is experimental. If this book cannot be opened, convert a DRM-free copy to EPUB.")}>{t("AZW3/KF8: experimental")}</span>}
         <button
           type="button"
           ref={settingsButtonRef}

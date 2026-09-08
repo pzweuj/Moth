@@ -276,7 +276,13 @@ async function request<T>(path: string, init?: RequestInit, expectedContentVersi
       throw new ApiError(412, "content_changed", "The book changed while it was being read. Refresh before continuing.");
     }
   }
-  return (await response.json()) as T;
+  // Axum handlers that return `()` use a successful 200 with an empty body
+  // (for example book organization and scan requests), while other mutation
+  // endpoints use 204. Treat both forms as a void response so a successful
+  // mutation is not reported as a JSON parse failure in the UI.
+  const body = await response.text();
+  if (!body.trim()) return undefined as T;
+  return JSON.parse(body) as T;
 }
 
 async function clearMothCaches(): Promise<void> {

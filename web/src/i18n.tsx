@@ -9,6 +9,9 @@ const STORAGE_KEY = "moth:ui-preferences";
 const LEGACY_READER_STORAGE_KEY = "moth:reader-settings";
 
 const messages: Record<string, { "zh-CN": Message; en: Message }> = {
+  "This book could not be opened. Check the source file and rescan the library.": { "zh-CN": "无法打开这本书，请检查原文件后重新扫描书库。", en: "This book could not be opened. Check the source file and rescan the library." },
+  "AZW3/KF8: experimental": { "zh-CN": "AZW3/KF8：实验性", en: "AZW3/KF8: experimental" },
+  "AZW3/KF8 support is experimental. If this book cannot be opened, convert a DRM-free copy to EPUB.": { "zh-CN": "AZW3/KF8 支持仍处于实验阶段。如无法打开，请将无 DRM 的副本转换为 EPUB。", en: "AZW3/KF8 support is experimental. If this book cannot be opened, convert a DRM-free copy to EPUB." },
   "Moth / personal library": { "zh-CN": "Moth / 个人书库", en: "Moth / personal library" },
   "Moth / connection": { "zh-CN": "Moth / 连接状态", en: "Moth / connection" },
   "Moth / reader": { "zh-CN": "Moth / 阅读器", en: "Moth / reader" },

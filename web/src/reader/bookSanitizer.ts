@@ -14,9 +14,11 @@ export function sanitizeBookDocument(document: Document): void {
       const name = attribute.name.toLowerCase();
       const value = attribute.value.trim();
       const urlAttribute = ["href", "src", "xlink:href", "action", "formaction", "poster", "data", "srcset"].includes(name);
+      const isNavigation = element.localName === "a" && name === "href";
+      const blockedUrl = isNavigation ? isUnsafeUrl : isBlockedCssUrl;
       const unsafeUrl = name === "srcset"
-        ? value.split(",").some((candidate) => isUnsafeUrl(candidate.split(/\s+/)[0] ?? ""))
-        : isUnsafeUrl(value);
+        ? value.split(",").some((candidate) => blockedUrl(candidate.trim().split(/\s+/)[0] ?? ""))
+        : blockedUrl(value);
       if (urlAttribute && unsafeUrl) {
         element.removeAttribute(attribute.name);
       }
@@ -29,7 +31,7 @@ export function sanitizeBookDocument(document: Document): void {
   const head = document.head ?? document.documentElement;
   const csp = document.createElement("meta");
   csp.httpEquiv = "Content-Security-Policy";
-  csp.content = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
+  csp.content = "default-src 'none'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline' blob: data:; font-src 'self' blob: data:; media-src 'self' blob: data:; object-src 'none'; frame-src 'none'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'";
   head.prepend(csp);
 }
 
