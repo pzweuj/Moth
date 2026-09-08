@@ -53,6 +53,8 @@ export function LibraryPage({ session }: { session?: SessionState }) {
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [moveTarget, setMoveTarget] = useState("");
   const [seriesTarget, setSeriesTarget] = useState("");
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [reorderingSectionId, setReorderingSectionId] = useState<number | null>(null);
   const [searchAll, setSearchAll] = useState(returnedFromReader && locationState?.searchAll === true);
 
   const books = useQuery<BookSummary[]>({ queryKey: ["books"], queryFn: () => api.getBooks(), networkMode: "always" });
@@ -128,6 +130,9 @@ export function LibraryPage({ session }: { session?: SessionState }) {
   const currentSection = sectionId !== undefined ? allSections.find((section) => section.id === sectionId) : undefined;
   const currentSeries = seriesId !== undefined
     ? allSections.flatMap((section) => section.series).find((series) => series.id === seriesId)
+    : undefined;
+  const currentSeriesSection = currentSeries
+    ? allSections.find((section) => section.id === currentSeries.section_id)
     : undefined;
   const sectionName = (section: SectionSummary) => section.is_system ? t("Unclassified") : section.name;
   const currentSectionName = currentSection ? sectionName(currentSection) : undefined;
@@ -247,13 +252,16 @@ export function LibraryPage({ session }: { session?: SessionState }) {
     const ordered = allSections.filter((section) => !section.is_system);
     const index = ordered.findIndex((section) => section.id === id);
     const target = index + direction;
-    if (index < 0 || target < 0 || target >= ordered.length || session?.offline) return;
+    if (index < 0 || target < 0 || target >= ordered.length || session?.offline || reorderingSectionId !== null) return;
     [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+    setReorderingSectionId(id);
     try {
       await api.reorderSections(ordered.map((section) => section.id));
       await refreshOrganization();
     } catch (error) {
       await dialog.alert(translateError(error, t), t("Could not reorder sections"));
+    } finally {
+      setReorderingSectionId(null);
     }
   };
 
@@ -289,48 +297,56 @@ export function LibraryPage({ session }: { session?: SessionState }) {
     <main className="home-shell">
       <div className="grain" aria-hidden="true" />
       <header className="home-nav">
-        <span className="wordmark">Moth <span>/</span> {t("personal library")}</span>
+        <Link className="wordmark" to="/" aria-label={t("Library home")}>Moth <span>/</span> {t("personal library")}</Link>
         <div className="home-actions">
-          <AppearanceControls compact />
-          {session?.offline && (
-            <button className="quiet-button" type="button" onClick={() => navigate("/login")}>
-              {t("Sign in to sync")}
-            </button>
-          )}
+          <div className="home-actions-preferences desktop-only">
+            <AppearanceControls compact />
+          </div>
           <button
-            className="quiet-button"
+            className="quiet-button home-actions-more"
             type="button"
-            onClick={() => scan.mutate()}
-            disabled={scan.isPending || scanning}
+            aria-expanded={actionsOpen}
+            aria-controls="library-actions"
+            onClick={() => setActionsOpen((open) => !open)}
           >
-            {scanning ? t("Scanning…") : scan.isPending ? t("Starting…") : t("Rescan library")}
+            {t("More")}
           </button>
-          <button className="quiet-button" type="button" onClick={() => void createSection()} disabled={session?.offline}>
-            {t("New section")}
-          </button>
-          <button className="quiet-button" type="button" onClick={() => void requestLogout()} disabled={logout.isPending}>
+          <div className={`home-actions-secondary ${actionsOpen ? "is-open" : ""}`} id="library-actions">
+            <div className="mobile-only home-actions-preferences">
+              <AppearanceControls compact />
+            </div>
+            {session?.offline && (
+              <button className="quiet-button" type="button" onClick={() => navigate("/login")}>
+                {t("Sign in to sync")}
+              </button>
+            )}
+            <button
+              className="quiet-button"
+              type="button"
+              onClick={() => scan.mutate()}
+              disabled={scan.isPending || scanning}
+            >
+              {scanning ? t("Scanning…") : scan.isPending ? t("Starting…") : t("Rescan library")}
+            </button>
+            <button className="quiet-button" type="button" onClick={() => void createSection()} disabled={session?.offline}>
+              {t("New section")}
+            </button>
+          </div>
+          <button className="quiet-button home-action-signout" type="button" onClick={() => void requestLogout()} disabled={logout.isPending}>
             {logout.isPending ? t("Leaving…") : t("Sign out")}
           </button>
         </div>
       </header>
 
       <section className="library-head">
-        <p className="eyebrow">{t("Good to see you, {{name}}", { name: session?.username ?? "" })}</p>
+        <p className="sr-only">{t("Good to see you, {{name}}", { name: session?.username ?? "" })}</p>
         <h1>{currentSeries?.name ?? currentSectionName ?? (isAllView ? t("All books") : t("Your library"))}</h1>
-        <p className="lede">{currentSeries ? t("{{count}} books in this series.", { count: currentSeries.book_count }) : currentSection ? t("{{count}} books in this section.", { count: sectionCardBooks(currentSection) }) : t("Books rest quietly here, ready when you are.")}</p>
       </section>
 
-      <nav className="library-shortcuts" aria-label={t("Library shortcuts")}>
-        <Link to="/all">{t("All books")}</Link>
-        {allSections.find((section) => section.is_system) && (
-          <Link to={`/section/${allSections.find((section) => section.is_system)!.id}`}>
-            {t("Unclassified")}
-          </Link>
-        )}
-      </nav>
       <nav className="library-breadcrumbs" aria-label={t("Library location")}>
-        <Link to="/all">{t("All books")}</Link>
-        {currentSection && <><span aria-hidden="true">/</span><Link to={`/section/${currentSection.id}`}>{currentSectionName}</Link></>}
+        <Link to="/">{t("Library home")}</Link>
+        {isAllView && <><span aria-hidden="true">/</span><span>{t("All books")}</span></>}
+        {(currentSection || currentSeriesSection) && <><span aria-hidden="true">/</span><Link to={`/section/${(currentSection ?? currentSeriesSection)!.id}`}>{currentSectionName ?? sectionName(currentSeriesSection!)}</Link></>}
         {currentSeries && <><span aria-hidden="true">/</span><span>{currentSeries.name}</span></>}
       </nav>
 
@@ -416,23 +432,49 @@ export function LibraryPage({ session }: { session?: SessionState }) {
       ) : sectionId === undefined && seriesId === undefined && !isAllView && hasOrganizedBooks && !query && format === "all" ? (
         <>
           <ul className="section-grid">
-            {allSections.map((section) => (
-              <li key={section.id} className="section-card">
-                <Link to={`/section/${section.id}`}>
-                  <span className="eyebrow">{section.is_system ? t("System section") : t("Section")}</span>
-                  <h2>{sectionName(section)}</h2>
-                  <p>{section.series.length} {t("series")} · {sectionCardBooks(section)} {t("books")}</p>
-                </Link>
-                {!section.is_system && !session?.offline && (
-                  <div className="section-order-actions">
-                    <button className="quiet-button" type="button" onClick={() => void reorderSection(section.id, -1)}>{t("Up")}</button>
-                    <button className="quiet-button" type="button" onClick={() => void reorderSection(section.id, 1)}>{t("Down")}</button>
-                  </div>
-                )}
-              </li>
-            ))}
+            {allSections.map((section) => {
+              const movableSections = allSections.filter((entry) => !entry.is_system);
+              const movableIndex = section.is_system ? -1 : movableSections.findIndex((entry) => entry.id === section.id);
+              const isReordering = reorderingSectionId === section.id;
+              const canMoveUp = movableIndex > 0;
+              const canMoveDown = movableIndex >= 0 && movableIndex < movableSections.length - 1;
+              const stopCardNavigation = (event: React.MouseEvent<HTMLButtonElement>) => {
+                event.preventDefault();
+                event.stopPropagation();
+              };
+              return (
+                <li key={section.id} className="section-card">
+                  <Link to={`/section/${section.id}`}>
+                    <span className="eyebrow">{section.is_system ? t("System section") : t("Section")}</span>
+                    <h2>{sectionName(section)}</h2>
+                    <p>{section.series.length} {t("series")} · {sectionCardBooks(section)} {t("books")}</p>
+                  </Link>
+                  {!section.is_system && !session?.offline && (
+                    <div className="section-order-actions" aria-busy={isReordering}>
+                      <button
+                        className="quiet-button"
+                        type="button"
+                        disabled={!canMoveUp || reorderingSectionId !== null}
+                        aria-label={`${t("Up")} ${sectionName(section)}`}
+                        onClick={(event) => { stopCardNavigation(event); void reorderSection(section.id, -1); }}
+                      >
+                        {t("Up")}
+                      </button>
+                      <button
+                        className="quiet-button"
+                        type="button"
+                        disabled={!canMoveDown || reorderingSectionId !== null}
+                        aria-label={`${t("Down")} ${sectionName(section)}`}
+                        onClick={(event) => { stopCardNavigation(event); void reorderSection(section.id, 1); }}
+                      >
+                        {t("Down")}
+                      </button>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
-          <p className="shelf-hint">{t("Open a section to browse its series and independent books.")}</p>
         </>
       ) : !hasVisibleContent ? (
         <section className="empty-library">

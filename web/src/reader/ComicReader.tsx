@@ -14,6 +14,8 @@ interface ComicReaderProps {
   onProgress: (progress: ProgressBody) => void;
   settings: ComicSettings;
   onBack?: () => void;
+  pagesOpen?: boolean;
+  onPagesOpenChange?: (open: boolean) => void;
 }
 
 const THUMB_RADIUS = 3;
@@ -33,10 +35,10 @@ function mapPageNumbers(names: string[], serverPages?: string[]): number[] {
 
 /**
  * CBZ reader. The archive is read over HTTP Range via zip.js and pages are
- * loaded lazily; only the current page (plus a small window for the thumbnail
- * strip and one ahead/behind) is fetched from the server.
+ * loaded lazily; the current page and nearby pages are prefetched, while the
+ * page drawer requests visible thumbnails as they enter its scroll window.
  */
-export function ComicReader({ detail, onProgress, settings, onBack }: ComicReaderProps) {
+export function ComicReader({ detail, onProgress, settings, onBack, pagesOpen: controlledPagesOpen, onPagesOpenChange }: ComicReaderProps) {
   const { t } = useUi();
   const [pages, setPages] = useState<string[]>([]);
   const [index, setIndex] = useState(0);
@@ -46,7 +48,7 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
   const [pageError, setPageError] = useState<unknown | null>(null);
   // Keep the page strip tucked away on touch layouts so the image gets the
   // full viewport by default. Desktop readers start with the panel visible.
-  const [pagesOpen, setPagesOpen] = useState(() => !isMobileReadingLayout());
+  const [internalPagesOpen, setInternalPagesOpen] = useState(false);
   const [, refreshCache] = useState(0);
 
   const loaderRef = useRef<ZipLoader | null>(null);
@@ -64,6 +66,11 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
   currentIndexRef.current = index;
+  const pagesOpen = controlledPagesOpen ?? internalPagesOpen;
+  const setPagesOpen = useCallback((open: boolean) => {
+    onPagesOpenChange?.(open);
+    if (controlledPagesOpen === undefined) setInternalPagesOpen(open);
+  }, [controlledPagesOpen, onPagesOpenChange]);
   const loadPage = useCallback(async (pageIndex: number): Promise<string | null> => {
     const cached = urlsRef.current.get(pageIndex);
     if (cached) return cached;
@@ -92,7 +99,7 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
       }
       if (generationRef.current !== generation) return null;
       if (loader && loaderRef.current !== loader) return null;
-      if (Math.abs(pageIndex - currentIndexRef.current) > THUMB_RADIUS) return null;
+      if (!pagesOpen && Math.abs(pageIndex - currentIndexRef.current) > THUMB_RADIUS) return null;
       // A successful display is the cache boundary. Preloaded pages may also
       // be stored, but they never affect the progress percentage.
       void saveOfflinePage(detail.id, detail.content_version, actualIndex, blob, pages[pageIndex], blob.type).catch(() => undefined);
@@ -103,7 +110,7 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
     } finally {
       inflightRef.current.delete(pageIndex);
     }
-  }, [detail.content_version, detail.id, pages]);
+  }, [detail.content_version, detail.id, pages, pagesOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -320,6 +327,7 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
   // so it still activates buttons.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest("button, a, input, select, textarea, [contenteditable], .settings-panel")) {
         return;
@@ -339,10 +347,35 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
     return () => window.removeEventListener("keydown", onKey);
   }, [next, prev]);
 
-  const min = Math.max(0, index - THUMB_RADIUS);
-  const max = Math.min(pages.length, index + THUMB_RADIUS + 1);
-  const windowPages = pages.slice(min, max);
-  const thumbIndexOffset = min;
+  useEffect(() => {
+    if (!pagesOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPagesOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pagesOpen, setPagesOpen]);
+
+  const windowPages = pages;
+  const thumbIndexOffset = 0;
+
+  useEffect(() => {
+    if (!pagesOpen || windowPages.length === 0 || typeof IntersectionObserver === "undefined") return;
+    const drawer = document.getElementById("comic-pages-panel");
+    if (!drawer) return;
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const pageIndex = Number((entry.target as HTMLElement).dataset.pageIndex);
+        if (Number.isInteger(pageIndex)) {
+          void loadPage(pageIndex);
+          observer.unobserve(entry.target);
+        }
+      }
+    }, { root: drawer, rootMargin: "120px" });
+    drawer.querySelectorAll<HTMLElement>("[data-page-index]").forEach((button) => observer.observe(button));
+    return () => observer.disconnect();
+  }, [loadPage, pagesOpen, windowPages.length]);
 
   return (
     <div className="reader-stage">
@@ -425,15 +458,6 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
         <span className="comic-counter">
           {pages.length === 0 ? "—" : t("Page {{page}} of {{total}}", { page: (pageNumbersRef.current[index] ?? index) + 1, total: detail.page_count || pages.length })}
         </span>
-        <button
-          className="comic-pages-toggle"
-          type="button"
-          aria-expanded={pagesOpen}
-          aria-controls="comic-pages-panel"
-          onClick={(event) => { event.stopPropagation(); setPagesOpen((open) => !open); }}
-        >
-          {t("Pages")} {pages.length ? `(${pages.length})` : ""}
-        </button>
         <span className="comic-mode-label" aria-label={t("Image size")}>
           {t(settings.mode === "fit-screen" ? "Fit screen" : settings.mode === "fit-width" ? "Fit width" : "Custom zoom")}
         </span>
@@ -441,29 +465,43 @@ export function ComicReader({ detail, onProgress, settings, onBack }: ComicReade
           {t("Next")} →
         </button>
       </div>
-      {pagesOpen && windowPages.length > 0 && (
-        <div id="comic-pages-panel" className="comic-thumbs" role="list" aria-label={t("Pages")}>
-          {windowPages.map((name, offset) => {
-            const i = thumbIndexOffset + offset;
-            const thumbUrl = urlsRef.current.get(i);
-            return (
-              <button
-                key={name}
-                type="button"
-                className={`comic-thumb ${i === index ? "is-active" : ""}`}
-                onClick={(event) => { event.stopPropagation(); goTo(i); }}
-                role="listitem"
-                aria-label={t("Go to page {{page}}", { page: i + 1 })}
-                aria-current={i === index ? "page" : undefined}
-              >
-                {thumbUrl ? (
-                  <img src={thumbUrl} alt="" loading="lazy" />
-                ) : (
-                  <span>{i + 1}</span>
-                )}
-              </button>
-            );
-          })}
+      {pagesOpen && <button className="reader-drawer-backdrop" type="button" aria-label={t("Close pages")} onClick={() => setPagesOpen(false)} />}
+      {pagesOpen && (
+        <div id="comic-pages-panel" className="comic-thumbs" role="dialog" aria-label={t("Pages")}>
+          <div className="reader-drawer-head">
+            <span>{t("Pages")} {pages.length ? `(${pages.length})` : ""}</span>
+            <button type="button" onClick={() => setPagesOpen(false)} aria-label={t("Close pages")}>✕</button>
+          </div>
+          {windowPages.length > 0 ? (
+            <div className="comic-thumb-grid" role="list">
+              {windowPages.map((name, offset) => {
+                const i = thumbIndexOffset + offset;
+                const thumbUrl = urlsRef.current.get(i);
+                return (
+                  <button
+                    key={name}
+                    type="button"
+                    className={`comic-thumb ${i === index ? "is-active" : ""}`}
+                    onClick={(event) => { event.stopPropagation(); goTo(i); setPagesOpen(false); }}
+                    role="listitem"
+                    aria-label={t("Go to page {{page}}", { page: i + 1 })}
+                    aria-current={i === index ? "page" : undefined}
+                    data-page-index={i}
+                    onMouseEnter={() => { void loadPage(i); }}
+                    onFocus={() => { void loadPage(i); }}
+                  >
+                    {thumbUrl ? (
+                      <img src={thumbUrl} alt="" loading="lazy" />
+                    ) : (
+                      <span>{i + 1}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="reader-drawer-empty">{t("No pages available")}</p>
+          )}
         </div>
       )}
       {loading && <div className="reader-loading">{t("Opening comic…")}</div>}

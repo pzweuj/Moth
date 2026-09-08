@@ -27,7 +27,8 @@ html {
 body {
   margin: 0;
   padding: 0 ${margin}px;
-  font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", "SimSun", Georgia, serif;
+  /* Keep the reading face local so offline books never depend on a remote font request. */
+  font-family: "Noto Serif SC", "Noto Serif CJK SC", "Source Han Serif SC", "Source Han Serif", "STSong", "Songti SC", "SimSun", "NSimSun", Georgia, serif;
   font-size: ${fontSize}px !important;
   line-height: ${lineHeight};
   overflow-wrap: break-word;

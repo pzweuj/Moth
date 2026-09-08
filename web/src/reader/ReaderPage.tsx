@@ -28,6 +28,10 @@ const SAVE_LABELS: Record<string, string> = {
   "local-error": "Could not save on device",
 };
 
+function formatReaderTime(value: Date): string {
+  return `${String(value.getHours()).padStart(2, "0")}:${String(value.getMinutes()).padStart(2, "0")}`;
+}
+
 /** TXT encoding options offered to the reader when auto-detection is wrong. */
 export const TXT_ENCODINGS = [
   { value: "", label: "Auto" },
@@ -64,12 +68,26 @@ export function ReaderPage() {
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
   const [comicSettings, setComicSettings] = useState<ComicSettings>(loadComicSettings);
   const [fixedLayout, setFixedLayout] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [readerPanel, setReaderPanel] = useState<"contents" | "settings" | null>(null);
   const [encoding, setEncoding] = useState(() => storedTxtEncoding(bookId));
   const [position, setPosition] = useState<ProgressBody | null>(null);
   const [localProgress, setLocalProgress] = useState<ProgressBody | null>(null);
   const [localProgressReady, setLocalProgressReady] = useState(false);
   const [offlineEncodingReady, setOfflineEncodingReady] = useState(true);
+  const [currentTime, setCurrentTime] = useState(() => new Date());
+
+  useEffect(() => {
+    const refresh = () => setCurrentTime(new Date());
+    refresh();
+    const timer = window.setInterval(refresh, 60_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, []);
 
   useEffect(() => {
     const nextTheme: ReaderTheme = appTheme === "dark" ? "dark" : settings.theme === "dark" ? "light" : settings.theme;
@@ -189,11 +207,16 @@ export function ReaderPage() {
     setAppTheme(next.theme === "dark" ? "dark" : "light");
   }, [setAppTheme]);
 
+  const settingsOpen = readerPanel === "settings";
+  const contentsOpen = readerPanel === "contents";
+
   // Escape closes the settings panel; focus moves into the panel when it
   // opens and returns to the toggle button when it closes.
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const settingsPanelRef = useRef<HTMLDivElement>(null);
   const wasOpenRef = useRef(false);
+  const contentsButtonRef = useRef<HTMLButtonElement>(null);
+  const contentsWasOpenRef = useRef(false);
   useEffect(() => {
     if (settingsOpen) {
       settingsPanelRef.current?.focus();
@@ -203,9 +226,13 @@ export function ReaderPage() {
     wasOpenRef.current = settingsOpen;
   }, [settingsOpen]);
   useEffect(() => {
+    if (!contentsOpen && contentsWasOpenRef.current) contentsButtonRef.current?.focus();
+    contentsWasOpenRef.current = contentsOpen;
+  }, [contentsOpen]);
+  useEffect(() => {
     if (!settingsOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSettingsOpen(false);
+      if (event.key === "Escape") setReaderPanel(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -266,6 +293,16 @@ export function ReaderPage() {
         <button type="button" onClick={backToLibrary}>
           ← {t("Your library")}
         </button>
+        <button
+          className="reader-contents-button"
+          type="button"
+          ref={contentsButtonRef}
+          onClick={() => setReaderPanel((panel) => panel === "contents" ? null : "contents")}
+          aria-expanded={contentsOpen}
+          aria-label={t(book.format === "cbz" ? "Pages" : "Contents")}
+        >
+          {book.format === "cbz" ? t("Pages") : t("Contents")}
+        </button>
         <span className="reader-title">{book.title}</span>
         {position && (
           <span className="reader-position">{Math.round(position.percent)}%</span>
@@ -275,12 +312,13 @@ export function ReaderPage() {
             {t(SAVE_LABELS[saveState] ?? saveState)}
           </span>
         )}
+        <time className="reader-clock" dateTime={currentTime.toISOString()}>{formatReaderTime(currentTime)}</time>
         <span className="format-badge">{book.format}</span>
         {book.format === "mobi" && <span className="format-badge" title={t("AZW3/KF8 support is experimental. If this book cannot be opened, convert a DRM-free copy to EPUB.")}>{t("AZW3/KF8: experimental")}</span>}
         <button
           type="button"
           ref={settingsButtonRef}
-          onClick={() => setSettingsOpen((open) => !open)}
+          onClick={() => setReaderPanel((panel) => panel === "settings" ? null : "settings")}
           aria-expanded={settingsOpen}
           aria-label={t("Reader settings")}
         >
@@ -289,10 +327,13 @@ export function ReaderPage() {
         <AppearanceControls compact />
       </header>
       {settingsOpen && (
+        <button className="reader-drawer-backdrop reader-settings-backdrop" type="button" aria-label={t("Close reader settings")} onClick={() => setReaderPanel(null)} />
+      )}
+      {settingsOpen && (
         <SettingsPanel
           settings={settings}
           onChange={handleSettingsChange}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => setReaderPanel(null)}
           panelRef={settingsPanelRef}
           showEncoding={book.format === "txt"}
           encoding={encoding}
@@ -315,7 +356,14 @@ export function ReaderPage() {
         )}
       >
         {book.format === "cbz" ? (
-            <ComicReader detail={readerBook} onProgress={handleProgress} settings={comicSettings} onBack={backToLibrary} />
+            <ComicReader
+              detail={readerBook}
+              onProgress={handleProgress}
+              settings={comicSettings}
+              onBack={backToLibrary}
+              pagesOpen={contentsOpen}
+              onPagesOpenChange={(open) => setReaderPanel(open ? "contents" : null)}
+            />
         ) : (
           <FoliateTextReader
             detail={readerBook}
@@ -324,6 +372,8 @@ export function ReaderPage() {
             onProgress={handleProgress}
             onLayoutChange={setFixedLayout}
             onBack={backToLibrary}
+            tocOpen={contentsOpen}
+            onTocOpenChange={(open) => setReaderPanel(open ? "contents" : null)}
           />
         )}
       </ErrorBoundary>

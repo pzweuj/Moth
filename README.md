@@ -53,6 +53,19 @@ $env:MOTH_WEB_DIR = "web/dist"
 cargo run -p moth-server
 ```
 
+For repeatable local testing, copy `.env.example` to `.env`, set
+`MOTH_TEST_USERNAME` and `MOTH_TEST_PASSWORD` (at least 10 characters), and
+run the explicit setup helper after the server is ready:
+
+```powershell
+Copy-Item .env.example .env
+# edit .env; keep the real credentials out of git
+./scripts/setup-local.ps1
+```
+
+These `MOTH_TEST_*` variables are read only by the helper; the server itself
+still creates its single account through `/setup` and never logs the password.
+
 In another terminal, install and start the Vite development server:
 
 ```powershell

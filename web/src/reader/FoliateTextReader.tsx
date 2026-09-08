@@ -22,6 +22,8 @@ interface FoliateTextReaderProps {
   /** Reports whether an EPUB declares a fixed (pre-paginated) layout. */
   onLayoutChange?: (fixedLayout: boolean) => void;
   onBack?: () => void;
+  tocOpen?: boolean;
+  onTocOpenChange?: (open: boolean) => void;
 }
 
 type TocEntry = { label: string; href?: string; level: number };
@@ -278,6 +280,8 @@ export function FoliateTextReader({
   onProgress,
   onLayoutChange,
   onBack,
+  tocOpen: controlledTocOpen,
+  onTocOpenChange,
 }: FoliateTextReaderProps) {
   const { t } = useUi();
   const hostRef = useRef<HTMLDivElement>(null);
@@ -292,9 +296,16 @@ export function FoliateTextReader({
   const restoredRef = useRef(false);
   const ignoreInitialRelocationRef = useRef(false);
   const [toc, setToc] = useState<TocEntry[]>([]);
-  const [tocOpen, setTocOpen] = useState(false);
+  const [internalTocOpen, setInternalTocOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown | null>(null);
+  const tocOpen = controlledTocOpen ?? internalTocOpen;
+  const tocOpenRef = useRef(tocOpen);
+  tocOpenRef.current = tocOpen;
+  const setTocOpen = useCallback((open: boolean) => {
+    onTocOpenChange?.(open);
+    if (controlledTocOpen === undefined) setInternalTocOpen(open);
+  }, [controlledTocOpen, onTocOpenChange]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -305,6 +316,7 @@ export function FoliateTextReader({
     let view: FoliateViewElement | null = null;
     let removeTapNavigation: (() => void) | undefined;
     let zipLoader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
+    const keyboardCleanups = new Map<Document, () => void>();
     const reportPublicationError = (error: unknown) => {
       if (cancelled) return;
       // Keep the original error object so a later language switch can render
@@ -332,9 +344,38 @@ export function FoliateTextReader({
       // already runs them in a sandbox; this second layer removes active
       // elements, event attributes and dangerous URLs before the document is
       // exposed to the reader.
+      const attachPublicationKeyboard = (document: Document) => {
+        if (keyboardCleanups.has(document)) return;
+        const onKey = (event: KeyboardEvent) => {
+          if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || tocOpenRef.current) return;
+          const target = event.target as HTMLElement | null;
+          if (target?.closest("button, a, input, select, textarea, [contenteditable], .settings-panel")) return;
+          if (event.key === "ArrowRight" || event.key === "PageDown" || event.key === " ") {
+            event.preventDefault();
+            void element.next();
+          } else if (event.key === "ArrowLeft" || event.key === "PageUp") {
+            event.preventDefault();
+            void element.prev();
+          }
+        };
+        document.addEventListener("keydown", onKey);
+        const cleanup = () => {
+          document.removeEventListener("keydown", onKey);
+        };
+        keyboardCleanups.set(document, cleanup);
+      };
       element.addEventListener("load", (event: Event) => {
         const document = (event as CustomEvent<{ doc?: Document }>).detail?.doc;
-        if (document) sanitizeBookDocument(document);
+        if (document) {
+          for (const [loadedDocument, cleanup] of keyboardCleanups) {
+            if (loadedDocument !== document) {
+              cleanup();
+              keyboardCleanups.delete(loadedDocument);
+            }
+          }
+          sanitizeBookDocument(document);
+          attachPublicationKeyboard(document);
+        }
       });
       // Do not let untrusted book links escape the reader. Internal chapter
       // links are still handled by Foliate's navigation layer.
@@ -552,6 +593,8 @@ export function FoliateTextReader({
       restoredRef.current = false;
       requestController.abort();
       removeTapNavigation?.();
+      for (const cleanup of keyboardCleanups.values()) cleanup();
+      keyboardCleanups.clear();
       void zipLoader?.close().catch(() => undefined);
       view?.close();
       view?.remove();
@@ -595,7 +638,7 @@ export function FoliateTextReader({
   // activates buttons.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (tocOpen) return;
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || tocOpen) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest("button, a, input, select, textarea, [contenteditable], .settings-panel")) {
         return;
@@ -619,16 +662,11 @@ export function FoliateTextReader({
 
   // Escape closes the contents drawer; focus moves into it when it opens and
   // back to the toggle button when it closes.
-  const tocButtonRef = useRef<HTMLButtonElement>(null);
   const tocListRef = useRef<HTMLDivElement>(null);
-  const wasOpenRef = useRef(false);
   useEffect(() => {
     if (tocOpen) {
       tocListRef.current?.focus();
-    } else if (wasOpenRef.current) {
-      tocButtonRef.current?.focus();
     }
-    wasOpenRef.current = tocOpen;
   }, [tocOpen]);
   useEffect(() => {
     if (!tocOpen) return;
@@ -637,7 +675,7 @@ export function FoliateTextReader({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [tocOpen]);
+  }, [setTocOpen, tocOpen]);
 
   const goTo = useCallback((href: string) => {
     const view = viewRef.current;
@@ -667,26 +705,16 @@ export function FoliateTextReader({
           </button>
         </div>
       )}
+      {tocOpen && <button className="reader-drawer-backdrop" type="button" aria-label={t("Close contents")} onClick={() => setTocOpen(false)} />}
       <div className="reader-bottom-bar" data-reader-controls="true">
         <button type="button" onClick={prev} disabled={loading || !!error} aria-label={t("Previous page")}>
           ← {t("Prev")}
         </button>
-        {toc.length > 0 && (
-        <button
-          type="button"
-          ref={tocButtonRef}
-          onClick={() => setTocOpen((open) => !open)}
-          aria-expanded={tocOpen}
-          aria-label={t("Contents")}
-        >
-          {t("Contents")}
-        </button>
-        )}
         <button type="button" onClick={next} disabled={loading || !!error} aria-label={t("Next page")}>
           {t("Next")} →
         </button>
       </div>
-      {tocOpen && toc.length > 0 && (
+      {tocOpen && (
         <div
           className="reader-toc"
           role="dialog"
@@ -700,23 +728,27 @@ export function FoliateTextReader({
               ✕
             </button>
           </div>
-          <ul>
-            {toc.map((item, index) => (
-              <li key={index}>
-                <button
-                  type="button"
-                  style={{ paddingLeft: `${10 + item.level * 16}px` }}
-                  onClick={() => {
-                    if (item.href) goTo(item.href);
-                    setTocOpen(false);
-                  }}
-                  disabled={!item.href}
-                >
-                  {item.label || `${t("Chapter")} ${index + 1}`}
-                </button>
-              </li>
-            ))}
-          </ul>
+          {toc.length > 0 ? (
+            <ul>
+              {toc.map((item, index) => (
+                <li key={index}>
+                  <button
+                    type="button"
+                    style={{ paddingLeft: `${10 + item.level * 16}px` }}
+                    onClick={() => {
+                      if (item.href) goTo(item.href);
+                      setTocOpen(false);
+                    }}
+                    disabled={!item.href}
+                  >
+                    {item.label || `${t("Chapter")} ${index + 1}`}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="reader-drawer-empty">{t("No contents available")}</p>
+          )}
         </div>
       )}
     </div>
