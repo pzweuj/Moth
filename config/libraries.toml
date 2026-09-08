@@ -1,0 +1,9 @@
+[[libraries]]
+key = "novels"
+name = "小说"
+path = "/books/novels"
+
+[[libraries]]
+key = "comics"
+name = "漫画"
+path = "/books/comics"

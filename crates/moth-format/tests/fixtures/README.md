@@ -11,6 +11,6 @@
 - SHA-256: `29448cd44f3e6d3db391c6aefc438f53283142d9e8a41ef439718a5d84f36240`.
 - Expected content: Alice, White Rabbit, “Down the Rabbit-Hole”, “The Pool of Tears”, twelve story chapters and Gutenberg notices.
 
-The Rust test verifies parser output. Playwright separately exercises the
-actual Foliate rendering, navigation, local caching and restored reading.
-This MOBI fixture does not establish AZW3/KF8 compatibility.
+The Rust test verifies parser output. The server converts this classic MOBI to
+the minimal EPUB reader format on first open and stores the result in the
+content-versioned data cache.

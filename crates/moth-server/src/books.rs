@@ -1,10 +1,9 @@
-//! Book API handlers: the library shelf, reading content, and progress.
+//! Publication API and format-specific reader endpoints.
 
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use axum::{
@@ -12,378 +11,325 @@ use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sqlx::Row;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio_util::io::ReaderStream;
-use zip::ZipArchive;
+use sqlx::{Row, SqlitePool};
+use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::auth::Authenticated;
-use crate::error::AppError;
-use crate::library::hash_file;
-use crate::state::{AppState, TxtCacheKey};
+use crate::{
+    auth::Authenticated,
+    error::AppError,
+    library::now_unix,
+    state::{AppState, ConversionState},
+};
 
-const TXT_PARSER_VERSION: &str = "txt-v1";
-static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CONTENT_ADAPTER_VERSION: &str = "core-v1";
 
-#[derive(Debug, Serialize, Clone)]
-pub struct BookListItem {
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicationSummary {
     pub id: i64,
     pub title: String,
     pub author: Option<String>,
-    pub format: String,
-    pub has_cover: bool,
+    pub source_format: String,
+    pub reader_format: String,
     pub cover_url: Option<String>,
-    pub page_count: i64,
-    pub parse_status: String,
-    pub percent: f64,
+    pub progress: f64,
     pub content_version: String,
     pub file_size: i64,
-    /// Direct section for an ungrouped book. Series members inherit the
-    /// section from their series and are exposed through the same field.
-    pub section_id: Option<i64>,
-    pub section_name: Option<String>,
-    pub series_id: Option<i64>,
-    pub series_name: Option<String>,
-    pub series_order: Option<i64>,
-    pub missing: bool,
+    pub filename: String,
+    pub library_key: String,
+    pub library_name: String,
+    pub directory_path: String,
+    pub parse_status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChapterInfo {
     pub idx: i64,
     pub title: String,
-    /// Byte size of the rendered chapter content, for client-side progress
-    /// estimation (each chapter is a section in the paginator).
-    pub size: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ProgressBody {
-    pub chapter_index: i64,
-    pub page_index: i64,
-    pub percent: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cfi: Option<String>,
-    /// TXT positions are tied to the decoded text. `auto` is the normalized
-    /// value for the decoder selected during the library scan; other formats
-    /// leave this field empty.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding: Option<String>,
+#[derive(Debug, Clone, Serialize)]
+pub struct PageInfo {
+    pub idx: i64,
+    pub path: String,
+    pub mime: String,
 }
 
-#[derive(Deserialize)]
-pub struct ProgressSyncBody {
-    pub chapter_index: i64,
-    pub page_index: i64,
-    pub percent: f64,
-    pub content_version: String,
-    pub base_revision: i64,
-    pub operation_id: String,
-    pub cfi: Option<String>,
-    pub encoding: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ProgressSyncResponse {
-    pub progress: ProgressBody,
-    pub revision: i64,
-    pub conflict: bool,
-}
-
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BookDetail {
-    pub id: i64,
-    pub title: String,
-    pub author: Option<String>,
-    pub format: String,
-    pub has_cover: bool,
-    pub cover_url: Option<String>,
-    pub page_count: i64,
-    pub parse_status: String,
-    pub parse_error: Option<String>,
+    #[serde(flatten)]
+    pub summary: PublicationSummary,
     pub chapters: Vec<ChapterInfo>,
-    /// Server order of CBZ image entries. The browser uses this mapping when
-    /// its locale-aware filename sort produces a different display order.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pages: Vec<String>,
-    pub progress: Option<ProgressBody>,
+    pub pages: Vec<PageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ReadingPosition {
+    #[serde(rename = "epub")]
+    Epub {
+        href: String,
+        cfi: String,
+        progress: f64,
+    },
+    #[serde(rename = "txt")]
+    Txt {
+        chapter_index: i64,
+        character_offset: i64,
+        encoding: String,
+        progress: f64,
+    },
+    #[serde(rename = "cbz")]
+    Cbz {
+        page_index: i64,
+        page_progress: f64,
+        progress: f64,
+    },
+}
+
+impl ReadingPosition {
+    fn progress_raw(&self) -> f64 {
+        match self {
+            Self::Epub { progress, .. }
+            | Self::Txt { progress, .. }
+            | Self::Cbz { progress, .. } => *progress,
+        }
+    }
+    fn progress(&self) -> f64 {
+        self.progress_raw().clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressBody {
     pub content_version: String,
-    pub file_size: i64,
-    pub section_id: Option<i64>,
-    pub section_name: Option<String>,
-    pub series_id: Option<i64>,
-    pub series_name: Option<String>,
-    pub series_order: Option<i64>,
-    pub missing: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parser_version: Option<String>,
+    pub position: ReadingPosition,
 }
 
-#[derive(Serialize)]
-pub struct ChapterContent {
-    pub idx: i64,
-    pub title: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parser_version: Option<String>,
+#[derive(Debug, Deserialize, Default)]
+pub struct PublicationQuery {
+    pub q: Option<String>,
+    pub library: Option<String>,
+    pub format: Option<String>,
+    pub author: Option<String>,
+    pub sort: Option<String>,
+    pub directory_id: Option<i64>,
 }
 
-#[derive(Serialize)]
-pub struct OfflineChapterManifest {
-    pub idx: i64,
-    pub title: String,
-    pub size: i64,
-    pub url: String,
+#[derive(Debug, Serialize)]
+pub struct HomeResponse {
+    pub continue_reading: Vec<PublicationSummary>,
+    pub recently_added: Vec<PublicationSummary>,
+    pub novels: Vec<PublicationSummary>,
+    pub comics: Vec<PublicationSummary>,
 }
 
-#[derive(Serialize)]
-pub struct OfflineManifest {
-    pub id: i64,
-    pub title: String,
-    pub format: String,
-    pub content_version: String,
-    pub file_size: i64,
-    pub cover_url: Option<String>,
+#[derive(Debug, Serialize)]
+pub struct ConversionResponse {
+    pub status: String,
     pub file_url: Option<String>,
-    pub chapters: Vec<OfflineChapterManifest>,
-    pub resource_urls: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChapterQuery {
     pub encoding: Option<String>,
-    pub parser_version: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct ScanStatusResponse {
-    pub scanning: bool,
-    pub processed: u64,
-    pub total: u64,
-    pub errors: u64,
-    pub message: String,
+#[derive(Debug, Serialize)]
+struct ChapterResponse {
+    idx: i64,
+    title: String,
+    content: String,
+    encoding: String,
+    content_version: String,
 }
 
-fn cover_url(id: i64, has_cover: bool, version: &str) -> Option<String> {
-    has_cover.then(|| format!("/api/v1/books/{id}/cover?v={version}"))
+pub async fn home(
+    State(state): State<AppState>,
+    _user: Authenticated,
+) -> Result<Json<HomeResponse>, AppError> {
+    let mut continue_reading = fetch_publications(&state.db, None, None, Some("progress")).await?;
+    continue_reading.retain(|book| book.progress > 0.0 && book.progress < 1.0);
+    continue_reading.truncate(12);
+    let all_recent = fetch_publications(&state.db, None, None, Some("added")).await?;
+    let novels = all_recent
+        .iter()
+        .filter(|book| matches!(book.source_format.as_str(), "epub" | "txt" | "mobi"))
+        .take(12)
+        .cloned()
+        .collect();
+    let comics = all_recent
+        .iter()
+        .filter(|book| book.source_format == "cbz")
+        .take(12)
+        .cloned()
+        .collect();
+    let mut recently_added = all_recent;
+    recently_added.truncate(12);
+    Ok(Json(HomeResponse {
+        continue_reading,
+        recently_added,
+        novels,
+        comics,
+    }))
 }
 
 pub async fn list_books(
     State(state): State<AppState>,
     _user: Authenticated,
-    Query(query): Query<BookListQuery>,
-) -> Result<Json<Vec<BookListItem>>, AppError> {
-    if query.section_id.is_some() && query.series_id.is_some() {
-        return Err(AppError::Validation(
-            "Choose either a section or a series filter".to_owned(),
-        ));
-    }
-    let books = fetch_book_items(&state.db, query.section_id, query.series_id).await?;
-    Ok(Json(books))
+    Query(query): Query<PublicationQuery>,
+) -> Result<Json<Vec<PublicationSummary>>, AppError> {
+    Ok(Json(fetch_filtered(&state.db, &query).await?))
 }
 
-/// Shared book projection used by the flat shelf and the organized shelf.
-/// Keeping the projection in one place ensures both views expose identical
-/// progress, cache-busting and classification metadata.
-pub(crate) async fn fetch_book_items(
-    db: &sqlx::SqlitePool,
-    section_filter: Option<i64>,
-    series_filter: Option<i64>,
-) -> Result<Vec<BookListItem>, AppError> {
-    let rows = sqlx::query(
-        "SELECT b.id, b.title, b.author, b.format, b.has_cover, b.page_count, \
-         b.parse_status, b.sha256, b.file_size, b.missing, b.series_order, \
-         s.id AS series_id, s.name AS series_name, \
-         COALESCE(s.section_id, b.section_id) AS section_id, \
-         COALESCE(ss.name, ds.name) AS section_name, \
-         COALESCE(CASE WHEN p.content_version IS NULL OR p.content_version = b.sha256 \
-         THEN p.percent ELSE 0.0 END, 0.0) AS percent \
-         FROM books b \
-         LEFT JOIN series s ON s.id = b.series_id \
-         LEFT JOIN sections ss ON ss.id = s.section_id \
-         LEFT JOIN sections ds ON ds.id = b.section_id \
-         LEFT JOIN reading_progress p ON p.book_id = b.id \
-         WHERE (? IS NULL OR COALESCE(s.section_id, b.section_id) = ?) \
-           AND (? IS NULL OR b.series_id = ?) \
-         ORDER BY CASE WHEN ? IS NOT NULL THEN b.series_order END, b.title COLLATE NOCASE",
-    )
-    .bind(section_filter)
-    .bind(section_filter)
-    .bind(series_filter)
-    .bind(series_filter)
-    .bind(series_filter)
-    .fetch_all(db)
-    .await?;
-
-    let mut books = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i64 = row.try_get("id")?;
-        let version: String = row.try_get("sha256")?;
-        let has_cover: bool = row.try_get("has_cover")?;
-        let series_id: Option<i64> = row.try_get("series_id")?;
-        let series_order: i64 = row.try_get("series_order")?;
-        books.push(BookListItem {
-            id,
-            title: row.try_get("title")?,
-            author: row.try_get("author")?,
-            format: row.try_get("format")?,
-            has_cover,
-            cover_url: cover_url(id, has_cover, &version),
-            page_count: row.try_get("page_count")?,
-            parse_status: row.try_get("parse_status")?,
-            percent: row.try_get("percent")?,
-            content_version: version,
-            file_size: row.try_get("file_size")?,
-            section_id: row.try_get("section_id")?,
-            section_name: row.try_get("section_name")?,
-            series_id,
-            series_name: row.try_get("series_name")?,
-            series_order: series_id.map(|_| series_order),
-            missing: row.try_get("missing")?,
-        });
+async fn fetch_filtered(
+    db: &SqlitePool,
+    query: &PublicationQuery,
+) -> Result<Vec<PublicationSummary>, AppError> {
+    if let Some(format) = query.format.as_deref().filter(|value| !value.is_empty())
+        && !matches!(format, "epub" | "txt" | "cbz" | "mobi")
+    {
+        return Err(AppError::Validation(
+            "format must be one of epub, txt, cbz, mobi".to_owned(),
+        ));
     }
-    Ok(books)
+    let mut sql = String::from(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,l.config_key,l.name,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN libraries l ON l.id=p.library_id JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE 1=1",
+    );
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(value) = query.library.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND l.config_key=?");
+        binds.push(value.to_owned());
+    }
+    if let Some(value) = query
+        .format
+        .as_deref()
+        .filter(|value| matches!(*value, "epub" | "txt" | "cbz" | "mobi"))
+    {
+        sql.push_str(" AND p.format=?");
+        binds.push(value.to_owned());
+    }
+    if let Some(value) = query.author.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND lower(COALESCE(p.author,'')) LIKE lower(?)");
+        binds.push(format!("%{value}%"));
+    }
+    if let Some(value) = query.q.as_deref().filter(|value| !value.trim().is_empty()) {
+        sql.push_str(" AND (lower(p.title) LIKE lower(?) OR lower(COALESCE(p.author,'')) LIKE lower(?) OR lower(p.filename) LIKE lower(?))");
+        let value = format!("%{}%", value.trim());
+        binds.extend([value.clone(), value.clone(), value]);
+    }
+    sql.push_str(match query.sort.as_deref() {
+        Some("added") => " ORDER BY p.added_at DESC, p.title COLLATE NOCASE",
+        Some("progress") => " ORDER BY COALESCE(r.updated_at,0) DESC, p.title COLLATE NOCASE",
+        _ => " ORDER BY p.title COLLATE NOCASE",
+    });
+    let mut request = sqlx::query(&sql);
+    for value in &binds {
+        request = request.bind(value);
+    }
+    let rows = request.fetch_all(db).await?;
+    rows.into_iter()
+        .map(|row| summary_from_row(&row).map_err(AppError::Database))
+        .collect()
+}
+
+pub(crate) async fn fetch_publications(
+    db: &SqlitePool,
+    library_id: Option<i64>,
+    directory_id: Option<i64>,
+    sort: Option<&str>,
+) -> Result<Vec<PublicationSummary>, AppError> {
+    let order = match sort {
+        Some("added") => "p.added_at DESC, p.title COLLATE NOCASE",
+        Some("progress") => "COALESCE(r.updated_at, 0) DESC, p.title COLLATE NOCASE",
+        _ => "p.title COLLATE NOCASE",
+    };
+    let query = format!(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,l.config_key,l.name,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN libraries l ON l.id=p.library_id JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE (? IS NULL OR p.library_id=?) AND (? IS NULL OR p.directory_id=?) ORDER BY {order}"
+    );
+    let rows = sqlx::query(&query)
+        .bind(library_id)
+        .bind(library_id)
+        .bind(directory_id)
+        .bind(directory_id)
+        .fetch_all(db)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(summary_from_row(&row)?);
+    }
+    Ok(out)
+}
+
+fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PublicationSummary, sqlx::Error> {
+    let source: String = row.try_get("format")?;
+    let hash: String = row.try_get("sha256")?;
+    let has_cover: bool = row.try_get("has_cover")?;
+    Ok(PublicationSummary {
+        id: row.try_get("id")?,
+        title: row.try_get("title")?,
+        author: row.try_get("author")?,
+        source_format: source.clone(),
+        reader_format: if source == "mobi" {
+            "epub".to_owned()
+        } else {
+            source
+        },
+        cover_url: has_cover.then(|| {
+            format!(
+                "/api/v1/publications/{}/cover?v={hash}",
+                row.try_get::<i64, _>("id").unwrap_or_default()
+            )
+        }),
+        progress: row.try_get::<f64, _>("progress")?.clamp(0.0, 1.0),
+        content_version: content_version(&hash, row.try_get::<String, _>("format")?.as_str(), None),
+        file_size: row.try_get("file_size")?,
+        filename: row.try_get("filename")?,
+        library_key: row.try_get("config_key")?,
+        library_name: row.try_get("name")?,
+        directory_path: row.try_get("relative_path")?,
+        parse_status: row.try_get("parse_status")?,
+    })
 }
 
 pub async fn get_book(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
-    Query(query): Query<ChapterQuery>,
 ) -> Result<Json<BookDetail>, AppError> {
-    let book = sqlx::query(
-        "SELECT b.title, b.author, b.format, b.relative_path, b.has_cover, b.page_count, \
-         b.parse_status, b.parse_error, b.sha256, b.file_size, b.missing, b.series_order, \
-         s.id AS series_id, s.name AS series_name, \
-         COALESCE(s.section_id, b.section_id) AS section_id, \
-         COALESCE(ss.name, ds.name) AS section_name \
-         FROM books b LEFT JOIN series s ON s.id = b.series_id \
-         LEFT JOIN sections ss ON ss.id = s.section_id \
-         LEFT JOIN sections ds ON ds.id = b.section_id \
-         WHERE b.id = ?",
+    let row = publication_row(&state.db, id).await?;
+    let summary = fetch_publications(
+        &state.db,
+        Some(row.library_id),
+        Some(row.directory_id),
+        Some("title"),
     )
-    .bind(id)
-    .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| AppError::NotFound)?;
-
-    let title: String = book.try_get("title")?;
-    let author: Option<String> = book.try_get("author")?;
-    let format: String = book.try_get("format")?;
-    let relative_path: String = book.try_get("relative_path")?;
-    let has_cover: bool = book.try_get("has_cover")?;
-    let page_count: i64 = book.try_get("page_count")?;
-    let parse_status: String = book.try_get("parse_status")?;
-    let parse_error: Option<String> = book.try_get("parse_error")?;
-    let content_version: String = book.try_get("sha256")?;
-    let file_size: i64 = book.try_get("file_size")?;
-    let missing: bool = book.try_get("missing")?;
-    let section_id: Option<i64> = book.try_get("section_id")?;
-    let section_name: Option<String> = book.try_get("section_name")?;
-    let series_id: Option<i64> = book.try_get("series_id")?;
-    let series_name: Option<String> = book.try_get("series_name")?;
-    let series_order_value: i64 = book.try_get("series_order")?;
-    let series_order: Option<i64> = series_id.map(|_| series_order_value);
-
-    let requested_encoding = requested_txt_encoding(&query);
-    let chapters: Vec<ChapterInfo> = if format == "cbz" {
-        Vec::new()
-    } else if format == "txt"
-        && let Some(encoding) = requested_encoding
-    {
-        if !valid_encoding(encoding) {
-            return Err(AppError::Validation("Unsupported text encoding".to_owned()));
-        }
-        let path = ensure_snapshot(&state, id, &relative_path, &content_version).await?;
-        cached_txt_chapters(&state, id, &content_version, encoding, path)
-            .await?
-            .iter()
-            .enumerate()
-            .map(|(idx, chapter)| ChapterInfo {
-                idx: idx as i64,
-                title: chapter.title.clone(),
-                size: chapter.content.len() as i64,
-            })
-            .collect()
-    } else {
-        sqlx::query_as::<_, (i64, String, i64)>(
-            "SELECT idx, title, length(content) FROM chapters WHERE book_id = ? ORDER BY idx",
-        )
-        .bind(id)
-        .fetch_all(&state.db)
-        .await?
-        .into_iter()
-        .map(|(idx, title, size)| ChapterInfo { idx, title, size })
-        .collect()
-    };
-    let pages = if format == "cbz" {
-        sqlx::query_scalar::<_, String>("SELECT path FROM pages WHERE book_id = ? ORDER BY idx")
+    .into_iter()
+    .find(|value| value.id == id)
+    .ok_or(AppError::NotFound)?;
+    let chapters = sqlx::query("SELECT idx,title FROM text_chapters WHERE publication_id=? AND encoding='auto' ORDER BY idx").bind(id).fetch_all(&state.db).await?.into_iter().map(|row| Ok(ChapterInfo { idx: row.try_get("idx")?, title: row.try_get("title")? })).collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let pages =
+        sqlx::query("SELECT idx,path,mime FROM cbz_pages WHERE publication_id=? ORDER BY idx")
             .bind(id)
             .fetch_all(&state.db)
             .await?
-    } else {
-        Vec::new()
-    };
-
-    let progress = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            f64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT chapter_index, page_index, percent, revision, content_version, cfi, encoding FROM reading_progress WHERE book_id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .map(
-        |(chapter_index, page_index, percent, revision, progress_version, cfi, encoding)| {
-            ProgressBody {
-                chapter_index,
-                page_index,
-                percent,
-                revision: Some(revision),
-                content_version: progress_version,
-                cfi,
-                encoding: stored_progress_encoding(&format, encoding),
-            }
-        },
-    );
-
+            .into_iter()
+            .map(|row| {
+                Ok(PageInfo {
+                    idx: row.try_get("idx")?,
+                    path: row.try_get("path")?,
+                    mime: row.try_get("mime")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
     Ok(Json(BookDetail {
-        id,
-        title,
-        author,
-        format: format.clone(),
-        has_cover,
-        cover_url: cover_url(id, has_cover, &content_version),
-        page_count,
-        parse_status,
-        parse_error,
+        summary,
         chapters,
         pages,
-        progress,
-        content_version,
-        file_size,
-        section_id,
-        section_name,
-        series_id,
-        series_name,
-        series_order,
-        missing,
-        parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
     }))
 }
 
@@ -391,1178 +337,839 @@ pub async fn get_cover(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
-    Query(query): Query<VersionQuery>,
-    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let current_version: String = sqlx::query_scalar("SELECT sha256 FROM books WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    // Cover URLs include `?v=<sha256>`. Retain old versioned thumbnails for
-    // an active reader while a rescan installs a new version, but ignore
-    // malformed values so they cannot become filesystem path components.
-    let version = query
-        .v
-        .filter(|value| is_content_version(value))
-        .unwrap_or(current_version);
-    let etag = format!("\"{version}\"");
-    if if_match_misses(&headers, &etag) {
-        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
+    let row = publication_row(&state.db, id).await?;
+    ensure_source_current(&row).await?;
+    if !row.has_cover {
+        return Err(AppError::NotFound);
     }
-    if if_none_match_hits(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-    let path = state.cover_path(id, &version);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(AppError::NotFound),
-    };
-    Ok((
-        [
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-            (header::ETAG, etag.as_str()),
-        ],
-        bytes,
-    )
-        .into_response())
+    let path = state.cover_path(&current_content_version(&row, None));
+    let bytes = tokio::fs::read(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::NotFound
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+    let etag = format!("\"{}\"", current_content_version(&row, None));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("cover response"))
 }
 
-/// Describe every authenticated resource needed to make a book available
-/// offline. The client may still choose its own download scheduling policy.
-pub async fn get_offline_manifest(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath(id): AxumPath<i64>,
-    Query(query): Query<ChapterQuery>,
-) -> Result<Json<OfflineManifest>, AppError> {
-    let row = sqlx::query(
-        "SELECT title, format, relative_path, has_cover, sha256, file_size FROM books WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound)?;
-    let title: String = row.try_get("title")?;
-    let format: String = row.try_get("format")?;
-    let relative_path: String = row.try_get("relative_path")?;
-    let has_cover: bool = row.try_get("has_cover")?;
-    let content_version: String = row.try_get("sha256")?;
-    let file_size: i64 = row.try_get("file_size")?;
-
-    let requested_encoding = requested_txt_encoding(&query);
-    let chapters = if format == "txt"
-        && let Some(encoding) = requested_encoding
-    {
-        if !valid_encoding(encoding) {
-            return Err(AppError::Validation("Unsupported text encoding".to_owned()));
-        }
-        let path = ensure_snapshot(&state, id, &relative_path, &content_version).await?;
-        cached_txt_chapters(&state, id, &content_version, encoding, path)
-            .await?
-            .iter()
-            .enumerate()
-            .map(|(idx, chapter)| OfflineChapterManifest {
-                idx: idx as i64,
-                title: chapter.title.clone(),
-                size: chapter.content.len() as i64,
-                url: format!("/api/v1/books/{id}/chapter/{idx}?encoding={encoding}"),
-            })
-            .collect()
-    } else {
-        sqlx::query_as::<_, (i64, String, i64)>(
-            "SELECT idx, title, length(content) FROM chapters WHERE book_id = ? ORDER BY idx",
-        )
-        .bind(id)
-        .fetch_all(&state.db)
-        .await?
-        .into_iter()
-        .map(|(idx, title, size)| OfflineChapterManifest {
-            idx,
-            title,
-            size,
-            url: format!("/api/v1/books/{id}/chapter/{idx}"),
-        })
-        .collect()
-    };
-    let resource_urls =
-        sqlx::query_scalar::<_, i64>("SELECT idx FROM resources WHERE book_id = ? ORDER BY idx")
-            .bind(id)
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .map(|idx| format!("/api/v1/books/{id}/resource/{idx}"))
-            .collect();
-
-    Ok(Json(OfflineManifest {
-        id,
-        title,
-        format: format.clone(),
-        content_version: content_version.clone(),
-        file_size,
-        cover_url: cover_url(id, has_cover, &content_version),
-        file_url: (format != "txt").then(|| format!("/api/v1/books/{id}/file")),
-        chapters,
-        resource_urls,
-        encoding: (format == "txt").then(|| {
-            query
-                .encoding
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map_or_else(|| "auto".to_owned(), |value| value.to_ascii_lowercase())
-        }),
-        parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
-    }))
-}
-
-/// A single byte range, inclusive endpoints, parsed from a `Range` header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ByteRange {
-    start: u64,
-    end: u64,
-}
-
-/// How a `Range` header should be handled. A request that cannot be satisfied
-/// is answered with `416`; a header we choose not to honor (multi-range,
-/// malformed) falls back to the full `200` response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RangeParse {
-    Satisfiable(ByteRange),
-    Unsatisfiable,
-    Ignore,
-}
-
-/// Parse a single `bytes=a-b` range against a known size.
-fn parse_range(header: &str, size: u64) -> RangeParse {
-    if size == 0 {
-        return RangeParse::Unsatisfiable;
-    }
-    let Some(spec) = header.strip_prefix("bytes=") else {
-        return RangeParse::Ignore;
-    };
-    // Only single ranges are handled; a multi-range request falls back to the
-    // full representation, which RFC 7233 permits.
-    if spec.contains(',') {
-        return RangeParse::Ignore;
-    }
-    let Some((start_str, end_str)) = spec.split_once('-') else {
-        return RangeParse::Ignore;
-    };
-
-    let parse = |value: &str| -> Option<u64> {
-        if value.is_empty() {
-            return None;
-        }
-        value.parse::<u64>().ok()
-    };
-
-    let start = parse(start_str);
-    let end = parse(end_str);
-    let range = match (start, end) {
-        // `bytes=start-end`
-        (Some(start), Some(end)) => {
-            if start > end || start >= size {
-                return RangeParse::Unsatisfiable;
-            }
-            ByteRange {
-                start,
-                end: end.min(size - 1),
-            }
-        }
-        // `bytes=start-`
-        (Some(start), None) => {
-            if start >= size {
-                return RangeParse::Unsatisfiable;
-            }
-            ByteRange {
-                start,
-                end: size - 1,
-            }
-        }
-        // `bytes=-N`: the last N bytes.
-        (None, Some(suffix)) => {
-            if suffix == 0 {
-                return RangeParse::Unsatisfiable;
-            }
-            ByteRange {
-                start: size.saturating_sub(suffix),
-                end: size - 1,
-            }
-        }
-        (None, None) => return RangeParse::Ignore,
-    };
-    RangeParse::Satisfiable(range)
-}
-
-/// Serve a raw book file with HTTP Range support, for `zip.js HttpRangeReader`
-/// and client-side readers. Bytes are streamed so large archives are never
-/// fully buffered server-side.
 pub async fn get_file(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let (relative_path, format, version) = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT relative_path, format, sha256 FROM books WHERE id = ?",
+    let row = publication_row(&state.db, id).await?;
+    let source = ensure_source_current(&row).await?;
+    let path = if row.format == "mobi" {
+        let target = state
+            .mobi_dir(&current_content_version(&row, None))
+            .join("book.epub");
+        if !target.exists() {
+            return Err(AppError::Conflict {
+                code: "conversion_required",
+                message: "请先转换此 MOBI，或将其转换为 EPUB",
+            });
+        }
+        target
+    } else {
+        source
+    };
+    let etag = format!("\"{}\"", current_content_version(&row, None));
+    if let Some(value) = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        let matches = value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == "*" || candidate == etag);
+        if !matches {
+            return Ok(Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .header(header::ETAG, etag)
+                .body(Body::empty())
+                .expect("precondition response"));
+        }
+    }
+    range_response(
+        &path,
+        &headers,
+        if row.format == "mobi" {
+            "application/epub+zip"
+        } else {
+            mime_for_format(&row.format)
+        },
+        &etag,
+    )
+    .await
+}
+
+pub async fn get_chapter(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath((id, idx)): AxumPath<(i64, i64)>,
+    Query(query): Query<ChapterQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let row = publication_row(&state.db, id).await?;
+    if row.format != "txt" {
+        return Err(AppError::Validation(
+            "chapters are available only for TXT publications".to_owned(),
+        ));
+    }
+    ensure_source_current(&row).await?;
+    let encoding = query
+        .encoding
+        .as_deref()
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    if !supported_encoding(&encoding) {
+        return Err(AppError::Validation("unsupported TXT encoding".to_owned()));
+    }
+    let chapter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
+    )
+    .bind(id)
+    .bind(&encoding)
+    .fetch_one(&state.db)
+    .await?;
+    if chapter_count == 0 && encoding != "auto" {
+        let path = row.root.join(&row.relative_path);
+        let version = current_content_version(&row, Some(&encoding));
+        crate::library::write_text_cache(&state, id, &version, &path, &encoding).await?;
+    }
+    let chapter = sqlx::query(
+        "SELECT title,byte_start,byte_end FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
+    )
+    .bind(id)
+    .bind(&encoding)
+    .bind(idx)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let start: u64 = chapter
+        .try_get::<i64, _>("byte_start")?
+        .try_into()
+        .map_err(|_| AppError::Validation("invalid chapter offset".to_owned()))?;
+    let end: u64 = chapter
+        .try_get::<i64, _>("byte_end")?
+        .try_into()
+        .map_err(|_| AppError::Validation("invalid chapter offset".to_owned()))?;
+    let cache_path = state
+        .txt_dir(&current_content_version(&row, Some(&encoding)), &encoding)
+        .join("book.utf8");
+    let content = read_cached_range(&cache_path, start, end).await?;
+    let title: String = chapter.try_get("title")?;
+    let content = render_txt_html(&content);
+    Ok(Json(serde_json::json!(ChapterResponse {
+        idx,
+        title,
+        content,
+        encoding: encoding.clone(),
+        content_version: current_content_version(&row, Some(&encoding))
+    })))
+}
+
+pub async fn get_page(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath((id, idx)): AxumPath<(i64, i64)>,
+) -> Result<Response, AppError> {
+    let row = publication_row(&state.db, id).await?;
+    if row.format != "cbz" {
+        return Err(AppError::Validation(
+            "pages are available only for CBZ publications".to_owned(),
+        ));
+    }
+    ensure_source_current(&row).await?;
+    let page = sqlx::query("SELECT path,mime FROM cbz_pages WHERE publication_id=? AND idx=?")
+        .bind(id)
+        .bind(idx)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let entry: String = page.try_get("path")?;
+    let mime: String = page.try_get("mime")?;
+    let source = row.root.join(&row.relative_path);
+    let bytes = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(source)?;
+        let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
+        let mut item = zip.by_name(&entry).map_err(std::io::Error::other)?;
+        let mut bytes = Vec::new();
+        item.read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(
+            header::ETAG,
+            format!("\"{}-page-{idx}\"", current_content_version(&row, None)),
+        )
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .expect("page response"))
+}
+
+pub async fn get_progress(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<Option<ProgressBody>>, AppError> {
+    let publication = publication_row(&state.db, id).await?;
+    ensure_source_current(&publication).await?;
+    let row = sqlx::query(
+        "SELECT content_version,locator_json,progress FROM reading_progress WHERE publication_id=?",
     )
     .bind(id)
     .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound)?;
-
-    let full_path = ensure_snapshot(&state, id, &relative_path, &version).await?;
-    let metadata = tokio::fs::metadata(&full_path).await?;
-    let size = metadata.len();
-    let content_type = content_type_for_format(&format);
-    let etag = format!("\"{version}\"");
-    if if_match_misses(&headers, &etag) {
-        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
-    }
-    if if_none_match_hits(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok());
-
-    let Some(range) = range else {
-        let file = tokio::fs::File::open(&full_path).await?;
-        return Ok((
-            [
-                (header::CONTENT_TYPE, content_type.to_owned()),
-                (header::ACCEPT_RANGES, "bytes".to_owned()),
-                (header::CONTENT_LENGTH, size.to_string()),
-                (header::CACHE_CONTROL, "no-cache".to_owned()),
-                (header::ETAG, etag.clone()),
-            ],
-            Body::from_stream(ReaderStream::new(file)),
-        )
-            .into_response());
+    .await?;
+    let value = match row {
+        Some(row) => {
+            let stored_progress: f64 = row.try_get("progress")?;
+            let stored_version: String = row.try_get("content_version")?;
+            let locator: String = row.try_get("locator_json")?;
+            let position = serde_json::from_str::<ReadingPosition>(&locator).ok();
+            let expected_version = position
+                .as_ref()
+                .map(|position| content_version_for_position(&publication, position))
+                .unwrap_or_else(|| current_content_version(&publication, None));
+            if let Some(position) = position.filter(|_| stored_version == expected_version) {
+                Some(ProgressBody {
+                    content_version: expected_version,
+                    position,
+                })
+            } else {
+                // Keep the useful coarse progress but deliberately discard a
+                // locator tied to an older file/parser version.
+                let position = fallback_position(&state.db, &publication, stored_progress).await?;
+                Some(ProgressBody {
+                    content_version: content_version_for_position(&publication, &position),
+                    position,
+                })
+            }
+        }
+        None => None,
     };
+    Ok(Json(value))
+}
 
-    match parse_range(range, size) {
-        RangeParse::Satisfiable(ByteRange { start, end }) => {
-            let mut file = tokio::fs::File::open(&full_path).await?;
-            file.seek(SeekFrom::Start(start)).await?;
-            let length = end - start + 1;
-            let body = Body::from_stream(ReaderStream::new(file.take(length)));
-            Ok((
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, content_type.to_owned()),
-                    (header::ACCEPT_RANGES, "bytes".to_owned()),
-                    (header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}")),
-                    (header::CONTENT_LENGTH, length.to_string()),
-                    (header::CACHE_CONTROL, "no-cache".to_owned()),
-                    (header::ETAG, etag.clone()),
-                ],
-                body,
-            )
-                .into_response())
+pub async fn put_progress(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath(id): AxumPath<i64>,
+    payload: Result<Json<ProgressBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ProgressBody>, AppError> {
+    let Json(body) = payload
+        .map_err(|_| AppError::Validation("Request body must be valid progress JSON".to_owned()))?;
+    let publication = publication_row(&state.db, id).await?;
+    ensure_source_current(&publication).await?;
+    let current_version = content_version_for_position(&publication, &body.position);
+    if body.content_version != current_version {
+        return Err(AppError::Conflict {
+            code: "content_version_mismatch",
+            message: "书籍内容已变化，请重新打开后再保存进度",
+        });
+    }
+    validate_progress(&state.db, &publication, &body).await?;
+    let now = now_unix();
+    let json = serde_json::to_string(&body.position)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
+    sqlx::query("INSERT INTO reading_progress (publication_id,content_version,locator_json,progress,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(publication_id) DO UPDATE SET content_version=excluded.content_version,locator_json=excluded.locator_json,progress=excluded.progress,updated_at=excluded.updated_at").bind(id).bind(&body.content_version).bind(json).bind(body.position.progress()).bind(now).execute(&state.db).await?;
+    Ok(Json(body))
+}
+
+async fn validate_progress(
+    db: &SqlitePool,
+    publication: &PublicationRow,
+    body: &ProgressBody,
+) -> Result<(), AppError> {
+    if body.content_version.trim().is_empty() {
+        return Err(AppError::Validation(
+            "content_version is required".to_owned(),
+        ));
+    }
+    let progress = body.position.progress_raw();
+    if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+        return Err(AppError::Validation(
+            "progress must be between 0 and 1".to_owned(),
+        ));
+    }
+    match (publication.format.as_str(), &body.position) {
+        ("epub" | "mobi", ReadingPosition::Epub { href, cfi, .. })
+            if !href.trim().is_empty()
+                && cfi.trim().starts_with("epubcfi(")
+                && cfi.trim().ends_with(')') =>
+        {
+            Ok(())
         }
-        RangeParse::Unsatisfiable => Ok((
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            [
-                (header::ACCEPT_RANGES, "bytes".to_owned()),
-                (header::CONTENT_RANGE, format!("bytes */{size}")),
-            ],
-            (),
-        )
-            .into_response()),
-        RangeParse::Ignore => {
-            let file = tokio::fs::File::open(&full_path).await?;
-            Ok((
-                [
-                    (header::CONTENT_TYPE, content_type.to_owned()),
-                    (header::ACCEPT_RANGES, "bytes".to_owned()),
-                    (header::CONTENT_LENGTH, size.to_string()),
-                    (header::CACHE_CONTROL, "no-cache".to_owned()),
-                    (header::ETAG, etag.clone()),
-                ],
-                Body::from_stream(ReaderStream::new(file)),
+        (
+            "txt",
+            ReadingPosition::Txt {
+                chapter_index,
+                character_offset,
+                encoding,
+                ..
+            },
+        ) if *chapter_index >= 0 && *character_offset >= 0 && supported_encoding(encoding) => {
+            let encoding = encoding.to_ascii_lowercase();
+            let chapter_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
             )
-                .into_response())
+            .bind(publication.id)
+            .bind(&encoding)
+            .fetch_one(db)
+            .await?;
+            if chapter_count > 0 && *chapter_index >= chapter_count {
+                return Err(AppError::Validation(
+                    "chapter_index is outside the TXT chapter list".to_owned(),
+                ));
+            }
+            if let Some(byte_end) = sqlx::query_scalar::<_, i64>(
+                "SELECT byte_end FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
+            )
+            .bind(publication.id)
+            .bind(&encoding)
+            .bind(*chapter_index)
+            .fetch_optional(db)
+            .await?
+            {
+                // The client stores a character offset, while the cache stores
+                // UTF-8 byte ranges.  A byte bound is a conservative upper
+                // bound that rejects corrupt/outlandish locators without
+                // requiring the server to decode the chapter again.
+                if *character_offset > byte_end.max(0) {
+                    return Err(AppError::Validation(
+                        "character_offset is outside the TXT chapter".to_owned(),
+                    ));
+                }
+            }
+            Ok(())
         }
+        (
+            "cbz",
+            ReadingPosition::Cbz {
+                page_index,
+                page_progress,
+                ..
+            },
+        ) if *page_index >= 0
+            && page_progress.is_finite()
+            && (0.0..=1.0).contains(page_progress) =>
+        {
+            let page_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM cbz_pages WHERE publication_id=?")
+                    .bind(publication.id)
+                    .fetch_one(db)
+                    .await?;
+            if page_count > 0 && *page_index >= page_count {
+                return Err(AppError::Validation(
+                    "page_index is outside the CBZ page list".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (_, _) => Err(AppError::Validation(
+            "阅读位置与书籍格式不匹配或包含无效定位".to_owned(),
+        )),
     }
 }
 
-fn if_match_misses(headers: &HeaderMap, etag: &str) -> bool {
-    headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() != etag)
+fn supported_encoding(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "auto" | "utf-8" | "utf-16le" | "utf-16be" | "gbk" | "gb18030" | "big5"
+    )
 }
 
-fn if_none_match_hits(headers: &HeaderMap, etag: &str) -> bool {
-    headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == etag)
+async fn fallback_position(
+    db: &SqlitePool,
+    row: &PublicationRow,
+    progress: f64,
+) -> Result<ReadingPosition, AppError> {
+    let progress = progress.clamp(0.0, 1.0);
+    Ok(match row.format.as_str() {
+        "txt" => {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding='auto'",
+            )
+            .bind(row.id)
+            .fetch_one(db)
+            .await?;
+            let last = (count - 1).max(0) as f64;
+            ReadingPosition::Txt {
+                chapter_index: (progress * last).round() as i64,
+                character_offset: 0,
+                encoding: "auto".to_owned(),
+                progress,
+            }
+        }
+        "cbz" => {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM cbz_pages WHERE publication_id=?")
+                    .bind(row.id)
+                    .fetch_one(db)
+                    .await?;
+            let last = (count - 1).max(0) as f64;
+            ReadingPosition::Cbz {
+                page_index: (progress * last).round() as i64,
+                page_progress: 0.0,
+                progress,
+            }
+        }
+        _ => ReadingPosition::Epub {
+            href: String::new(),
+            cfi: String::new(),
+            progress,
+        },
+    })
 }
 
-fn content_type_for_format(format: &str) -> &'static str {
+async fn read_cached_range(path: &Path, start: u64, end: u64) -> Result<String, AppError> {
+    let length = tokio::fs::metadata(path).await?.len();
+    let start = start.min(length);
+    let end = end.min(length);
+    if end < start {
+        return Ok(String::new());
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await?;
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(end - start)
+            .map_err(|_| AppError::Validation("chapter is too large".to_owned()))?
+    ];
+    tokio::io::AsyncReadExt::read_exact(&mut file, &mut bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn render_txt_html(text: &str) -> String {
+    moth_format::txt::render_plain_html(text)
+}
+
+pub async fn conversion_status(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<ConversionResponse>, AppError> {
+    let row = publication_row(&state.db, id).await?;
+    if row.format != "mobi" {
+        return Ok(Json(ConversionResponse {
+            status: "not_required".to_owned(),
+            file_url: Some(format!("/api/v1/publications/{id}/file")),
+            error: None,
+        }));
+    }
+    ensure_source_current(&row).await?;
+    let version = current_content_version(&row, None);
+    let target = state.mobi_dir(&version).join("book.epub");
+    if target.exists() {
+        return Ok(Json(ConversionResponse {
+            status: "ready".to_owned(),
+            file_url: Some(format!("/api/v1/publications/{id}/file")),
+            error: None,
+        }));
+    }
+    let jobs = state.conversion_jobs.lock().await;
+    let response = match jobs.get(&version) {
+        Some(ConversionState::Preparing) => ConversionResponse {
+            status: "preparing".to_owned(),
+            file_url: None,
+            error: None,
+        },
+        Some(ConversionState::Failed(error)) => ConversionResponse {
+            status: "failed".to_owned(),
+            file_url: None,
+            error: Some(error.clone()),
+        },
+        _ => ConversionResponse {
+            status: "pending".to_owned(),
+            file_url: None,
+            error: None,
+        },
+    };
+    Ok(Json(response))
+}
+
+pub async fn start_conversion(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<ConversionResponse>, AppError> {
+    let row = publication_row(&state.db, id).await?;
+    if row.format != "mobi" {
+        return Ok(Json(ConversionResponse {
+            status: "not_required".to_owned(),
+            file_url: Some(format!("/api/v1/publications/{id}/file")),
+            error: None,
+        }));
+    }
+    ensure_source_current(&row).await?;
+    let version = current_content_version(&row, None);
+    let target = state.mobi_dir(&version).join("book.epub");
+    if target.exists() {
+        return Ok(Json(ConversionResponse {
+            status: "ready".to_owned(),
+            file_url: Some(format!("/api/v1/publications/{id}/file")),
+            error: None,
+        }));
+    }
+    {
+        let mut jobs = state.conversion_jobs.lock().await;
+        if jobs
+            .get(&version)
+            .is_some_and(|value| matches!(value, ConversionState::Preparing))
+        {
+            return Ok(Json(ConversionResponse {
+                status: "preparing".to_owned(),
+                file_url: None,
+                error: None,
+            }));
+        }
+        jobs.insert(version.clone(), ConversionState::Preparing);
+    }
+    let jobs = Arc::clone(&state.conversion_jobs);
+    let source = row.root.join(&row.relative_path);
+    let dir = state.mobi_dir(&version);
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || convert_mobi(&source, &dir))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|value| value.map_err(|error| error.to_string()));
+        let mut jobs = jobs.lock().await;
+        *jobs.entry(version).or_insert(ConversionState::Preparing) = match result {
+            Ok(()) => ConversionState::Ready,
+            Err(error) => ConversionState::Failed(error),
+        };
+    });
+    Ok(Json(ConversionResponse {
+        status: "preparing".to_owned(),
+        file_url: None,
+        error: None,
+    }))
+}
+
+async fn publication_row(db: &SqlitePool, id: i64) -> Result<PublicationRow, AppError> {
+    let row = sqlx::query("SELECT p.id,p.library_id,p.directory_id,p.relative_path,p.format,p.sha256,p.file_size,p.mtime_ns,p.has_cover,l.root_path FROM publications p JOIN libraries l ON l.id=p.library_id WHERE p.id=?").bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
+    Ok(PublicationRow {
+        id: row.try_get("id")?,
+        library_id: row.try_get("library_id")?,
+        directory_id: row.try_get("directory_id")?,
+        relative_path: row.try_get("relative_path")?,
+        format: row.try_get("format")?,
+        sha256: row.try_get("sha256")?,
+        file_size: row.try_get("file_size")?,
+        mtime_ns: row.try_get("mtime_ns")?,
+        has_cover: row.try_get("has_cover")?,
+        root: PathBuf::from(row.try_get::<String, _>("root_path")?),
+    })
+}
+
+struct PublicationRow {
+    id: i64,
+    library_id: i64,
+    directory_id: i64,
+    relative_path: String,
+    format: String,
+    sha256: String,
+    file_size: i64,
+    mtime_ns: i64,
+    has_cover: bool,
+    root: PathBuf,
+}
+
+pub(crate) fn content_version(hash: &str, format: &str, encoding: Option<&str>) -> String {
+    let encoding = encoding.unwrap_or("auto").to_ascii_lowercase();
+    format!("{CONTENT_ADAPTER_VERSION}-{format}-{encoding}-{hash}")
+}
+fn current_content_version(row: &PublicationRow, encoding: Option<&str>) -> String {
+    content_version(&row.sha256, &row.format, encoding)
+}
+fn content_version_for_position(row: &PublicationRow, position: &ReadingPosition) -> String {
+    let encoding = match position {
+        ReadingPosition::Txt { encoding, .. } => Some(encoding.as_str()),
+        _ => None,
+    };
+    current_content_version(row, encoding)
+}
+fn mime_for_format(format: &str) -> &'static str {
     match format {
         "epub" => "application/epub+zip",
-        "mobi" => "application/x-mobipocket-ebook",
         "cbz" => "application/vnd.comicbook+zip",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
 
-fn is_content_version(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-#[derive(Deserialize)]
-pub struct ChapterQuery {
-    /// Optional explicit encoding label for TXT books (`utf-8`, `gb18030`,
-    /// `gbk`, `big5`, `utf-16le`, `utf-16be`). When set, the chapter is
-    /// re-decoded from the original file with that encoding instead of the
-    /// auto-detected one the scan used.
-    pub encoding: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-pub struct BookListQuery {
-    pub section_id: Option<i64>,
-    pub series_id: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub struct VersionQuery {
-    pub v: Option<String>,
-}
-
-/// Empty and `auto` select the encoding detected during the library scan.
-/// Only an explicit supported label triggers a re-parse of the original file.
-fn requested_txt_encoding(query: &ChapterQuery) -> Option<&str> {
-    query
-        .encoding
-        .as_deref()
-        .map(str::trim)
-        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("auto"))
-}
-
-fn valid_encoding(label: &str) -> bool {
-    matches!(
-        label.to_ascii_lowercase().as_str(),
-        "utf-8" | "gb18030" | "gbk" | "big5" | "utf-16le" | "utf-16be"
-    )
-}
-
-/// Normalize a client supplied progress encoding. TXT locations must carry a
-/// stable label so positions decoded with different codecs are never merged;
-/// the other formats have no text codec and therefore always use `None`.
-fn normalize_progress_encoding(
-    format: &str,
-    encoding: Option<&str>,
-) -> Result<Option<String>, AppError> {
-    if format != "txt" {
-        return Ok(None);
-    }
-    let value = encoding.map(str::trim).unwrap_or("auto");
-    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
-        return Ok(Some("auto".to_owned()));
-    }
-    if valid_encoding(value) {
-        Ok(Some(value.to_ascii_lowercase()))
-    } else {
-        Err(AppError::Validation("Unsupported text encoding".to_owned()))
-    }
-}
-
-/// Normalize a value read from the database for API responses and conflict
-/// checks. Rows created before the encoding migration have NULL, which is the
-/// legacy auto-detected TXT decoder.
-fn stored_progress_encoding(format: &str, encoding: Option<String>) -> Option<String> {
-    if format == "txt" {
-        Some(
-            encoding
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_else(|| "auto".to_owned()),
-        )
-    } else {
-        None
-    }
-}
-
-async fn cached_txt_chapters(
-    state: &AppState,
-    book_id: i64,
-    content_version: &str,
-    encoding: &str,
-    path: PathBuf,
-) -> Result<Arc<Vec<moth_format::Chapter>>, AppError> {
-    let key = TxtCacheKey {
-        book_id,
-        content_version: content_version.to_owned(),
-        encoding: encoding.to_ascii_lowercase(),
-        parser_version: TXT_PARSER_VERSION,
-    };
-    if let Some(chapters) = state.txt_cache.lock().await.get(&key).cloned() {
-        return Ok(chapters);
-    }
-    let parser_encoding = key.encoding.clone();
-    let parsed = tokio::task::spawn_blocking(move || {
-        moth_format::txt::parse_with_encoding(&path, Some(&parser_encoding))
-    })
-    .await
-    .map_err(|error| AppError::Io(std::io::Error::other(error)))?
-    .map_err(|error| AppError::Io(std::io::Error::other(error.to_string())))?;
-    let chapters = Arc::new(parsed.chapters);
-    state
-        .txt_cache
-        .lock()
-        .await
-        .insert(key, Arc::clone(&chapters));
-    Ok(chapters)
-}
-
-/// Make a verified immutable copy of a source file. The database hash is the
-/// content version advertised to clients; if the source changed underneath a
-/// scan, serving it with the old ETag would make Range readers mix bytes.
-async fn ensure_snapshot(
-    state: &AppState,
-    book_id: i64,
-    relative: &str,
-    version: &str,
-) -> Result<PathBuf, AppError> {
-    let source = resolve_library_file(state, relative).await?;
-    let snapshots = state.snapshots_dir().join(book_id.to_string());
-    let target = snapshots.join(format!("{version}.bin"));
-    let version = version.to_owned();
-    let result = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
-        std::fs::create_dir_all(&snapshots).map_err(|error| error.to_string())?;
-
-        // A snapshot is immutable once its SHA-256 matches the database
-        // version. Reusing it avoids copying and hashing the read-only source
-        // for every HTTP Range request. If it is missing or corrupt, rebuild
-        // it atomically below.
-        if target.is_file()
-            && hash_file(&target)
-                .map(|(hash, _)| hash == version)
-                .unwrap_or(false)
-        {
-            return Ok(target);
-        }
-
-        let mut input = std::fs::File::open(&source).map_err(|error| error.to_string())?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let sequence = SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = snapshots.join(format!(".{}.{}.{}.tmp", version, nonce, sequence));
-        // `create_new` keeps concurrent requests from ever writing the same
-        // temporary file, even on filesystems whose clock has coarse
-        // resolution.
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 128 * 1024];
-        loop {
-            let read = input.read(&mut buffer).map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..read])
-                .map_err(|error| error.to_string())?;
-            hasher.update(&buffer[..read]);
-        }
-        output.sync_all().map_err(|error| error.to_string())?;
-        let actual = hex::encode(hasher.finalize());
-        if actual != version {
-            let _ = std::fs::remove_file(&temporary);
-            return Err("content_changed".to_owned());
-        }
-
-        let existing_valid = if target.exists() {
-            let mut file = std::fs::File::open(&target).map_err(|error| error.to_string())?;
-            let mut digest = Sha256::new();
-            let mut buf = [0_u8; 128 * 1024];
-            loop {
-                let read = file.read(&mut buf).map_err(|error| error.to_string())?;
-                if read == 0 {
-                    break;
-                }
-                digest.update(&buf[..read]);
-            }
-            hex::encode(digest.finalize()) == version
+async fn ensure_source_current(row: &PublicationRow) -> Result<PathBuf, AppError> {
+    let path = row.root.join(&row.relative_path);
+    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::NotFound
         } else {
-            false
-        };
-        if existing_valid {
-            let _ = std::fs::remove_file(&temporary);
-        } else {
-            match std::fs::rename(&temporary, &target) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Windows does not replace an existing destination. A
-                    // competing writer either installed the same valid hash
-                    // or left a corrupt partial target; retain/replace it
-                    // accordingly.
-                    let target_valid = std::fs::File::open(&target)
-                        .ok()
-                        .and_then(|mut file| {
-                            let mut digest = Sha256::new();
-                            let mut buf = [0_u8; 128 * 1024];
-                            loop {
-                                match file.read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(read) => digest.update(&buf[..read]),
-                                    Err(_) => return None,
-                                }
-                            }
-                            Some(hex::encode(digest.finalize()) == version)
-                        })
-                        .unwrap_or(false);
-                    if target_valid {
-                        let _ = std::fs::remove_file(&temporary);
-                    } else {
-                        std::fs::remove_file(&target).map_err(|error| error.to_string())?;
-                        std::fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
-                    }
-                }
-                Err(error) => return Err(error.to_string()),
-            }
+            AppError::Io(error)
         }
-        Ok(target)
-    })
-    .await
-    .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
-    result.map_err(|error| {
-        if error == "content_changed" {
-            AppError::Conflict {
-                code: "content_changed",
-                message: "The source file changed; rescan the library before reading it",
-            }
-        } else {
-            AppError::Io(std::io::Error::other(error))
-        }
-    })
-}
-
-/// Resolve a database relative path without allowing traversal or symlink
-/// escapes from the configured read-only library directory.
-async fn resolve_library_file(state: &AppState, relative: &str) -> Result<PathBuf, AppError> {
-    let relative_path = Path::new(relative);
-    if relative_path.is_absolute()
-        || relative_path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        tracing::error!(%relative, "book path escaped library root");
-        return Err(AppError::NotFound);
-    }
-    let root = tokio::fs::canonicalize(&state.config.books_dir)
-        .await
-        .map_err(|_| AppError::NotFound)?;
-    let full = tokio::fs::canonicalize(root.join(relative_path))
-        .await
-        .map_err(|_| AppError::NotFound)?;
-    if !full.starts_with(&root) || !full.is_file() {
-        return Err(AppError::NotFound);
-    }
-    Ok(full)
-}
-
-pub async fn get_chapter(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
-    Query(query): Query<ChapterQuery>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let row = sqlx::query(
-        "SELECT b.format, b.relative_path, b.sha256, b.missing, c.title, c.content \
-         FROM chapters c JOIN books b ON b.id = c.book_id \
-         WHERE c.book_id = ? AND c.idx = ?",
-    )
-    .bind(book_id)
-    .bind(idx)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound)?;
-    let format: String = row.try_get("format")?;
-    let relative_path: String = row.try_get("relative_path")?;
-    let content_version: String = row.try_get("sha256")?;
-    let missing: bool = row.try_get("missing")?;
-    // A missing source can still serve the last indexed chapter HTML. Only
-    // explicit TXT re-decoding needs the original bytes and therefore still
-    // requires a snapshot.
-    let snapshot_path = if missing {
-        None
-    } else {
-        Some(ensure_snapshot(&state, book_id, &relative_path, &content_version).await?)
-    };
-    let etag = format!("\"{content_version}\"");
-    if if_match_misses(&headers, &etag) {
-        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
-    }
-    if if_none_match_hits(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-
-    let requested_encoding = requested_txt_encoding(&query);
-    let (title, content) = if format == "txt"
-        && let Some(encoding) = requested_encoding
-    {
-        // The stored chapters were rendered with the detected encoding. For a
-        // manual override, re-read the original file, re-decode it, and serve
-        // the requested chapter so a wrong guess is fixed without a rescan.
-        if !valid_encoding(encoding) {
-            return Err(AppError::Validation("Unsupported text encoding".to_owned()));
-        }
-        let snapshot = snapshot_path.ok_or(AppError::NotFound)?;
-        let book =
-            cached_txt_chapters(&state, book_id, &content_version, encoding, snapshot).await?;
-        let chapter = book.get(idx as usize).ok_or_else(|| AppError::NotFound)?;
-        (chapter.title.clone(), chapter.content.clone())
-    } else {
-        (row.try_get("title")?, row.try_get("content")?)
-    };
-
-    Ok((
-        [(header::ETAG, etag)],
-        Json(ChapterContent {
-            idx,
-            title,
-            content,
-            encoding: (format == "txt").then(|| {
-                requested_encoding
-                    .map(str::to_ascii_lowercase)
-                    .unwrap_or_else(|| "auto".to_owned())
-            }),
-            parser_version: (format == "txt").then(|| TXT_PARSER_VERSION.to_owned()),
-        }),
-    )
-        .into_response())
-}
-
-pub async fn get_resource(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let row = sqlx::query(
-        "SELECT r.mime, r.path AS source_path, b.relative_path, b.sha256, b.missing FROM resources r JOIN books b ON b.id = r.book_id \
-         WHERE r.book_id = ? AND r.idx = ?",
-    )
-    .bind(book_id)
-    .bind(idx)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound)?;
-    let mime: String = row.try_get("mime")?;
-    let source_path: String = row.try_get("source_path")?;
-    let relative_path: String = row.try_get("relative_path")?;
-    let version: String = row.try_get("sha256")?;
-    let missing: bool = row.try_get("missing")?;
-    if !missing {
-        ensure_snapshot(&state, book_id, &relative_path, &version).await?;
-    }
-    let etag = format!("\"{version}\"");
-    if if_match_misses(&headers, &etag) {
-        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
-    }
-    if if_none_match_hits(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-    let path = state.resource_path(book_id, &version, idx);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(AppError::NotFound),
-    };
-    let mut response = (
-        [
-            (header::CONTENT_TYPE, mime),
-            (header::ETAG, etag),
-            (header::CACHE_CONTROL, "no-cache".to_owned()),
-        ],
-        bytes,
-    )
-        .into_response();
-    // The client uses the original archive path to rebuild CSS dependencies
-    // from cached blobs. Invalid/non-ASCII paths are simply omitted; the
-    // numeric resource remains usable without dependency rewriting.
-    if let Ok(value) = source_path.parse() {
-        response.headers_mut().insert(
-            header::HeaderName::from_static("x-moth-resource-path"),
-            value,
-        );
-    }
-    Ok(response)
-}
-
-pub async fn get_page(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath((book_id, idx)): AxumPath<(i64, i64)>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let (entry_name, mime, file_path, version, missing) =
-        sqlx::query_as::<_, (String, String, String, String, bool)>(
-            "SELECT p.path, p.mime, b.relative_path, b.sha256, b.missing FROM pages p \
-         JOIN books b ON b.id = p.book_id WHERE p.book_id = ? AND p.idx = ?",
-        )
-        .bind(book_id)
-        .bind(idx)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound)?;
-
-    let etag = format!("\"{version}\"");
-    if missing {
-        return Err(AppError::NotFound);
-    }
-    let snapshot_path = ensure_snapshot(&state, book_id, &file_path, &version).await?;
-    if if_match_misses(&headers, &etag) {
-        return Ok((StatusCode::PRECONDITION_FAILED, [(header::ETAG, etag)]).into_response());
-    }
-    if if_none_match_hits(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-
-    let bytes = tokio::task::spawn_blocking(move || read_cbz_page(&snapshot_path, &entry_name))
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
-
-    Ok((
-        [
-            (header::CONTENT_TYPE, mime),
-            (header::ETAG, format!("\"{version}\"")),
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable".to_owned(),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-
-fn read_cbz_page(path: &Path, entry_name: &str) -> Result<Vec<u8>, AppError> {
-    let file = std::fs::File::open(path)?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| AppError::Archive(error.to_string()))?;
-    let mut entry = archive
-        .by_name(entry_name)
-        .map_err(|error| AppError::Archive(error.to_string()))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes).map_err(AppError::Io)?;
-    Ok(bytes)
-}
-
-pub async fn get_progress(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath(book_id): AxumPath<i64>,
-) -> Result<Json<ProgressBody>, AppError> {
-    let format: Option<String> = sqlx::query_scalar("SELECT format FROM books WHERE id = ?")
-        .bind(book_id)
-        .fetch_optional(&state.db)
-        .await?;
-    let format = format.as_deref().unwrap_or("");
-    let progress = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            f64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT chapter_index, page_index, percent, revision, content_version, cfi, encoding FROM reading_progress WHERE book_id = ?",
-    )
-    .bind(book_id)
-    .fetch_optional(&state.db)
-    .await?
-    .map(
-        |(chapter_index, page_index, percent, revision, content_version, cfi, encoding)| {
-            ProgressBody {
-                chapter_index,
-                page_index,
-                percent,
-                revision: Some(revision),
-                content_version,
-                cfi,
-                encoding: stored_progress_encoding(format, encoding),
-            }
-        },
-    )
-    .unwrap_or(ProgressBody {
-        chapter_index: 0,
-        page_index: 0,
-        percent: 0.0,
-        revision: None,
-        content_version: None,
-        cfi: None,
-        encoding: None,
-    });
-    Ok(Json(progress))
-}
-
-pub async fn put_progress(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath(book_id): AxumPath<i64>,
-    Json(body): Json<ProgressBody>,
-) -> Result<StatusCode, AppError> {
-    let (version, format) =
-        sqlx::query_as::<_, (String, String)>("SELECT sha256, format FROM books WHERE id = ?")
-            .bind(book_id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or(AppError::NotFound)?;
-    let encoding = normalize_progress_encoding(&format, body.encoding.as_deref())?;
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let percent = body.percent.clamp(0.0, 100.0);
-    sqlx::query(
-        "INSERT INTO reading_progress (book_id, chapter_index, page_index, percent, updated_at, revision, content_version, cfi, encoding) \
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?) \
-         ON CONFLICT(book_id) DO UPDATE SET chapter_index = excluded.chapter_index, \
-         page_index = excluded.page_index, percent = excluded.percent, \
-         updated_at = excluded.updated_at, revision = reading_progress.revision + 1, \
-         content_version = excluded.content_version, cfi = excluded.cfi, encoding = excluded.encoding",
-    )
-    .bind(book_id)
-    .bind(body.chapter_index.max(0))
-    .bind(body.page_index.max(0))
-    .bind(percent)
-    .bind(now)
-    .bind(version)
-    .bind(body.cfi)
-    .bind(encoding)
-    .execute(&state.db)
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Merge an offline progress operation. The operation id makes retries
-/// idempotent; when another device advanced the same book, the larger
-/// percentage wins as agreed by the product contract.
-pub async fn sync_progress(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath(book_id): AxumPath<i64>,
-    Json(body): Json<ProgressSyncBody>,
-) -> Result<Json<ProgressSyncResponse>, AppError> {
-    if body.operation_id.trim().is_empty() || body.operation_id.len() > 128 {
-        return Err(AppError::Validation(
-            "operation_id must contain 1–128 characters".to_owned(),
-        ));
-    }
-    let (current_version, format) =
-        sqlx::query_as::<_, (String, String)>("SELECT sha256, format FROM books WHERE id = ?")
-            .bind(book_id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or(AppError::NotFound)?;
-    if body.content_version != current_version {
+    })?;
+    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or(0);
+    if size != row.file_size || mtime != row.mtime_ns {
         return Err(AppError::Conflict {
-            code: "content_changed",
-            message: "The book changed; download it again before syncing progress",
+            code: "source_changed",
+            message: "源文件已变化，请先重新扫描书库",
         });
     }
-    let incoming_encoding = normalize_progress_encoding(&format, body.encoding.as_deref())?;
-
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let mut tx = state.db.begin().await?;
-    // Reserve the operation id inside the same write transaction as the
-    // progress update. A plain read-then-insert check races when a browser
-    // retries the same request concurrently and would turn an idempotent
-    // operation into a unique-constraint error.
-    let inserted = sqlx::query(
-        "INSERT INTO progress_operations (book_id, operation_id, revision, created_at) VALUES (?, ?, 0, ?) \
-         ON CONFLICT(book_id, operation_id) DO NOTHING",
-    )
-    .bind(book_id)
-    .bind(&body.operation_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected()
-        > 0;
-    if !inserted {
-        let progress = read_progress(&mut tx, book_id, current_version.clone(), &format).await?;
-        tx.commit().await?;
-        // A retry may arrive after a newer operation has advanced the book;
-        // return the current revision so the client does not move its base
-        // revision backwards to the operation's historical revision.
-        let current_revision = progress.revision.unwrap_or(0);
-        return Ok(Json(ProgressSyncResponse {
-            progress,
-            revision: current_revision,
-            conflict: false,
-        }));
-    }
-
-    let current = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            f64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT chapter_index, page_index, percent, revision, content_version, cfi, encoding FROM reading_progress WHERE book_id = ?",
-    )
-    .bind(book_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let (current_progress, current_revision, same_location_version) = match current {
-        Some((chapter_index, page_index, percent, revision, version, cfi, encoding)) => {
-            let same_content_version = version.as_deref() == Some(current_version.as_str());
-            let current_encoding = stored_progress_encoding(&format, encoding);
-            let same_encoding = current_encoding == incoming_encoding;
-            (
-                ProgressBody {
-                    chapter_index: if same_content_version {
-                        chapter_index
-                    } else {
-                        0
-                    },
-                    page_index: if same_content_version { page_index } else { 0 },
-                    percent: if same_content_version { percent } else { 0.0 },
-                    revision: Some(revision),
-                    content_version: version,
-                    cfi: if same_content_version && same_encoding {
-                        cfi
-                    } else {
-                        None
-                    },
-                    encoding: current_encoding,
-                },
-                revision,
-                same_content_version && same_encoding,
-            )
-        }
-        None => (
-            ProgressBody {
-                chapter_index: 0,
-                page_index: 0,
-                percent: 0.0,
-                revision: Some(0),
-                content_version: Some(current_version.clone()),
-                cfi: None,
-                encoding: stored_progress_encoding(&format, None),
-            },
-            0,
-            stored_progress_encoding(&format, None) == incoming_encoding,
-        ),
-    };
-    let incoming = ProgressBody {
-        chapter_index: body.chapter_index.max(0),
-        page_index: body.page_index.max(0),
-        percent: body.percent.clamp(0.0, 100.0),
-        revision: None,
-        content_version: Some(current_version.clone()),
-        cfi: body.cfi.clone(),
-        encoding: incoming_encoding,
-    };
-    let conflict = same_location_version && body.base_revision != current_revision;
-    let winner = if conflict && incoming.percent <= current_progress.percent {
-        current_progress
-    } else {
-        incoming
-    };
-    let revision = current_revision.saturating_add(1);
-    sqlx::query(
-        "INSERT INTO reading_progress (book_id, chapter_index, page_index, percent, updated_at, revision, content_version, cfi, encoding) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(book_id) DO UPDATE SET chapter_index = excluded.chapter_index, page_index = excluded.page_index, \
-         percent = excluded.percent, updated_at = excluded.updated_at, revision = excluded.revision, content_version = excluded.content_version, cfi = excluded.cfi, encoding = excluded.encoding",
-    )
-    .bind(book_id)
-    .bind(winner.chapter_index)
-    .bind(winner.page_index)
-    .bind(winner.percent)
-    .bind(now)
-    .bind(revision)
-    .bind(current_version.clone())
-    .bind(winner.cfi.clone())
-    .bind(winner.encoding.clone())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "UPDATE progress_operations SET revision = ? WHERE book_id = ? AND operation_id = ?",
-    )
-    .bind(revision)
-    .bind(book_id)
-    .bind(&body.operation_id)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    let mut progress = winner;
-    progress.revision = Some(revision);
-    progress.content_version = Some(current_version);
-    Ok(Json(ProgressSyncResponse {
-        progress,
-        revision,
-        conflict,
-    }))
+    Ok(path)
 }
 
-async fn read_progress(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    book_id: i64,
-    version: String,
-    format: &str,
-) -> Result<ProgressBody, AppError> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            f64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT chapter_index, page_index, percent, revision, content_version, cfi, encoding FROM reading_progress WHERE book_id = ?",
-    )
-    .bind(book_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(row
-        .map(
-            |(chapter_index, page_index, percent, revision, content_version, cfi, encoding)| {
-                ProgressBody {
-                    chapter_index,
-                    page_index,
-                    percent,
-                    revision: Some(revision),
-                    content_version: content_version.or(Some(version.clone())),
-                    cfi,
-                    encoding: stored_progress_encoding(format, encoding),
-                }
-            },
+async fn range_response(
+    path: &Path,
+    headers: &HeaderMap,
+    mime: &'static str,
+    etag: &str,
+) -> Result<Response, AppError> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let total = metadata.len();
+    let common = |builder: axum::http::response::Builder| {
+        builder
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "no-cache")
+    };
+    let Some(value) = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        let bytes = tokio::fs::read(path).await?;
+        return Ok(common(Response::builder())
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+            .expect("file response"));
+    };
+    let Some((start, end)) = parse_range(value, total) else {
+        return Ok(common(Response::builder())
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(Body::empty())
+            .expect("range response"));
+    };
+    let length = end - start + 1;
+    let mut file = tokio::fs::File::open(path).await?;
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await?;
+    let mut body = vec![
+        0_u8;
+        usize::try_from(length).map_err(|_| AppError::Validation(
+            "requested range is too large".to_owned()
+        ))?
+    ];
+    tokio::io::AsyncReadExt::read_exact(&mut file, &mut body).await?;
+    Ok(common(Response::builder())
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
         )
-        .unwrap_or(ProgressBody {
-            chapter_index: 0,
-            page_index: 0,
-            percent: 0.0,
-            revision: Some(0),
-            content_version: Some(version),
-            cfi: None,
-            encoding: stored_progress_encoding(format, None),
-        }))
+        .header(header::CONTENT_LENGTH, body.len())
+        .body(Body::from(body))
+        .expect("range response"))
 }
 
-pub async fn scan_status(
-    State(state): State<AppState>,
-    _user: Authenticated,
-) -> Result<Json<ScanStatusResponse>, AppError> {
-    let status = state.scan_status.lock().await.clone();
-    Ok(Json(ScanStatusResponse {
-        scanning: status.scanning,
-        processed: status.processed,
-        total: status.total,
-        errors: status.errors,
-        message: status.message,
-    }))
+fn parse_range(value: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let range = value.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let length = suffix.min(total);
+        return Some((total - length, total - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().ok()?.min(total - 1)
+    };
+    (start <= end).then_some((start, end))
+}
+
+fn convert_mobi(source: &Path, directory: &Path) -> Result<(), AppError> {
+    std::fs::create_dir_all(directory)?;
+    let target = directory.join("book.epub");
+    let book = mobi::Mobi::from_path(source).map_err(mobi_conversion_error)?;
+    let text = match book.content_as_string() {
+        Ok(text) => text,
+        Err(_) => book.content_as_string_lossy(),
+    };
+    if text.trim().is_empty() {
+        return Err(mobi_conversion_error("没有可读取的正文"));
+    }
+    let title = xml_escape(&book.title());
+    let author = xml_escape(&book.author().unwrap_or_default());
+    let mut image_items = Vec::new();
+    let mut image_paths = std::collections::HashMap::new();
+    for record in book.image_records() {
+        let Some((extension, mime)) = mobi_image_type(record.content) else {
+            continue;
+        };
+        let path = format!("images/record-{}.{}", record.record.id, extension);
+        image_paths.insert(record.record.id, path.clone());
+        image_items.push((path, mime, record.content.to_vec()));
+    }
+    let mut html = if text.to_ascii_lowercase().contains("<html") {
+        moth_format::html::sanitize_and_rewrite(&text, "", &std::collections::HashMap::new(), "")
+    } else {
+        format!("<p>{}</p>", xml_escape(&text).replace('\n', "</p><p>"))
+    };
+    // Classic MOBI embeds image references as `recindex` attributes. Repoint
+    // those references at the image entries written into the generated EPUB.
+    for (record_id, path) in &image_paths {
+        for quote in [
+            format!("recindex=\"{record_id}\""),
+            format!("recindex='{record_id}'"),
+        ] {
+            html = html.replace(&quote, &format!("src=\"{path}\""));
+        }
+    }
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default();
+    writer
+        .start_file("mimetype", stored)
+        .map_err(|error| AppError::Archive(error.to_string()))?;
+    writer.write_all(b"application/epub+zip")?;
+    writer
+        .start_file("META-INF/container.xml", deflated)
+        .map_err(|error| AppError::Archive(error.to_string()))?;
+    writer.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
+    writer
+        .start_file("OEBPS/content.opf", deflated)
+        .map_err(|error| AppError::Archive(error.to_string()))?;
+    let image_manifest = image_items
+        .iter()
+        .enumerate()
+        .map(|(index, (path, mime, _))| {
+            format!("<item id=\"image-{index}\" href=\"{path}\" media-type=\"{mime}\"/>")
+        })
+        .collect::<String>();
+    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">moth-{}</dc:identifier><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata><manifest><item id="chapter-1" href="chapter-1.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{image_manifest}</manifest><spine><itemref idref="chapter-1"/></spine></package>"#, uuidish(&title)).as_bytes())?;
+    writer
+        .start_file("OEBPS/chapter-1.xhtml", deflated)
+        .map_err(|error| AppError::Archive(error.to_string()))?;
+    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body>{html}</body></html>"#).as_bytes())?;
+    writer
+        .start_file("OEBPS/nav.xhtml", deflated)
+        .map_err(|error| AppError::Archive(error.to_string()))?;
+    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{title}</title></head><body><nav epub:type="toc" id="toc"><h2>{title}</h2><ol><li><a href="chapter-1.xhtml">{title}</a></li></ol></nav></body></html>"#).as_bytes())?;
+    for (path, _mime, bytes) in image_items {
+        writer
+            .start_file(format!("OEBPS/{path}"), deflated)
+            .map_err(|error| AppError::Archive(error.to_string()))?;
+        writer.write_all(&bytes)?;
+    }
+    let bytes = writer
+        .finish()
+        .map_err(|error| AppError::Archive(error.to_string()))?
+        .into_inner();
+    let temp = target.with_extension("tmp");
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(temp, target)?;
+    Ok(())
+}
+
+fn mobi_conversion_error(error: impl std::fmt::Display) -> AppError {
+    AppError::Validation(format!(
+        "MOBI 不支持、包含 DRM 或已损坏，请转换为 EPUB：{error}"
+    ))
+}
+
+fn mobi_image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("png", "image/png"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(("gif", "image/gif"))
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some(("webp", "image/webp"))
+    } else if bytes.starts_with(b"BM") {
+        Some(("bmp", "image/bmp"))
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(("jpg", "image/jpeg"))
+    } else {
+        None
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+fn uuidish(value: &str) -> String {
+    format!("{:x}", md5_like(value.as_bytes()))
+}
+fn md5_like(bytes: &[u8]) -> u64 {
+    let mut value = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x100000001b3);
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn satisfied(header: &str, size: u64) -> Option<ByteRange> {
-        match parse_range(header, size) {
-            RangeParse::Satisfiable(range) => Some(range),
-            _ => None,
-        }
+    #[test]
+    fn parses_single_and_suffix_ranges() {
+        assert_eq!(parse_range("bytes=0-9", 20), Some((0, 9)));
+        assert_eq!(parse_range("bytes=10-", 20), Some((10, 19)));
+        assert_eq!(parse_range("bytes=-4", 20), Some((16, 19)));
+        assert_eq!(parse_range("bytes=20-", 20), None);
+        assert_eq!(parse_range("bytes=0-1,4-5", 20), Some((0, 1)));
     }
 
     #[test]
-    fn parses_closed_ranges() {
+    fn converts_fixture_to_minimal_epub3() {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../moth-format/tests/fixtures/alice.mobi");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        convert_mobi(&source, temp.path()).expect("classic MOBI conversion");
+        let file = std::fs::File::open(temp.path().join("book.epub")).expect("converted EPUB");
+        let mut archive = ZipArchive::new(file).expect("valid EPUB zip");
         assert_eq!(
-            satisfied("bytes=0-4", 100),
-            Some(ByteRange { start: 0, end: 4 })
+            archive.by_name("mimetype").expect("mimetype").size(),
+            "application/epub+zip".len() as u64
         );
-        assert_eq!(
-            satisfied("bytes=95-200", 100),
-            Some(ByteRange { start: 95, end: 99 })
-        );
-        assert_eq!(
-            satisfied("bytes=10-10", 100),
-            Some(ByteRange { start: 10, end: 10 })
-        );
-    }
-
-    #[test]
-    fn parses_open_ended_and_suffix_ranges() {
-        assert_eq!(
-            satisfied("bytes=90-", 100),
-            Some(ByteRange { start: 90, end: 99 })
-        );
-        assert_eq!(
-            satisfied("bytes=-10", 100),
-            Some(ByteRange { start: 90, end: 99 })
-        );
-        // A suffix longer than the file covers the whole file.
-        assert_eq!(
-            satisfied("bytes=-500", 100),
-            Some(ByteRange { start: 0, end: 99 })
-        );
-    }
-
-    #[test]
-    fn rejects_unsatisfiable_ranges() {
-        assert!(matches!(
-            parse_range("bytes=-1", 0),
-            RangeParse::Unsatisfiable
-        ));
-        assert!(matches!(
-            parse_range("bytes=100-", 100),
-            RangeParse::Unsatisfiable
-        ));
-        assert!(matches!(
-            parse_range("bytes=100-200", 100),
-            RangeParse::Unsatisfiable
-        ));
-        assert!(matches!(
-            parse_range("bytes=5-2", 100),
-            RangeParse::Unsatisfiable
-        ));
-        assert!(matches!(
-            parse_range("bytes=-0", 100),
-            RangeParse::Unsatisfiable
-        ));
-    }
-
-    #[test]
-    fn ignores_other_or_malformed_headers() {
-        assert!(matches!(parse_range("items=0-1", 100), RangeParse::Ignore));
-        assert!(matches!(
-            parse_range("bytes=0-1,4-5", 100),
-            RangeParse::Ignore
-        ));
-        assert!(matches!(parse_range("bytes=abc", 100), RangeParse::Ignore));
-        assert!(matches!(parse_range("bytes=-", 100), RangeParse::Ignore));
+        assert!(archive.by_name("OEBPS/content.opf").is_ok());
+        assert!(archive.by_name("OEBPS/nav.xhtml").is_ok());
+        assert!(archive.by_name("OEBPS/chapter-1.xhtml").is_ok());
     }
 }

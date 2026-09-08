@@ -42,8 +42,6 @@ fn main() {
     let (gbk, _, _) = encoding_rs::GBK.encode(&legacy_text);
     std::fs::write(target.join("Legacy GBK.txt"), gbk).expect("write gbk");
     std::fs::write(target.join("Broken.epub"), b"not a zip").expect("broken epub");
-    std::fs::write(target.join("Experimental.azw3"), b"unsupported KF8 fixture")
-        .expect("broken azw3");
 
     // CBZ: three pages exercising natural sort order.
     let cbz = std::fs::File::create(target.join("晨光短篇.cbz")).expect("create cbz");

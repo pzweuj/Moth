@@ -1,7 +1,11 @@
 //! Plain-text parsing: encoding detection, decoding, and chapter splitting.
 
-use std::path::Path;
 use std::sync::OnceLock;
+use std::{
+    fs::File,
+    io::{BufReader, Read},
+    path::Path,
+};
 
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
@@ -22,8 +26,10 @@ fn chapter_marker() -> &'static Regex {
 fn cjk_marker() -> &'static Regex {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     MARKER.get_or_init(|| {
-        Regex::new(r"^\s*第\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[章节回卷部篇]\b?")
-            .expect("cjk marker")
+        Regex::new(
+            r"^\s*(?:第\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[章节回卷部篇]|卷\s*[0-9０-９一二三四五六七八九十百千零〇]+|楔子|序章|序言|终章|终回|番外(?:篇|章)?|后记|尾声|引子)",
+        )
+        .expect("cjk marker")
     })
 }
 
@@ -62,6 +68,63 @@ fn decode(bytes: &[u8]) -> String {
     } else {
         decoded.into_owned()
     }
+}
+
+/// Decode a text file incrementally.  Encoding detection only needs a small
+/// prefix; the remainder is fed through `encoding_rs`'s stateful decoder so a
+/// multi-byte character split across read buffers is handled correctly.
+fn decode_file(path: &Path, requested: Option<&str>) -> Result<String, ParseError> {
+    const SAMPLE_SIZE: usize = 64 * 1024;
+    const BUFFER_SIZE: usize = 64 * 1024;
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
+    let mut sample = vec![0_u8; SAMPLE_SIZE];
+    let sample_len = reader.read(&mut sample)?;
+    let sample = &sample[..sample_len];
+    let encoding = requested
+        .and_then(|label| match label.to_ascii_lowercase().as_str() {
+            "utf-8" => Some(UTF_8),
+            "gb18030" => Some(encoding_rs::GB18030),
+            "gbk" => Some(encoding_rs::GBK),
+            "big5" => Some(encoding_rs::BIG5),
+            "utf-16le" => Some(UTF_16LE),
+            "utf-16be" => Some(UTF_16BE),
+            _ => None,
+        })
+        .unwrap_or_else(|| detect_encoding(sample));
+
+    let mut decoder = encoding.new_decoder();
+    let mut output = String::new();
+    let mut feed = |bytes: &[u8], last: bool| {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            // UTF-8 output can be up to four times larger than the input.
+            // Reserve enough room so the decoder normally consumes a whole
+            // chunk, while retaining a loop for pathological replacement
+            // expansion or an unexpectedly full String capacity.
+            output.reserve(bytes[offset..].len().saturating_mul(4).saturating_add(4));
+            let (_, read, _) = decoder.decode_to_string(&bytes[offset..], &mut output, last);
+            if read == 0 {
+                break;
+            }
+            offset += read;
+        }
+        if last {
+            let _ = decoder.decode_to_string(&[], &mut output, true);
+        }
+    };
+    feed(sample, false);
+
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            feed(&[], true);
+            break;
+        }
+        feed(&buffer[..read], false);
+    }
+    Ok(output)
 }
 
 fn normalize(text: &str) -> String {
@@ -208,6 +271,13 @@ fn render_html(body: &str) -> String {
     out
 }
 
+/// Render a normalized UTF-8 TXT slice only after it has been read from the
+/// byte-range cache. Keeping this separate from indexing avoids storing a
+/// complete HTML copy of a large novel in SQLite or the cache directory.
+pub fn render_plain_html(body: &str) -> String {
+    render_html(body)
+}
+
 fn is_heading(text: &str) -> bool {
     let text = text.trim();
     if text.len() > 60 || text.is_empty() {
@@ -255,17 +325,15 @@ pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
 /// Parse a plain-text book, optionally decoding with an explicit encoding
 /// label (see [`decode_with`]) instead of auto-detection.
 pub fn parse_with_encoding(path: &Path, encoding: Option<&str>) -> Result<ParsedBook, ParseError> {
-    let bytes = std::fs::read(path)?;
-    let decoded = match encoding {
-        Some(label) => decode_with(label, &bytes),
-        None => decode(&bytes),
-    };
-    let text = normalize(&decoded);
-    if text.trim().is_empty() {
-        return Err(ParseError::NoContent);
-    }
-
-    let chapters = split_and_render(&text, path);
+    let plain_chapters = normalized_chapters(path, encoding)?;
+    let chapters = plain_chapters
+        .iter()
+        .map(|(title, body)| Chapter {
+            title: title.clone(),
+            content: render_html(body),
+            base_dir: String::new(),
+        })
+        .collect::<Vec<_>>();
     // First title as the book title; the filename stem is the fallback.
     let has_named_chapter = chapters.iter().any(|chapter| !chapter.title.is_empty());
     let title = if has_named_chapter {
@@ -294,6 +362,21 @@ pub fn parse_with_encoding(path: &Path, encoding: Option<&str>) -> Result<Parsed
         resources: Vec::new(),
         pages: Vec::new(),
     })
+}
+
+/// Decode and split a TXT file into normalized UTF-8 chapter bodies. The
+/// server uses this during a scan to build the byte-range cache; HTML is
+/// rendered later for the specific chapter requested by the reader.
+pub fn normalized_chapters(
+    path: &Path,
+    encoding: Option<&str>,
+) -> Result<Vec<(String, String)>, ParseError> {
+    let decoded = decode_file(path, encoding)?;
+    let text = normalize(&decoded);
+    if text.trim().is_empty() {
+        return Err(ParseError::NoContent);
+    }
+    Ok(split_chapters(&text))
 }
 
 /// Split decoded text into chapters and render each as an HTML fragment.
@@ -341,6 +424,19 @@ mod tests {
         assert_eq!(chapters.len(), 2);
         assert_eq!(chapters[0].0, "Chapter 1");
         assert_eq!(chapters[1].0, "Chapter 2: The Road");
+    }
+
+    #[test]
+    fn detects_common_cjk_special_chapters() {
+        let text =
+            "卷一 初遇\n\n甲\n\n楔子\n\n乙\n\n番外篇\n\n丙\n\n终章\n\n丁\n\n第一章出发\n\n戊";
+        let chapters = split_chapters(text);
+        assert_eq!(chapters.len(), 5);
+        assert_eq!(chapters[0].0, "卷一 初遇");
+        assert_eq!(chapters[1].0, "楔子");
+        assert_eq!(chapters[2].0, "番外篇");
+        assert_eq!(chapters[3].0, "终章");
+        assert_eq!(chapters[4].0, "第一章出发");
     }
 
     #[test]

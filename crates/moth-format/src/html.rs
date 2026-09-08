@@ -147,9 +147,14 @@ mod tests {
     #[test]
     fn rewrites_relative_resources() {
         let html = r#"<html><body><img src="../Images/x.jpg"/><link rel="stylesheet" href="../css/main.css"/></body></html>"#;
-        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/api/v1/books/1/resource");
-        assert!(out.contains(r#"src="/api/v1/books/1/resource/0""#));
-        assert!(out.contains(r#"href="/api/v1/books/1/resource/1""#));
+        let out = sanitize_and_rewrite(
+            html,
+            "OEBPS/text",
+            &map(),
+            "/api/v1/publications/1/resource",
+        );
+        assert!(out.contains(r#"src="/api/v1/publications/1/resource/0""#));
+        assert!(out.contains(r#"href="/api/v1/publications/1/resource/1""#));
     }
 
     #[test]

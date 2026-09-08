@@ -279,11 +279,7 @@ class View {
 
                 resolve()
             }, { once: true })
-            // Moth's offline reader can provide a sanitized section through
-            // srcdoc. WebKit refuses to resolve blob/data iframe URLs after
-            // the network is disabled, while srcdoc stays entirely local.
-            if (src.startsWith('moth-srcdoc:')) this.#iframe.srcdoc = src.slice('moth-srcdoc:'.length)
-            else this.#iframe.src = src
+            this.#iframe.src = src
         })
     }
     render(layout) {

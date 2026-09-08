@@ -29,7 +29,7 @@ impl BookFormat {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "epub" => Some(Self::Epub),
-            "mobi" | "azw" | "azw3" => Some(Self::Mobi),
+            "mobi" => Some(Self::Mobi),
             "cbz" => Some(Self::Cbz),
             "txt" => Some(Self::Txt),
             _ => None,
@@ -242,10 +242,7 @@ mod tests {
             BookFormat::from_path(Path::new("a.MOBI")),
             Some(BookFormat::Mobi)
         );
-        assert_eq!(
-            BookFormat::from_path(Path::new("a.azw3")),
-            Some(BookFormat::Mobi)
-        );
+        assert_eq!(BookFormat::from_path(Path::new("a.azw3")), None);
         assert_eq!(
             BookFormat::from_path(Path::new("a.cbz")),
             Some(BookFormat::Cbz)

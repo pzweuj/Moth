@@ -34,11 +34,6 @@ pub struct SessionResponse {
     pub authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Stable for the lifetime of the database and used to isolate browser
-    /// caches after a server is rebuilt at the same origin.
-    pub instance_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,13 +89,10 @@ pub async fn current_session(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<Json<SessionResponse>, AppError> {
-    let instance_id = server_instance_id(&state).await?;
     let Some(token) = cookie_token(&jar) else {
         return Ok(Json(SessionResponse {
             authenticated: false,
             username: None,
-            instance_id,
-            account_id: None,
         }));
     };
 
@@ -109,16 +101,7 @@ pub async fn current_session(
     Ok(Json(SessionResponse {
         authenticated,
         username,
-        instance_id,
-        account_id: authenticated.then_some("1".to_owned()),
     }))
-}
-
-async fn server_instance_id(state: &AppState) -> Result<String, AppError> {
-    sqlx::query_scalar("SELECT value FROM server_metadata WHERE key = 'instance_id'")
-        .fetch_one(&state.db)
-        .await
-        .map_err(AppError::Database)
 }
 
 pub async fn logout(

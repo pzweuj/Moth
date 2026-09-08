@@ -49,8 +49,16 @@ fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
             while end_b < b_chars.len() && b_chars[end_b].is_ascii_digit() {
                 end_b += 1;
             }
-            let num_a: u64 = a[i..end_a].parse().unwrap_or(0);
-            let num_b: u64 = b[j..end_b].parse().unwrap_or(0);
+            let num_a: u64 = a_chars[i..end_a]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            let num_b: u64 = b_chars[j..end_b]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
             match num_a.cmp(&num_b) {
                 std::cmp::Ordering::Equal => {
                     i = end_a;
@@ -144,6 +152,13 @@ mod tests {
         let mut names = vec!["page_10.jpg", "page_2.jpg", "page_1.jpg"];
         names.sort_by(|a, b| natural_compare(a, b));
         assert_eq!(names, vec!["page_1.jpg", "page_2.jpg", "page_10.jpg"]);
+    }
+
+    #[test]
+    fn natural_ordering_handles_unicode_prefixes() {
+        let mut names = vec!["卷10/页2.jpg", "卷2/页10.jpg", "卷2/页1.jpg"];
+        names.sort_by(|a, b| natural_compare(a, b));
+        assert_eq!(names, vec!["卷2/页1.jpg", "卷2/页10.jpg", "卷10/页2.jpg"]);
     }
 
     #[test]

@@ -9,6 +9,7 @@ services:
     environment:
       MOTH_BIND_ADDR: 0.0.0.0:8080
       MOTH_DATA_DIR: /data
+      MOTH_CONFIG_FILE: /config/libraries.toml
       MOTH_BOOKS_DIR: /books
       MOTH_WEB_DIR: /app/web
       MOTH_COOKIE_SECURE: ${MOTH_COOKIE_SECURE:-false}
@@ -19,8 +20,16 @@ services:
         source: ./data
         target: /data
       - type: bind
-        source: ${MOTH_BOOKS_PATH:-./books}
-        target: /books
+        source: ${MOTH_CONFIG_PATH:-./config/libraries.toml}
+        target: /config/libraries.toml
+        read_only: true
+      - type: bind
+        source: ${MOTH_NOVELS_PATH:-./books/novels}
+        target: /books/novels
+        read_only: true
+      - type: bind
+        source: ${MOTH_COMICS_PATH:-./books/comics}
+        target: /books/comics
         read_only: true
     healthcheck:
       test:

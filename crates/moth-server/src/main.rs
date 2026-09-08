@@ -31,8 +31,9 @@ async fn main() -> Result<(), moth_server::error::AppError> {
 
     // Index the library in the background on startup; the scan task is
     // short-lived and never blocks the server.
+    let scan_state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = moth_server::library::start_scan_on(&state).await {
+        if let Err(error) = moth_server::library::start_initial_scan(&scan_state).await {
             tracing::warn!(%error, "could not start initial library scan");
         }
     });

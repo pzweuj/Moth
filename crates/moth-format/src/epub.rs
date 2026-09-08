@@ -318,6 +318,61 @@ pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
     })
 }
 
+/// Parse only EPUB metadata and its declared cover. The scanner uses this
+/// lightweight path; chapter XHTML, stylesheets and other resources remain in
+/// the read-only source and are fetched later through the browser's Range
+/// loader.
+pub fn parse_metadata(path: &Path) -> Result<ParsedBook, ParseError> {
+    let file = std::fs::File::open(path)?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| ParseError::Archive(error.to_string()))?;
+    let opf_path = find_opf(&mut archive)?;
+    let package = read_package(&mut archive, &opf_path)?;
+    let by_id: HashMap<String, &ManifestItem> = package
+        .manifest
+        .iter()
+        .map(|item| (item.id.clone(), item))
+        .collect();
+    let cover_path = package
+        .cover_id
+        .as_ref()
+        .and_then(|id| by_id.get(id))
+        .filter(|item| item.mime.starts_with("image/"))
+        .map(|item| item.path.clone())
+        .or_else(|| {
+            package
+                .manifest
+                .iter()
+                .find(|item| {
+                    item.properties
+                        .split_whitespace()
+                        .any(|property| property == "cover-image")
+                        || item.mime.starts_with("image/")
+                })
+                .map(|item| item.path.clone())
+        });
+    let cover = cover_path.and_then(|path| {
+        zip_bytes(&mut archive, &path).ok().map(|data| Cover {
+            mime: package
+                .manifest
+                .iter()
+                .find(|item| item.path == path)
+                .map(|item| item.mime.clone())
+                .unwrap_or_else(|| crate::detect_image_mime(&data).to_owned()),
+            data,
+        })
+    });
+    Ok(ParsedBook {
+        format: crate::BookFormat::Epub,
+        title: package.title,
+        author: package.author,
+        cover,
+        chapters: Vec::new(),
+        resources: Vec::new(),
+        pages: Vec::new(),
+    })
+}
+
 fn title_from_xhtml(html: &str) -> Option<String> {
     static TITLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = TITLE
@@ -361,6 +416,17 @@ mod tests {
         assert_eq!(package.spine, vec!["ch1".to_owned()]);
         assert_eq!(package.manifest.len(), 1);
         assert_eq!(package.manifest[0].path, "OEBPS/text/ch1.xhtml");
+    }
+
+    #[test]
+    fn metadata_parse_does_not_load_spine_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.epub");
+        std::fs::write(&path, build_minimal_epub()).unwrap();
+        let book = parse_metadata(&path).unwrap();
+        assert_eq!(book.title, "T");
+        assert!(book.chapters.is_empty());
+        assert!(book.resources.is_empty());
     }
 
     #[test]

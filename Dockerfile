@@ -29,7 +29,7 @@ RUN apt-get update \
 
 RUN groupadd --system --gid 10001 moth \
     && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent --no-create-home moth \
-    && mkdir -p /app/web /data /books \
+    && mkdir -p /app/web /data /books /config \
     && chown -R moth:moth /app /data /books
 
 COPY --from=server-builder /src/target/release/moth-server /app/moth-server

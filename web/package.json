@@ -11,7 +11,6 @@
     "test:e2e": "node node_modules/@playwright/test/cli.js test"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.75.5",
     "@zip.js/zip.js": "^2.11.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
@@ -29,7 +28,6 @@
     "eslint": "^9.26.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.19",
-    "fake-indexeddb": "^6.2.5",
     "globals": "^16.0.0",
     "jsdom": "^26.1.0",
     "typescript": "~5.8.3",

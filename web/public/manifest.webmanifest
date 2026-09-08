@@ -7,6 +7,6 @@
   "orientation": "any",
   "background_color": "#f5f5ef",
   "theme_color": "#f5f5ef",
-  "description": "私密、在线优先的个人书库，支持缓存已阅读内容。",
+  "description": "私密、在线优先的个人书库；阅读时需要连接服务器。",
   "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
 }

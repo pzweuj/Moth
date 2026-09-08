@@ -7,17 +7,6 @@ declare const process: {
 
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: [
-      // foliate-js's pdf.js pulls in the vendored pdfjs build, which trips
-      // Vite's import-glob scanner. Moth does not support PDFs, so the import
-      // is redirected to a stub and the pdfjs subtree stays out of the graph.
-      {
-        find: /^\.\/pdf\.js$/,
-        replacement: "/src/reader/pdf-stub.js",
-      },
-    ],
-  },
   server: {
     // Bind to IPv4 because some Windows environments deny the IPv6 localhost
     // listener. 5173 is also commonly inside a Windows TCP excluded range, so

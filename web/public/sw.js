@@ -1,8 +1,7 @@
-/* global self, caches, URL, fetch */
+/* global self, caches, URL, fetch, Response */
 
 const VERSION = "__MOTH_BUILD_VERSION__";
 const SHELL = `moth-shell-${VERSION}`;
-const RUNTIME = `moth-runtime-${VERSION}`;
 const SHELL_ASSETS = [
   "/",
   "/index.html",
@@ -18,9 +17,8 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     // Cache Storage is shared by every app on an origin. Remove only Moth's
-    // own versioned caches so a co-hosted application is never wiped during
-    // an update.
-    caches.keys().then((keys) => Promise.all(keys.filter((key) => (key.startsWith("moth-shell-") || key.startsWith("moth-runtime-")) && ![SHELL, RUNTIME].includes(key)).map((key) => caches.delete(key)))).then(() => self.clients.claim()),
+    // own versioned shell caches so a co-hosted application is never wiped.
+    caches.keys().then((keys) => Promise.all(keys.filter((key) => key.startsWith("moth-shell-") && key !== SHELL).map((key) => caches.delete(key)))).then(() => self.clients.claim()),
   );
 });
 
@@ -28,18 +26,15 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET" || new URL(request.url).origin !== self.location.origin) return;
   const url = new URL(request.url);
-  if (url.pathname.startsWith("/api/")) return;
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-      return fetch(request).then((response) => {
-        if (!response.ok || response.type === "opaque") return response;
-        const copy = response.clone();
-        void caches.open(RUNTIME).then((cache) => cache.put(request, copy));
-        return response;
-      }).catch(() => caches.match("/index.html"));
-    }),
-  );
+  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return;
+  const navigation = request.mode === "navigate" || request.headers.get("accept")?.includes("text/html");
+  event.respondWith(caches.match(request).then((cached) => cached || fetch(request)).catch(() => {
+    if (navigation) return caches.match("/index.html");
+    return new Response("需要连接服务器", {
+      status: 503,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }));
 });
 
 self.addEventListener("message", (event) => {
