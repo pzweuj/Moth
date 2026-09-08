@@ -58,15 +58,11 @@ export async function login(page: Page, url: string) {
   await page.getByLabel("重复密码", { exact: true }).fill(credentials.password);
   await page.getByRole("button", { name: "创建账户", exact: true }).click();
   await expect(page.getByRole("button", { name: "退出", exact: true })).toBeVisible();
-  await expect.poll(async () => {
-    const response = await page.request.get(`${url}/api/v1/publications`);
-    return (await response.json() as unknown[]).length;
-  }).toBeGreaterThanOrEqual(5);
 }
 
 export async function waitForScan(page: Page, url: string) {
   await expect.poll(async () => {
-    const response = await page.request.get(`${url}/api/v1/libraries/default/scan/status`);
+    const response = await page.request.get(`${url}/api/v1/scan/status`);
     const value = await response.json();
     return value.scanning;
   }).toBe(false);

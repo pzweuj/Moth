@@ -5,7 +5,7 @@ use std::path::Path;
 
 use zip::ZipArchive;
 
-use crate::{Page, ParseError, ParsedBook};
+use crate::{ComicIndex, Cover, Page, ParseError};
 
 /// Image extensions accepted as comic pages.
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
@@ -81,7 +81,7 @@ fn natural_compare(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Parse a CBZ archive into its ordered page list. Page bytes are served
 /// lazily from the original (read-only) archive by the library layer.
-pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
+pub fn parse(path: &Path) -> Result<ComicIndex, ParseError> {
     let file = std::fs::File::open(path)?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| ParseError::Archive(error.to_string()))?;
@@ -126,21 +126,13 @@ pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
             .map_err(|error| ParseError::Archive(error.to_string()))?
             .read_to_end(&mut buffer)
             .map_err(|error| ParseError::Archive(error.to_string()))?;
-        Some(crate::Cover {
+        Some(Cover {
             data: buffer,
             mime: first.mime.clone(),
         })
     };
 
-    Ok(ParsedBook {
-        format: crate::BookFormat::Cbz,
-        title: String::new(),
-        author: None,
-        cover,
-        chapters: Vec::new(),
-        resources: Vec::new(),
-        pages,
-    })
+    Ok(ComicIndex { pages, cover })
 }
 
 #[cfg(test)]

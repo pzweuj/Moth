@@ -36,7 +36,7 @@ async fn reject_legacy_schema(pool: &SqlitePool) -> Result<(), AppError> {
     let legacy_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
          WHERE type = 'table' AND name IN
-           ('admin_credentials','books','chapters','resources','pages','sections',
+           ('libraries','admin_credentials','books','chapters','resources','pages','sections',
             'series','progress_operations','server_metadata')",
     )
     .fetch_one(pool)
@@ -47,13 +47,13 @@ async fn reject_legacy_schema(pool: &SqlitePool) -> Result<(), AppError> {
     .fetch_one(pool)
     .await?;
     let has_core: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('libraries','publications','reading_progress')",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('directories','publications','reading_progress')",
     )
     .fetch_one(pool)
     .await?;
     if legacy_tables > 0 || (has_migrations > 0 && has_core == 0) {
         return Err(AppError::Config(
-            "旧版 Moth 数据库不兼容当前 V0.2 schema；请先备份并删除 data/moth.db（及 moth.db-wal/moth.db-shm），然后重新扫描书库".to_owned(),
+            "旧版 Moth 数据库不兼容当前个人核心 schema；请先备份并删除 data/moth.db（及 moth.db-wal/moth.db-shm），然后重新扫描书库".to_owned(),
         ));
     }
     Ok(())
@@ -118,5 +118,29 @@ mod tests {
         assert!(
             matches!(error, AppError::Config(message) if message.contains("旧版 Moth") && message.contains("moth.db"))
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_old_multi_library_schema() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_test(temp.path().to_path_buf());
+        tokio::fs::create_dir_all(&config.data_dir)
+            .await
+            .expect("data directory");
+        let database_path = config.data_dir.join("moth.db");
+        let options = connect_options(&database_path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("legacy connection");
+        sqlx::query("CREATE TABLE libraries (id INTEGER PRIMARY KEY, root_path TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("legacy libraries table");
+        pool.close().await;
+
+        let error = connect(&config).await.expect_err("legacy schema must fail");
+        assert!(matches!(error, AppError::Config(message) if message.contains("旧版 Moth")));
     }
 }

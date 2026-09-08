@@ -1,7 +1,7 @@
-//! Book parsing for Moth. Each supported format is parsed into a unified
-//! [`ParsedBook`]: metadata, chapters of HTML, embedded resources, and (for
-//! comics) a page list. Parsing is CPU-bound and must run off the async
-//! runtime (see `spawn_blocking`).
+//! Small format-specific parsers for Moth's read-only book root. EPUB and
+//! MOBI expose metadata, TXT exposes normalized chapter ranges, and CBZ
+//! exposes an ordered page index. Parsing is CPU-bound and must run off the
+//! async runtime (see `spawn_blocking`).
 
 pub mod cbz;
 pub mod epub;
@@ -13,8 +13,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-/// The book formats Moth can read. Moth is self-hosted with a single user;
-/// formats are parsed server-side into a normalized form.
+/// The book formats Moth can read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookFormat {
     Epub,
@@ -82,29 +81,6 @@ pub struct Cover {
     pub mime: String,
 }
 
-/// A single reading unit. For text formats this is a chapter rendered as an
-/// HTML fragment (EPUB spine items keep their XHTML; TXT/MOBI become generated
-/// HTML). Relative resource URLs are preserved here and rewritten to served
-/// endpoints by [`ParsedBook::rewrite_resource_urls`].
-#[derive(Debug, Clone)]
-pub struct Chapter {
-    pub title: String,
-    pub content: String,
-    /// Directory of the source file inside its archive (EPUB only), used to
-    /// resolve relative resource URLs. Empty for non-EPUB formats.
-    pub base_dir: String,
-}
-
-/// A resource embedded in an EPUB archive (image, stylesheet, font) that
-/// chapters reference.
-#[derive(Debug, Clone)]
-pub struct Resource {
-    /// Normalized path inside the archive (for example `OEBPS/Images/x.jpg`).
-    pub path: String,
-    pub mime: String,
-    pub data: Vec<u8>,
-}
-
 /// A comic page from a CBZ archive.
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -113,58 +89,11 @@ pub struct Page {
     pub mime: String,
 }
 
-/// The normalized result of parsing one book.
+/// CBZ metadata and the naturally ordered pages served on demand.
 #[derive(Debug, Clone)]
-pub struct ParsedBook {
-    pub format: BookFormat,
-    pub title: String,
-    pub author: Option<String>,
-    pub cover: Option<Cover>,
-    pub chapters: Vec<Chapter>,
-    pub resources: Vec<Resource>,
+pub struct ComicIndex {
     pub pages: Vec<Page>,
-}
-
-impl ParsedBook {
-    /// Parse a book file. The format is detected from the extension.
-    pub fn parse(path: &Path) -> Result<Self, ParseError> {
-        let format = BookFormat::from_path(path).ok_or(ParseError::UnsupportedFormat)?;
-        Self::parse_as(path, format)
-    }
-
-    /// Parse a book file with an explicit format.
-    pub fn parse_as(path: &Path, format: BookFormat) -> Result<Self, ParseError> {
-        let mut book = match format {
-            BookFormat::Epub => epub::parse(path)?,
-            BookFormat::Mobi => mobi::parse(path)?,
-            BookFormat::Cbz => cbz::parse(path)?,
-            BookFormat::Txt => txt::parse(path)?,
-        };
-        if book.title.trim().is_empty() {
-            book.title = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_owned());
-        }
-        Ok(book)
-    }
-
-    /// Sanitize chapter HTML and rewrite internal resource URLs to served
-    /// endpoints. Called by the library layer once the book's id (which is
-    /// part of the endpoint path) is known.
-    pub fn rewrite_resource_urls(&mut self, prefix: &str) {
-        let resources: std::collections::HashMap<String, usize> = self
-            .resources
-            .iter()
-            .enumerate()
-            .map(|(index, resource)| (resource.path.clone(), index))
-            .collect();
-        for chapter in &mut self.chapters {
-            let base_dir = std::mem::take(&mut chapter.base_dir);
-            chapter.content =
-                html::sanitize_and_rewrite(&chapter.content, &base_dir, &resources, prefix);
-        }
-    }
+    pub cover: Option<Cover>,
 }
 
 /// Resolve a possibly-relative reference against a base directory and

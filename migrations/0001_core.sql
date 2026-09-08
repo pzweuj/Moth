@@ -18,29 +18,18 @@ CREATE TABLE sessions (
 );
 CREATE INDEX sessions_expires_at_idx ON sessions (expires_at);
 
-CREATE TABLE libraries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    config_key TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    root_path TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
 CREATE TABLE directories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
     parent_id INTEGER REFERENCES directories(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     relative_path TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE (library_id, relative_path)
+    UNIQUE (relative_path)
 );
-CREATE INDEX directories_parent_idx ON directories (library_id, parent_id, name COLLATE NOCASE);
+CREATE INDEX directories_parent_idx ON directories (parent_id, name COLLATE NOCASE);
 
 CREATE TABLE publications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
     directory_id INTEGER NOT NULL REFERENCES directories(id) ON DELETE CASCADE,
     relative_path TEXT NOT NULL,
     filename TEXT NOT NULL,
@@ -55,11 +44,11 @@ CREATE TABLE publications (
     parse_error TEXT,
     added_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE (library_id, relative_path)
+    UNIQUE (relative_path)
 );
-CREATE INDEX publications_library_idx ON publications (library_id, directory_id);
+CREATE INDEX publications_directory_idx ON publications (directory_id);
 CREATE INDEX publications_format_idx ON publications (format);
-CREATE INDEX publications_hash_idx ON publications (library_id, sha256, file_size, format);
+CREATE INDEX publications_hash_idx ON publications (sha256, file_size, format);
 
 CREATE TABLE text_chapters (
     publication_id INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
@@ -68,6 +57,7 @@ CREATE TABLE text_chapters (
     title TEXT NOT NULL,
     byte_start INTEGER NOT NULL,
     byte_end INTEGER NOT NULL,
+    character_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (publication_id, encoding, idx)
 );
 CREATE INDEX text_chapters_lookup_idx ON text_chapters (publication_id, encoding, idx);

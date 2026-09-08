@@ -1,13 +1,9 @@
-//! Sanitizing and URL rewriting for EPUB chapter XHTML. Chapters are stored
-//! server-side with internal resource URLs rewritten to served endpoints, and
-//! active content (scripts, embedded objects) removed.
+//! Sanitizing and URL rewriting for HTML embedded in classic MOBI conversion.
+//! Active content (scripts, embedded objects) is removed before it is packaged.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use regex::Regex;
-
-use crate::resolve_reference;
 
 fn element_regex(name: &str) -> &'static Regex {
     static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
@@ -57,15 +53,11 @@ fn strip_event_handlers(html: &str) -> String {
     re.replace_all(html, "").into_owned()
 }
 
-/// Remove active content and rewrite internal `src`/`href` references to the
-/// resource endpoint prefix. References that are not in `resources` are left
-/// unchanged; absolute and scheme URLs are never rewritten.
-pub fn sanitize_and_rewrite(
-    html: &str,
-    base_dir: &str,
-    resources: &HashMap<String, usize>,
-    prefix: &str,
-) -> String {
+/// Remove active content and neutralize dangerous URLs before classic MOBI
+/// HTML is placed in the generated EPUB. Resource URLs remain relative to the
+/// generated archive; the conversion layer rewrites embedded `recindex`
+/// references separately.
+pub fn sanitize_html(html: &str) -> String {
     let stripped = strip_elements(html, &["script", "iframe", "object", "embed", "form"]);
     let stripped = strip_event_handlers(&stripped);
 
@@ -114,21 +106,7 @@ pub fn sanitize_and_rewrite(
         {
             return format!("{attribute}=\"#\"");
         }
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("http://")
-            || trimmed.starts_with("https://")
-            || trimmed.starts_with("data:")
-            || trimmed.starts_with("mailto:")
-        {
-            return caps[0].to_owned();
-        }
-        let resolved = resolve_reference(base_dir, trimmed);
-        if let Some(index) = resources.get(&resolved) {
-            format!(r#"{attribute}="{prefix}/{index}""#)
-        } else {
-            caps[0].to_owned()
-        }
+        caps[0].to_owned()
     })
     .into_owned()
 }
@@ -137,39 +115,10 @@ pub fn sanitize_and_rewrite(
 mod tests {
     use super::*;
 
-    fn map() -> HashMap<String, usize> {
-        let mut map = HashMap::new();
-        map.insert("OEBPS/Images/x.jpg".to_owned(), 0);
-        map.insert("OEBPS/css/main.css".to_owned(), 1);
-        map
-    }
-
-    #[test]
-    fn rewrites_relative_resources() {
-        let html = r#"<html><body><img src="../Images/x.jpg"/><link rel="stylesheet" href="../css/main.css"/></body></html>"#;
-        let out = sanitize_and_rewrite(
-            html,
-            "OEBPS/text",
-            &map(),
-            "/api/v1/publications/1/resource",
-        );
-        assert!(out.contains(r#"src="/api/v1/publications/1/resource/0""#));
-        assert!(out.contains(r#"href="/api/v1/publications/1/resource/1""#));
-    }
-
-    #[test]
-    fn leaves_external_and_fragment_urls() {
-        let html = r##"<a href="#note">n</a><img src="https://x/y.png"/><img src="data:image/png;base64,aa"/>"##;
-        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/resource");
-        assert!(out.contains(r##"href="#note""##));
-        assert!(out.contains(r#"src="https://x/y.png""#));
-        assert!(out.contains(r#"src="data:image/png;base64,aa""#));
-    }
-
     #[test]
     fn strips_active_content() {
         let html = r#"<p onclick="evil()">x</p><script>alert(1)</script><iframe src="https://evil"></iframe>"#;
-        let out = sanitize_and_rewrite(html, "", &HashMap::new(), "/resource");
+        let out = sanitize_html(html);
         assert!(!out.contains("<script"));
         assert!(!out.contains("<iframe"));
         assert!(!out.contains("onclick"));
@@ -179,7 +128,7 @@ mod tests {
     #[test]
     fn neutralizes_dangerous_urls() {
         let html = "<a href=\"java\nscript:alert(1)\">x</a><img src=\"data:text/html,<script>x</script>\"><a href=\"file:///etc/passwd\">f</a>";
-        let out = sanitize_and_rewrite(html, "", &HashMap::new(), "/resource");
+        let out = sanitize_html(html);
         assert!(!out.to_ascii_lowercase().contains("javascript:"));
         assert!(!out.to_ascii_lowercase().contains("data:text/html"));
         assert!(!out.to_ascii_lowercase().contains("file:"));
@@ -189,7 +138,7 @@ mod tests {
     #[test]
     fn strips_forms_metadata_and_dangerous_srcsets() {
         let html = r#"<meta http-equiv="refresh" content="0;url=https://evil"><base href="https://evil/"><form action="https://evil"><input></form><img srcset="filesystem:secret 1x, ../ok.png 2x"><img src=javascript:alert(1)><svg><use xlink:href="javascript:alert(1)"/></svg>"#;
-        let out = sanitize_and_rewrite(html, "OEBPS/text", &map(), "/resource");
+        let out = sanitize_html(html);
         assert!(!out.to_ascii_lowercase().contains("<meta"));
         assert!(!out.to_ascii_lowercase().contains("<base"));
         assert!(!out.to_ascii_lowercase().contains("<form"));

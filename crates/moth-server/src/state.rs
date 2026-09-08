@@ -6,8 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
-/// Progress of a library scan, surfaced through
-/// `GET /api/v1/library/scan/status`.
+/// Progress of the single-root scan, surfaced through `GET /api/v1/scan/status`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanStatus {
     pub scanning: bool,

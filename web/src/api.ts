@@ -21,28 +21,28 @@ export type PublicationSummary = {
   content_version: string;
   file_size: number;
   filename: string;
-  library_key: string;
-  library_name: string;
   directory_path: string;
   parse_status: string;
 };
 
 export type BookDetail = PublicationSummary & {
-  chapters: Array<{ idx: number; title: string }>;
+  chapters: Array<{ idx: number; title: string; character_count: number }>;
   pages: Array<{ idx: number; path: string; mime: string }>;
 };
 
-export type LibrarySummary = { key: string; name: string; publication_count: number; directory_count: number };
+export type DirectorySummary = { name: string; path: string; publication_count: number };
 export type BrowseResponse = {
-  library: LibrarySummary;
   path: string;
   breadcrumbs: Array<{ name: string; path: string }>;
-  directories: Array<{ name: string; path: string; publication_count: number }>;
+  directories: DirectorySummary[];
   publications: PublicationSummary[];
+  publication_count: number;
+  directory_count: number;
 };
-export type HomeResponse = { continue_reading: PublicationSummary[]; recently_added: PublicationSummary[]; novels: PublicationSummary[]; comics: PublicationSummary[] };
-export type ChapterContent = { idx: number; title: string; content: string; encoding: string; content_version: string };
+export type HomeResponse = { continue_reading: PublicationSummary[]; recently_added: PublicationSummary[] };
+export type ChapterContent = { idx: number; title: string; content: string; text: string; encoding: string; content_version: string; character_count: number };
 export type ConversionResponse = { status: "pending" | "preparing" | "ready" | "failed" | "not_required"; file_url?: string; error?: string };
+export type ScanStatus = { scanning: boolean; processed: number; total: number; errors: number; message: string };
 
 export class ApiError extends Error {
   status: number;
@@ -79,22 +79,15 @@ export const api = {
   logout: () => request<void>("/session", { method: "DELETE" }),
   session: () => request<SessionState>("/session"),
   home: () => request<HomeResponse>("/home"),
-  libraries: () => request<LibrarySummary[]>("/libraries"),
-  browse: (key: string, path = "") => request<BrowseResponse>(`/libraries/${encodeURIComponent(key)}/browse?path=${encodeURIComponent(path)}`),
-  publications: (query: { q?: string; library?: string; format?: Format | "all"; author?: string; sort?: string } = {}) => {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(query)) if (value && value !== "all") params.set(key, value);
-    return request<PublicationSummary[]>(`/publications${params.toString() ? `?${params}` : ""}`);
-  },
+  browse: (path = "") => request<BrowseResponse>(`/browse?path=${encodeURIComponent(path)}`),
   book: (id: number) => request<BookDetail>(`/publications/${id}`),
   progress: (id: number) => request<ProgressBody | null>(`/publications/${id}/progress`),
   saveProgress: (id: number, value: ProgressBody) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value) }),
   chapter: (id: number, index: number, encoding?: string) => request<ChapterContent>(`/publications/${id}/chapters/${index}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`),
   conversion: (id: number) => request<ConversionResponse>(`/publications/${id}/conversion`),
   startConversion: (id: number) => request<ConversionResponse>(`/publications/${id}/conversion`, { method: "POST" }),
-  scan: (key: string) => request<void>(`/libraries/${encodeURIComponent(key)}/scan`, { method: "POST" }),
-  scanStatus: (key: string) => request<{ scanning: boolean; processed: number; total: number; errors: number; message: string }>(`/libraries/${encodeURIComponent(key)}/scan/status`),
+  scan: () => request<void>("/scan", { method: "POST" }),
+  scanStatus: () => request<ScanStatus>("/scan/status"),
 };
 
 export const bookFileUrl = (id: number) => `/api/v1/publications/${id}/file`;
-export const coverUrl = (book: PublicationSummary) => book.cover_url ? `${book.cover_url}` : undefined;

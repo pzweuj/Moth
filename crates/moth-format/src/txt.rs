@@ -11,7 +11,7 @@ use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 use regex::Regex;
 
-use crate::{Chapter, ParseError, ParsedBook};
+use crate::ParseError;
 
 /// Chapter heading markers, checked case-insensitively against a line. CJK
 /// covers 第N章/节/回/卷/部/篇; Latin covers chapter/part/volume/book/section.
@@ -317,53 +317,6 @@ pub fn decode_with(label: &str, bytes: &[u8]) -> String {
     }
 }
 
-/// Parse a plain-text book.
-pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
-    parse_with_encoding(path, None)
-}
-
-/// Parse a plain-text book, optionally decoding with an explicit encoding
-/// label (see [`decode_with`]) instead of auto-detection.
-pub fn parse_with_encoding(path: &Path, encoding: Option<&str>) -> Result<ParsedBook, ParseError> {
-    let plain_chapters = normalized_chapters(path, encoding)?;
-    let chapters = plain_chapters
-        .iter()
-        .map(|(title, body)| Chapter {
-            title: title.clone(),
-            content: render_html(body),
-            base_dir: String::new(),
-        })
-        .collect::<Vec<_>>();
-    // First title as the book title; the filename stem is the fallback.
-    let has_named_chapter = chapters.iter().any(|chapter| !chapter.title.is_empty());
-    let title = if has_named_chapter {
-        chapters
-            .iter()
-            .find_map(|chapter| {
-                if chapter.title.is_empty() {
-                    None
-                } else {
-                    Some(chapter.title.clone())
-                }
-            })
-            .unwrap_or_default()
-    } else {
-        path.file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
-
-    Ok(ParsedBook {
-        format: crate::BookFormat::Txt,
-        title,
-        author: None,
-        cover: None,
-        chapters,
-        resources: Vec::new(),
-        pages: Vec::new(),
-    })
-}
-
 /// Decode and split a TXT file into normalized UTF-8 chapter bodies. The
 /// server uses this during a scan to build the byte-range cache; HTML is
 /// rendered later for the specific chapter requested by the reader.
@@ -377,31 +330,6 @@ pub fn normalized_chapters(
         return Err(ParseError::NoContent);
     }
     Ok(split_chapters(&text))
-}
-
-/// Split decoded text into chapters and render each as an HTML fragment.
-/// Shared with the MOBI parser, whose decompressed text follows the same
-/// conventions as plain text.
-pub fn split_and_render(text: &str, path: &Path) -> Vec<Chapter> {
-    let mut chapters: Vec<Chapter> = Vec::new();
-    for (title, body) in split_chapters(text) {
-        chapters.push(Chapter {
-            title,
-            content: render_html(&body),
-            base_dir: String::new(),
-        });
-    }
-    if chapters.is_empty() {
-        chapters.push(Chapter {
-            title: path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            content: render_html(text),
-            base_dir: String::new(),
-        });
-    }
-    chapters
 }
 
 #[cfg(test)]

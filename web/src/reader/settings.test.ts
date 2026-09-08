@@ -12,8 +12,8 @@ describe("reader settings persistence", () => {
     expect(loadSettings()).toEqual({
       fontSize: 18,
       lineHeight: 1.7,
-      margin: 16,
       theme: "light",
+      flow: "paginated",
     });
   });
 
@@ -21,8 +21,8 @@ describe("reader settings persistence", () => {
     const settings: ReaderSettings = {
       fontSize: 22,
       lineHeight: 2.0,
-      margin: 8,
       theme: "dark",
+      flow: "scrolled",
     };
     saveSettings(settings);
     expect(loadSettings()).toEqual(settings);
@@ -41,8 +41,8 @@ describe("reader settings persistence", () => {
     expect(loadSettings()).toEqual({
       fontSize: 18,
       lineHeight: 1.7,
-      margin: 16,
       theme: "light",
+      flow: "paginated",
     });
   });
 
@@ -50,7 +50,7 @@ describe("reader settings persistence", () => {
     const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
     });
-    expect(() => saveSettings({ ...loadSettings(), theme: "sepia" })).not.toThrow();
+    expect(() => saveSettings({ ...loadSettings(), theme: "dark" })).not.toThrow();
     spy.mockRestore();
   });
 });

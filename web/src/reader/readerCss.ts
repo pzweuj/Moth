@@ -8,13 +8,11 @@ import type { ReaderSettings } from "./settings";
 export function readerCss({
   fontSize,
   lineHeight,
-  margin,
   theme,
 }: ReaderSettings): string {
   const dark = theme === "dark";
-  const sepia = theme === "sepia";
-  const foreground = dark ? "#d8d3cc" : sepia ? "#3b3229" : "#1f2328";
-  const background = dark ? "#14161a" : sepia ? "#f2e8d5" : "#fbfaf7";
+  const foreground = dark ? "#d8d3cc" : "#1f2328";
+  const background = dark ? "#14161a" : "#fbfaf7";
   const link = dark ? "lightblue" : "#3b5bdb";
   return `
 :root {
@@ -26,7 +24,7 @@ html {
 }
 body {
   margin: 0;
-  padding: 0 ${margin}px;
+  padding: 0 clamp(16px, 6vw, 96px);
   /* Keep the reading face local so the reader never depends on a remote font request. */
   font-family: "Noto Serif SC", "Noto Serif CJK SC", "Source Han Serif SC", "Source Han Serif", "STSong", "Songti SC", "SimSun", "NSimSun", Georgia, serif;
   font-size: ${fontSize}px !important;

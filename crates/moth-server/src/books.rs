@@ -38,8 +38,6 @@ pub struct PublicationSummary {
     pub content_version: String,
     pub file_size: i64,
     pub filename: String,
-    pub library_key: String,
-    pub library_name: String,
     pub directory_path: String,
     pub parse_status: String,
 }
@@ -48,6 +46,7 @@ pub struct PublicationSummary {
 pub struct ChapterInfo {
     pub idx: i64,
     pub title: String,
+    pub character_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,22 +107,10 @@ pub struct ProgressBody {
     pub position: ReadingPosition,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct PublicationQuery {
-    pub q: Option<String>,
-    pub library: Option<String>,
-    pub format: Option<String>,
-    pub author: Option<String>,
-    pub sort: Option<String>,
-    pub directory_id: Option<i64>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct HomeResponse {
     pub continue_reading: Vec<PublicationSummary>,
     pub recently_added: Vec<PublicationSummary>,
-    pub novels: Vec<PublicationSummary>,
-    pub comics: Vec<PublicationSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,102 +130,29 @@ struct ChapterResponse {
     idx: i64,
     title: String,
     content: String,
+    text: String,
     encoding: String,
     content_version: String,
+    character_count: i64,
 }
 
 pub async fn home(
     State(state): State<AppState>,
     _user: Authenticated,
 ) -> Result<Json<HomeResponse>, AppError> {
-    let mut continue_reading = fetch_publications(&state.db, None, None, Some("progress")).await?;
+    let mut continue_reading = fetch_publications(&state.db, None, Some("progress")).await?;
     continue_reading.retain(|book| book.progress > 0.0 && book.progress < 1.0);
     continue_reading.truncate(12);
-    let all_recent = fetch_publications(&state.db, None, None, Some("added")).await?;
-    let novels = all_recent
-        .iter()
-        .filter(|book| matches!(book.source_format.as_str(), "epub" | "txt" | "mobi"))
-        .take(12)
-        .cloned()
-        .collect();
-    let comics = all_recent
-        .iter()
-        .filter(|book| book.source_format == "cbz")
-        .take(12)
-        .cloned()
-        .collect();
-    let mut recently_added = all_recent;
+    let mut recently_added = fetch_publications(&state.db, None, Some("added")).await?;
     recently_added.truncate(12);
     Ok(Json(HomeResponse {
         continue_reading,
         recently_added,
-        novels,
-        comics,
     }))
-}
-
-pub async fn list_books(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    Query(query): Query<PublicationQuery>,
-) -> Result<Json<Vec<PublicationSummary>>, AppError> {
-    Ok(Json(fetch_filtered(&state.db, &query).await?))
-}
-
-async fn fetch_filtered(
-    db: &SqlitePool,
-    query: &PublicationQuery,
-) -> Result<Vec<PublicationSummary>, AppError> {
-    if let Some(format) = query.format.as_deref().filter(|value| !value.is_empty())
-        && !matches!(format, "epub" | "txt" | "cbz" | "mobi")
-    {
-        return Err(AppError::Validation(
-            "format must be one of epub, txt, cbz, mobi".to_owned(),
-        ));
-    }
-    let mut sql = String::from(
-        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,l.config_key,l.name,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN libraries l ON l.id=p.library_id JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE 1=1",
-    );
-    let mut binds: Vec<String> = Vec::new();
-    if let Some(value) = query.library.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND l.config_key=?");
-        binds.push(value.to_owned());
-    }
-    if let Some(value) = query
-        .format
-        .as_deref()
-        .filter(|value| matches!(*value, "epub" | "txt" | "cbz" | "mobi"))
-    {
-        sql.push_str(" AND p.format=?");
-        binds.push(value.to_owned());
-    }
-    if let Some(value) = query.author.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND lower(COALESCE(p.author,'')) LIKE lower(?)");
-        binds.push(format!("%{value}%"));
-    }
-    if let Some(value) = query.q.as_deref().filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND (lower(p.title) LIKE lower(?) OR lower(COALESCE(p.author,'')) LIKE lower(?) OR lower(p.filename) LIKE lower(?))");
-        let value = format!("%{}%", value.trim());
-        binds.extend([value.clone(), value.clone(), value]);
-    }
-    sql.push_str(match query.sort.as_deref() {
-        Some("added") => " ORDER BY p.added_at DESC, p.title COLLATE NOCASE",
-        Some("progress") => " ORDER BY COALESCE(r.updated_at,0) DESC, p.title COLLATE NOCASE",
-        _ => " ORDER BY p.title COLLATE NOCASE",
-    });
-    let mut request = sqlx::query(&sql);
-    for value in &binds {
-        request = request.bind(value);
-    }
-    let rows = request.fetch_all(db).await?;
-    rows.into_iter()
-        .map(|row| summary_from_row(&row).map_err(AppError::Database))
-        .collect()
 }
 
 pub(crate) async fn fetch_publications(
     db: &SqlitePool,
-    library_id: Option<i64>,
     directory_id: Option<i64>,
     sort: Option<&str>,
 ) -> Result<Vec<PublicationSummary>, AppError> {
@@ -248,11 +162,9 @@ pub(crate) async fn fetch_publications(
         _ => "p.title COLLATE NOCASE",
     };
     let query = format!(
-        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,l.config_key,l.name,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN libraries l ON l.id=p.library_id JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE (? IS NULL OR p.library_id=?) AND (? IS NULL OR p.directory_id=?) ORDER BY {order}"
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE (? IS NULL OR p.directory_id=?) ORDER BY {order}"
     );
     let rows = sqlx::query(&query)
-        .bind(library_id)
-        .bind(library_id)
         .bind(directory_id)
         .bind(directory_id)
         .fetch_all(db)
@@ -288,8 +200,6 @@ fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PublicationSummary,
         content_version: content_version(&hash, row.try_get::<String, _>("format")?.as_str(), None),
         file_size: row.try_get("file_size")?,
         filename: row.try_get("filename")?,
-        library_key: row.try_get("config_key")?,
-        library_name: row.try_get("name")?,
         directory_path: row.try_get("relative_path")?,
         parse_status: row.try_get("parse_status")?,
     })
@@ -300,18 +210,13 @@ pub async fn get_book(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<BookDetail>, AppError> {
-    let row = publication_row(&state.db, id).await?;
-    let summary = fetch_publications(
-        &state.db,
-        Some(row.library_id),
-        Some(row.directory_id),
-        Some("title"),
-    )
-    .await?
-    .into_iter()
-    .find(|value| value.id == id)
-    .ok_or(AppError::NotFound)?;
-    let chapters = sqlx::query("SELECT idx,title FROM text_chapters WHERE publication_id=? AND encoding='auto' ORDER BY idx").bind(id).fetch_all(&state.db).await?.into_iter().map(|row| Ok(ChapterInfo { idx: row.try_get("idx")?, title: row.try_get("title")? })).collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let summary = fetch_publications(&state.db, Some(row.directory_id), Some("title"))
+        .await?
+        .into_iter()
+        .find(|value| value.id == id)
+        .ok_or(AppError::NotFound)?;
+    let chapters = sqlx::query("SELECT idx,title,character_count FROM text_chapters WHERE publication_id=? AND encoding='auto' ORDER BY idx").bind(id).fetch_all(&state.db).await?.into_iter().map(|row| Ok(ChapterInfo { idx: row.try_get("idx")?, title: row.try_get("title")?, character_count: row.try_get("character_count")? })).collect::<Result<Vec<_>, sqlx::Error>>()?;
     let pages =
         sqlx::query("SELECT idx,path,mime FROM cbz_pages WHERE publication_id=? ORDER BY idx")
             .bind(id)
@@ -338,7 +243,7 @@ pub async fn get_cover(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     ensure_source_current(&row).await?;
     if !row.has_cover {
         return Err(AppError::NotFound);
@@ -368,7 +273,7 @@ pub async fn get_file(
     AxumPath(id): AxumPath<i64>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     let source = ensure_source_current(&row).await?;
     let path = if row.format == "mobi" {
         let target = state
@@ -420,7 +325,7 @@ pub async fn get_chapter(
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
     Query(query): Query<ChapterQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     if row.format != "txt" {
         return Err(AppError::Validation(
             "chapters are available only for TXT publications".to_owned(),
@@ -448,7 +353,7 @@ pub async fn get_chapter(
         crate::library::write_text_cache(&state, id, &version, &path, &encoding).await?;
     }
     let chapter = sqlx::query(
-        "SELECT title,byte_start,byte_end FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
+        "SELECT title,byte_start,byte_end,character_count FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
     )
     .bind(id)
     .bind(&encoding)
@@ -467,15 +372,18 @@ pub async fn get_chapter(
     let cache_path = state
         .txt_dir(&current_content_version(&row, Some(&encoding)), &encoding)
         .join("book.utf8");
-    let content = read_cached_range(&cache_path, start, end).await?;
+    let text = read_cached_range(&cache_path, start, end).await?;
     let title: String = chapter.try_get("title")?;
-    let content = render_txt_html(&content);
+    let character_count: i64 = chapter.try_get("character_count")?;
+    let content = render_txt_html(&text);
     Ok(Json(serde_json::json!(ChapterResponse {
         idx,
         title,
         content,
+        text,
         encoding: encoding.clone(),
-        content_version: current_content_version(&row, Some(&encoding))
+        content_version: current_content_version(&row, Some(&encoding)),
+        character_count
     })))
 }
 
@@ -484,7 +392,7 @@ pub async fn get_page(
     _user: Authenticated,
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     if row.format != "cbz" {
         return Err(AppError::Validation(
             "pages are available only for CBZ publications".to_owned(),
@@ -528,7 +436,7 @@ pub async fn get_progress(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<Option<ProgressBody>>, AppError> {
-    let publication = publication_row(&state.db, id).await?;
+    let publication = publication_row(&state.db, &state.config.books_dir, id).await?;
     ensure_source_current(&publication).await?;
     let row = sqlx::query(
         "SELECT content_version,locator_json,progress FROM reading_progress WHERE publication_id=?",
@@ -574,7 +482,7 @@ pub async fn put_progress(
 ) -> Result<Json<ProgressBody>, AppError> {
     let Json(body) = payload
         .map_err(|_| AppError::Validation("Request body must be valid progress JSON".to_owned()))?;
-    let publication = publication_row(&state.db, id).await?;
+    let publication = publication_row(&state.db, &state.config.books_dir, id).await?;
     ensure_source_current(&publication).await?;
     let current_version = content_version_for_position(&publication, &body.position);
     if body.content_version != current_version {
@@ -632,29 +540,24 @@ async fn validate_progress(
             .bind(&encoding)
             .fetch_one(db)
             .await?;
-            if chapter_count > 0 && *chapter_index >= chapter_count {
+            if chapter_count == 0 || *chapter_index >= chapter_count {
                 return Err(AppError::Validation(
                     "chapter_index is outside the TXT chapter list".to_owned(),
                 ));
             }
-            if let Some(byte_end) = sqlx::query_scalar::<_, i64>(
-                "SELECT byte_end FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
+            let character_count = sqlx::query_scalar::<_, i64>(
+                "SELECT character_count FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
             )
             .bind(publication.id)
             .bind(&encoding)
             .bind(*chapter_index)
             .fetch_optional(db)
             .await?
-            {
-                // The client stores a character offset, while the cache stores
-                // UTF-8 byte ranges.  A byte bound is a conservative upper
-                // bound that rejects corrupt/outlandish locators without
-                // requiring the server to decode the chapter again.
-                if *character_offset > byte_end.max(0) {
-                    return Err(AppError::Validation(
-                        "character_offset is outside the TXT chapter".to_owned(),
-                    ));
-                }
+            .ok_or_else(|| AppError::Validation("chapter_index is outside the TXT chapter list".to_owned()))?;
+            if *character_offset > character_count.max(0) {
+                return Err(AppError::Validation(
+                    "character_offset is outside the TXT chapter".to_owned(),
+                ));
             }
             Ok(())
         }
@@ -674,7 +577,7 @@ async fn validate_progress(
                     .bind(publication.id)
                     .fetch_one(db)
                     .await?;
-            if page_count > 0 && *page_index >= page_count {
+            if page_count == 0 || *page_index >= page_count {
                 return Err(AppError::Validation(
                     "page_index is outside the CBZ page list".to_owned(),
                 ));
@@ -764,7 +667,7 @@ pub async fn conversion_status(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<ConversionResponse>, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     if row.format != "mobi" {
         return Ok(Json(ConversionResponse {
             status: "not_required".to_owned(),
@@ -808,7 +711,7 @@ pub async fn start_conversion(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<ConversionResponse>, AppError> {
-    let row = publication_row(&state.db, id).await?;
+    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     if row.format != "mobi" {
         return Ok(Json(ConversionResponse {
             status: "not_required".to_owned(),
@@ -861,11 +764,14 @@ pub async fn start_conversion(
     }))
 }
 
-async fn publication_row(db: &SqlitePool, id: i64) -> Result<PublicationRow, AppError> {
-    let row = sqlx::query("SELECT p.id,p.library_id,p.directory_id,p.relative_path,p.format,p.sha256,p.file_size,p.mtime_ns,p.has_cover,l.root_path FROM publications p JOIN libraries l ON l.id=p.library_id WHERE p.id=?").bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
+async fn publication_row(
+    db: &SqlitePool,
+    root: &Path,
+    id: i64,
+) -> Result<PublicationRow, AppError> {
+    let row = sqlx::query("SELECT id,directory_id,relative_path,format,sha256,file_size,mtime_ns,has_cover FROM publications WHERE id=?").bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
     Ok(PublicationRow {
         id: row.try_get("id")?,
-        library_id: row.try_get("library_id")?,
         directory_id: row.try_get("directory_id")?,
         relative_path: row.try_get("relative_path")?,
         format: row.try_get("format")?,
@@ -873,13 +779,12 @@ async fn publication_row(db: &SqlitePool, id: i64) -> Result<PublicationRow, App
         file_size: row.try_get("file_size")?,
         mtime_ns: row.try_get("mtime_ns")?,
         has_cover: row.try_get("has_cover")?,
-        root: PathBuf::from(row.try_get::<String, _>("root_path")?),
+        root: root.to_owned(),
     })
 }
 
 struct PublicationRow {
     id: i64,
-    library_id: i64,
     directory_id: i64,
     relative_path: String,
     format: String,
@@ -1042,7 +947,7 @@ fn convert_mobi(source: &Path, directory: &Path) -> Result<(), AppError> {
         image_items.push((path, mime, record.content.to_vec()));
     }
     let mut html = if text.to_ascii_lowercase().contains("<html") {
-        moth_format::html::sanitize_and_rewrite(&text, "", &std::collections::HashMap::new(), "")
+        moth_format::html::sanitize_html(&text)
     } else {
         format!("<p>{}</p>", xml_escape(&text).replace('\n', "</p><p>"))
     };

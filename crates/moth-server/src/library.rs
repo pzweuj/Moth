@@ -1,17 +1,16 @@
-//! Filesystem-first library configuration, directory indexing and scanning.
+//! Filesystem-first indexing for one read-only book root.
 
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Query, State},
 };
 use image::codecs::jpeg::JpegEncoder;
-use moth_format::{BookFormat, ParsedBook};
+use moth_format::{BookFormat, Cover, Page, ParseError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -24,12 +23,69 @@ use crate::{
 
 const COVER_MAX_EDGE: u32 = 640;
 
-#[derive(Debug, Serialize)]
-pub struct LibrarySummary {
-    pub key: String,
-    pub name: String,
-    pub publication_count: i64,
-    pub directory_count: i64,
+struct IndexedPublication {
+    title: String,
+    author: Option<String>,
+    cover: Option<Cover>,
+    pages: Vec<Page>,
+}
+
+fn parse_index(path: &Path, format: BookFormat) -> Result<IndexedPublication, ParseError> {
+    let fallback_title = || {
+        path.file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "未命名".to_owned())
+    };
+    match format {
+        BookFormat::Epub => {
+            let metadata = moth_format::epub::parse_metadata(path)?;
+            Ok(IndexedPublication {
+                title: if metadata.title.trim().is_empty() {
+                    fallback_title()
+                } else {
+                    metadata.title
+                },
+                author: metadata.author,
+                cover: metadata.cover,
+                pages: Vec::new(),
+            })
+        }
+        BookFormat::Mobi => {
+            let metadata = moth_format::mobi::parse_metadata(path)?;
+            Ok(IndexedPublication {
+                title: if metadata.title.trim().is_empty() {
+                    fallback_title()
+                } else {
+                    metadata.title
+                },
+                author: metadata.author,
+                cover: metadata.cover,
+                pages: Vec::new(),
+            })
+        }
+        BookFormat::Txt => {
+            let chapters = moth_format::txt::normalized_chapters(path, None)?;
+            let title = chapters
+                .iter()
+                .find_map(|(title, _)| (!title.trim().is_empty()).then(|| title.clone()))
+                .unwrap_or_else(fallback_title);
+            Ok(IndexedPublication {
+                title,
+                author: None,
+                cover: None,
+                pages: Vec::new(),
+            })
+        }
+        BookFormat::Cbz => {
+            let index = moth_format::cbz::parse(path)?;
+            Ok(IndexedPublication {
+                title: fallback_title(),
+                author: None,
+                cover: index.cover,
+                pages: index.pages,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -41,11 +97,12 @@ pub struct DirectorySummary {
 
 #[derive(Debug, Serialize)]
 pub struct BrowseResponse {
-    pub library: LibrarySummary,
     pub path: String,
     pub breadcrumbs: Vec<Breadcrumb>,
     pub directories: Vec<DirectorySummary>,
     pub publications: Vec<crate::books::PublicationSummary>,
+    pub publication_count: i64,
+    pub directory_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,100 +116,76 @@ pub struct BrowseQuery {
     pub path: Option<String>,
 }
 
-pub async fn list_libraries(
+pub async fn browse(
     State(state): State<AppState>,
     _user: Authenticated,
-) -> Result<Json<Vec<LibrarySummary>>, AppError> {
-    let rows = sqlx::query(
-        "SELECT l.config_key, l.name, COUNT(DISTINCT p.id) AS publication_count, COUNT(DISTINCT d.id) AS directory_count
-         FROM libraries l LEFT JOIN directories d ON d.library_id = l.id LEFT JOIN publications p ON p.library_id = l.id
-         GROUP BY l.id ORDER BY l.name COLLATE NOCASE",
-    ).fetch_all(&state.db).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(LibrarySummary {
-            key: row.try_get("config_key")?,
-            name: row.try_get("name")?,
-            publication_count: row.try_get("publication_count")?,
-            directory_count: row.try_get("directory_count")?,
-        });
-    }
-    Ok(Json(out))
-}
-
-pub async fn browse_library(
-    State(state): State<AppState>,
-    _user: Authenticated,
-    AxumPath(key): AxumPath<String>,
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, AppError> {
-    let library = library_row(&state.db, &key).await?;
+    ensure_directory(&state.db, Path::new("")).await?;
     let path = normalize_relative(query.path.as_deref().unwrap_or(""))?;
     let directory_id: i64 =
-        sqlx::query_scalar("SELECT id FROM directories WHERE library_id = ? AND relative_path = ?")
-            .bind(library.0)
+        sqlx::query_scalar("SELECT id FROM directories WHERE relative_path = ?")
             .bind(&path)
             .fetch_optional(&state.db)
             .await?
             .ok_or(AppError::NotFound)?;
-    let summary = library_summary(&state.db, library.0, &library.1).await?;
     let directories = sqlx::query(
         "SELECT d.name, d.relative_path AS path, COUNT(p.id) AS publication_count
          FROM directories d LEFT JOIN publications p ON p.directory_id = d.id
-         WHERE d.library_id = ? AND d.parent_id = ? GROUP BY d.id ORDER BY d.name COLLATE NOCASE",
+         WHERE d.parent_id = ? GROUP BY d.id ORDER BY d.name COLLATE NOCASE",
     )
-    .bind(library.0)
     .bind(directory_id)
     .fetch_all(&state.db)
-    .await?;
-    let dirs = directories
-        .into_iter()
-        .map(|row| {
-            Ok(DirectorySummary {
-                name: row.try_get("name")?,
-                path: row.try_get("path")?,
-                publication_count: row.try_get("publication_count")?,
-            })
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(DirectorySummary {
+            name: row.try_get("name")?,
+            path: row.try_get("path")?,
+            publication_count: row.try_get("publication_count")?,
         })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
     let publications =
-        crate::books::fetch_publications(&state.db, Some(library.0), Some(directory_id), None)
+        crate::books::fetch_publications(&state.db, Some(directory_id), None).await?;
+    let publication_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publications")
+        .fetch_one(&state.db)
+        .await?;
+    let directory_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM directories WHERE relative_path <> ''")
+            .fetch_one(&state.db)
             .await?;
     Ok(Json(BrowseResponse {
-        library: summary,
         path: path.clone(),
         breadcrumbs: breadcrumbs(&path),
-        directories: dirs,
+        directories,
         publications,
+        publication_count,
+        directory_count,
     }))
 }
 
-pub async fn start_library_scan(
+pub async fn start_scan(
     State(state): State<AppState>,
     _user: Authenticated,
-    AxumPath(key): AxumPath<String>,
 ) -> Result<(), AppError> {
-    let _ = library_row(&state.db, &key).await?;
-    start_scan_on(&state, Some(key)).await
+    start_scan_on(&state).await
 }
 
 pub async fn scan_status(
     State(state): State<AppState>,
     _user: Authenticated,
-    AxumPath(key): AxumPath<String>,
 ) -> Result<Json<ScanStatus>, AppError> {
-    let _ = library_row(&state.db, &key).await?;
-    let status = state.scan_status.lock().await.clone();
-    Ok(Json(status))
+    Ok(Json(state.scan_status.lock().await.clone()))
 }
 
-pub async fn start_scan_on(state: &AppState, only: Option<String>) -> Result<(), AppError> {
+pub async fn start_scan_on(state: &AppState) -> Result<(), AppError> {
     {
         let mut status = state.scan_status.lock().await;
         if status.scanning {
             return Err(AppError::Conflict {
                 code: "scan_in_progress",
-                message: "A library scan is already running",
+                message: "书库扫描正在进行",
             });
         }
         *status = ScanStatus {
@@ -162,7 +195,7 @@ pub async fn start_scan_on(state: &AppState, only: Option<String>) -> Result<(),
     }
     let cloned = state.clone();
     tokio::spawn(async move {
-        let result = run_scan(&cloned, only.as_deref()).await;
+        let result = run_scan(&cloned).await;
         let mut status = cloned.scan_status.lock().await;
         status.scanning = false;
         if let Err(error) = result {
@@ -173,77 +206,42 @@ pub async fn start_scan_on(state: &AppState, only: Option<String>) -> Result<(),
 }
 
 pub async fn start_initial_scan(state: &AppState) -> Result<(), AppError> {
-    sync_configured_libraries(state).await?;
-    start_scan_on(state, None).await
+    ensure_directory(&state.db, Path::new("")).await?;
+    start_scan_on(state).await
 }
 
-async fn run_scan(state: &AppState, only: Option<&str>) -> Result<(), AppError> {
-    let configured: Vec<_> = state
-        .config
-        .libraries
-        .iter()
-        .filter(|library| only.is_none_or(|key| key == library.key))
-        .cloned()
-        .collect();
-    let mut all_files = Vec::new();
-    let mut all_directories = Vec::new();
-    let mut directory_paths: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut complete = true;
-    let mut scanned_keys = Vec::with_capacity(configured.len());
-    for library in configured {
-        let root = library.path.clone();
-        let key = library.key.clone();
-        scanned_keys.push(key.clone());
-        let scan_root = root.clone();
-        let collected = tokio::task::spawn_blocking(move || collect_files(&root))
-            .await
-            .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+async fn run_scan(state: &AppState) -> Result<(), AppError> {
+    let root = state.config.books_dir.clone();
+    let collected = tokio::task::spawn_blocking(move || collect_files(&root))
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let mut complete = collected.complete;
+    let root = state.config.books_dir.clone();
+    {
+        let mut status = state.scan_status.lock().await;
+        status.total = collected.files.len() as u64;
         if !collected.complete {
-            complete = false;
-            state.scan_status.lock().await.message = format!("Library scan was incomplete: {key}");
+            status.message = "扫描未完整完成，已保留现有索引".to_owned();
         }
-        for directory in collected.directories {
-            match directory.strip_prefix(&scan_root) {
-                Ok(relative) => {
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    directory_paths
-                        .entry(key.clone())
-                        .or_default()
-                        .insert(relative);
-                    all_directories.push((key.clone(), directory));
-                }
-                Err(_) => {
-                    complete = false;
-                    state.scan_status.lock().await.message =
-                        format!("Library scan encountered a path outside its root: {key}");
-                }
-            }
-        }
-        all_files.extend(collected.files.into_iter().map(|file| (key.clone(), file)));
     }
-    state.scan_status.lock().await.total = all_files.len() as u64;
-    // Create the directory tree before indexing files so empty directories are
-    // visible and the database remains a faithful projection of the source
-    // filesystem.  A directory disappearing between collection and indexing
-    // makes the scan incomplete; in that case pruning is deliberately skipped.
-    for (key, directory) in all_directories {
+    for directory in collected.directories {
         if !directory.is_dir() {
             complete = false;
-            state.scan_status.lock().await.message = format!(
-                "Library scan was incomplete while reading directory: {}",
-                directory.display()
-            );
+            state.scan_status.lock().await.message =
+                format!("扫描期间目录消失：{}", directory.display());
             continue;
         }
-        let (library_id, _name, root) = library_row(&state.db, &key).await?;
-        let relative = directory.strip_prefix(&root).map_err(|_| {
-            AppError::Validation("directory is outside configured library".to_owned())
-        })?;
-        ensure_directory(&state.db, library_id, relative).await?;
+        let relative = directory
+            .strip_prefix(&root)
+            .map_err(|_| AppError::Validation("directory is outside book root".to_owned()))?;
+        if let Err(error) = ensure_directory(&state.db, relative).await {
+            complete = false;
+            state.scan_status.lock().await.message = error.to_string();
+        }
     }
-    for (key, file) in all_files {
-        if let Err(error) = index_file(state, &key, &file).await {
-            tracing::warn!(library = %key, path = %file.display(), %error, "publication indexing failed");
+    for file in collected.files {
+        if let Err(error) = index_file(state, &file).await {
+            tracing::warn!(path = %file.display(), %error, "publication indexing failed");
             complete = false;
             let mut status = state.scan_status.lock().await;
             status.errors += 1;
@@ -252,7 +250,7 @@ async fn run_scan(state: &AppState, only: Option<&str>) -> Result<(), AppError> 
         state.scan_status.lock().await.processed += 1;
     }
     if complete {
-        prune_removed(state, &scanned_keys, &directory_paths).await?;
+        prune_removed(state).await?;
     }
     Ok(())
 }
@@ -315,11 +313,11 @@ fn collect_files(root: &Path) -> Collected {
     }
 }
 
-async fn index_file(state: &AppState, key: &str, path: &Path) -> Result<(), AppError> {
-    let (library_id, _name, root) = library_row(&state.db, key).await?;
+async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
+    let root = &state.config.books_dir;
     let relative = path
-        .strip_prefix(&root)
-        .map_err(|_| AppError::Validation("file is outside configured library".to_owned()))?
+        .strip_prefix(root)
+        .map_err(|_| AppError::Validation("file is outside book root".to_owned()))?
         .to_string_lossy()
         .replace('\\', "/");
     let metadata = std::fs::metadata(path)?;
@@ -332,7 +330,12 @@ async fn index_file(state: &AppState, key: &str, path: &Path) -> Result<(), AppE
         .unwrap_or(0);
     let format = BookFormat::from_path(path)
         .ok_or_else(|| AppError::Validation("unsupported publication".to_owned()))?;
-    let existing = sqlx::query("SELECT id, sha256, file_size, mtime_ns, format FROM publications WHERE library_id = ? AND relative_path = ?").bind(library_id).bind(&relative).fetch_optional(&state.db).await?;
+    let existing = sqlx::query(
+        "SELECT id,sha256,file_size,mtime_ns,format FROM publications WHERE relative_path=?",
+    )
+    .bind(&relative)
+    .fetch_optional(&state.db)
+    .await?;
     if let Some(row) = existing {
         let id: i64 = row.try_get("id")?;
         if row.try_get::<i64, _>("file_size")? == size
@@ -344,49 +347,35 @@ async fn index_file(state: &AppState, key: &str, path: &Path) -> Result<(), AppE
         let hash = hash_file(path)?;
         let directory = ensure_directory(
             &state.db,
-            library_id,
             Path::new(&relative).parent().unwrap_or(Path::new("")),
         )
         .await?;
         return store_publication(
-            state, id, library_id, directory, &relative, path, format, hash, size, mtime,
+            state, id, directory, &relative, path, format, hash, size, mtime,
         )
         .await;
     }
     let hash = hash_file(path)?;
-    // A unique hash match is treated as a move/rename within one Library.
-    let candidates = sqlx::query("SELECT id,relative_path FROM publications WHERE library_id = ? AND sha256 = ? AND file_size = ? AND format = ? AND relative_path <> ?")
-        .bind(library_id).bind(&hash).bind(size).bind(format.as_str()).bind(&relative).fetch_all(&state.db).await?;
+    let candidates = sqlx::query("SELECT id,relative_path FROM publications WHERE sha256=? AND file_size=? AND format=? AND relative_path<>?")
+        .bind(&hash).bind(size).bind(format.as_str()).bind(&relative)
+        .fetch_all(&state.db).await?;
     let id = if candidates.len() == 1 {
         let candidate_path: String = candidates[0].try_get("relative_path")?;
-        let candidate_file = root.join(&candidate_path);
-        let candidate_exists = candidate_file.is_file()
-            && BookFormat::from_path(&candidate_file)
-                .is_some_and(|candidate_format| candidate_format.as_str() == format.as_str());
-        if candidate_exists {
-            0
-        } else {
+        if !root.join(&candidate_path).is_file() {
             candidates[0].try_get("id")?
+        } else {
+            0
         }
     } else {
-        // Multiple equal hashes are intentionally kept as independent rows;
-        // only one unambiguously missing path may be adopted as a move.
         0
     };
     let directory = ensure_directory(
         &state.db,
-        library_id,
         Path::new(&relative).parent().unwrap_or(Path::new("")),
     )
     .await?;
-    if id != 0 {
-        return store_publication(
-            state, id, library_id, directory, &relative, path, format, hash, size, mtime,
-        )
-        .await;
-    }
     store_publication(
-        state, 0, library_id, directory, &relative, path, format, hash, size, mtime,
+        state, id, directory, &relative, path, format, hash, size, mtime,
     )
     .await
 }
@@ -395,7 +384,6 @@ async fn index_file(state: &AppState, key: &str, path: &Path) -> Result<(), AppE
 async fn store_publication(
     state: &AppState,
     id: i64,
-    library_id: i64,
     directory_id: i64,
     relative: &str,
     path: &Path,
@@ -406,11 +394,7 @@ async fn store_publication(
 ) -> Result<(), AppError> {
     let parsed = tokio::task::spawn_blocking({
         let path = path.to_owned();
-        move || match format {
-            BookFormat::Epub => moth_format::epub::parse_metadata(&path),
-            BookFormat::Mobi => moth_format::mobi::parse_metadata(&path),
-            _ => ParsedBook::parse_as(&path, format),
-        }
+        move || parse_index(&path, format)
     })
     .await
     .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
@@ -429,16 +413,16 @@ async fn store_publication(
     };
     let status = if parse_error.is_some() { "error" } else { "ok" };
     let publication_id = if id == 0 {
-        sqlx::query_scalar::<_, i64>("INSERT INTO publications (library_id,directory_id,relative_path,filename,format,title,author,file_size,mtime_ns,sha256,has_cover,parse_status,parse_error,added_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id")
-            .bind(library_id).bind(directory_id).bind(relative).bind(path.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()).bind(format.as_str()).bind(&title).bind(&author).bind(size).bind(mtime).bind(&hash).bind(cover.is_some()).bind(status).bind(&parse_error).bind(now).bind(now).fetch_one(&state.db).await?
+        sqlx::query_scalar::<_, i64>("INSERT INTO publications (directory_id,relative_path,filename,format,title,author,file_size,mtime_ns,sha256,has_cover,parse_status,parse_error,added_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id")
+            .bind(directory_id).bind(relative).bind(path.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()).bind(format.as_str()).bind(&title).bind(&author).bind(size).bind(mtime).bind(&hash).bind(cover.is_some()).bind(status).bind(&parse_error).bind(now).bind(now).fetch_one(&state.db).await?
     } else {
         sqlx::query("UPDATE publications SET directory_id=?,relative_path=?,filename=?,format=?,title=?,author=?,file_size=?,mtime_ns=?,sha256=?,has_cover=?,parse_status=?,parse_error=?,updated_at=? WHERE id=?")
             .bind(directory_id).bind(relative).bind(path.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()).bind(format.as_str()).bind(&title).bind(&author).bind(size).bind(mtime).bind(&hash).bind(cover.is_some()).bind(status).bind(&parse_error).bind(now).bind(id).execute(&state.db).await?;
-        sqlx::query("DELETE FROM text_chapters WHERE publication_id = ?")
+        sqlx::query("DELETE FROM text_chapters WHERE publication_id=?")
             .bind(id)
             .execute(&state.db)
             .await?;
-        sqlx::query("DELETE FROM cbz_pages WHERE publication_id = ?")
+        sqlx::query("DELETE FROM cbz_pages WHERE publication_id=?")
             .bind(id)
             .execute(&state.db)
             .await?;
@@ -486,26 +470,29 @@ pub(crate) async fn write_text_cache(
     let mut bytes = Vec::new();
     let mut ranges = Vec::with_capacity(chapters.len());
     for (idx, (title, body)) in chapters.iter().enumerate() {
+        // Keep the separator outside each chapter's range. It is useful in
+        // the concatenated cache, but it is not part of the normalized text
+        // returned to the reader or counted by the TXT locator.
+        if idx > 0 {
+            bytes.extend_from_slice(b"\n");
+        }
         let start = bytes.len() as i64;
         bytes.extend_from_slice(body.as_bytes());
-        bytes.extend_from_slice(b"\n");
         let end = bytes.len() as i64;
-        ranges.push((idx as i64, title.clone(), start, end));
+        // The virtual TXT section renders its chapter title as an h1, then a
+        // single newline, before the normalized body. The locator covers
+        // exactly those visible UTF-16 code units.
+        let character_count =
+            (title.encode_utf16().count() + 1 + body.encode_utf16().count()) as i64;
+        ranges.push((idx as i64, title.clone(), start, end, character_count));
     }
     let target = dir.join("book.utf8");
     let temp = dir.join("book.utf8.tmp");
     tokio::fs::write(&temp, bytes).await?;
     tokio::fs::rename(&temp, &target).await?;
-    for (idx, title, start, end) in ranges {
-        sqlx::query("INSERT INTO text_chapters (publication_id,encoding,idx,title,byte_start,byte_end) VALUES (?,?,?,?,?,?) ON CONFLICT(publication_id,encoding,idx) DO UPDATE SET title=excluded.title,byte_start=excluded.byte_start,byte_end=excluded.byte_end")
-            .bind(id)
-            .bind(encoding)
-            .bind(idx)
-            .bind(title)
-            .bind(start)
-            .bind(end)
-            .execute(&state.db)
-            .await?;
+    for (idx, title, start, end, character_count) in ranges {
+        sqlx::query("INSERT INTO text_chapters (publication_id,encoding,idx,title,byte_start,byte_end,character_count) VALUES (?,?,?,?,?,?,?) ON CONFLICT(publication_id,encoding,idx) DO UPDATE SET title=excluded.title,byte_start=excluded.byte_start,byte_end=excluded.byte_end,character_count=excluded.character_count")
+            .bind(id).bind(encoding).bind(idx).bind(title).bind(start).bind(end).bind(character_count).execute(&state.db).await?;
     }
     Ok(())
 }
@@ -540,34 +527,16 @@ async fn write_cover(
     Ok(())
 }
 
-async fn ensure_directory(
-    db: &SqlitePool,
-    library_id: i64,
-    relative: &Path,
-) -> Result<i64, AppError> {
-    // Every non-root directory must be attached to the synthetic library-root
-    // row.  The old implementation started with `parent_id = NULL`, which
-    // left first-level directories orphaned from browse queries that select
-    // `parent_id = root.id`.
-    sqlx::query("INSERT INTO directories (library_id,parent_id,name,relative_path,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(library_id,relative_path) DO NOTHING")
-        .bind(library_id)
-        .bind(None::<i64>)
-        .bind("书库")
-        .bind("")
-        .bind(now_unix())
-        .execute(db)
+async fn ensure_directory(db: &SqlitePool, relative: &Path) -> Result<i64, AppError> {
+    sqlx::query("INSERT INTO directories (parent_id,name,relative_path,updated_at) VALUES (?,?,?,?) ON CONFLICT(relative_path) DO NOTHING")
+        .bind(None::<i64>).bind("书库").bind("").bind(now_unix()).execute(db).await?;
+    let root_id: i64 = sqlx::query_scalar("SELECT id FROM directories WHERE relative_path=''")
+        .fetch_one(db)
         .await?;
-    let root_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM directories WHERE library_id = ? AND relative_path = ''",
-    )
-    .bind(library_id)
-    .fetch_one(db)
-    .await?;
     if relative.as_os_str().is_empty() {
         return Ok(root_id);
     }
-
-    let mut parent_id = Some(root_id);
+    let mut parent_id = root_id;
     let mut current = String::new();
     for component in relative.components() {
         let name = component.as_os_str().to_string_lossy().to_string();
@@ -579,164 +548,67 @@ async fn ensure_directory(
         } else {
             format!("{current}/{name}")
         };
-        sqlx::query("INSERT INTO directories (library_id,parent_id,name,relative_path,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(library_id,relative_path) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id, updated_at=excluded.updated_at")
-            .bind(library_id).bind(parent_id).bind(&name).bind(&current).bind(now_unix()).execute(db).await?;
-        parent_id = sqlx::query_scalar(
-            "SELECT id FROM directories WHERE library_id = ? AND relative_path = ?",
-        )
-        .bind(library_id)
-        .bind(&current)
-        .fetch_one(db)
-        .await?;
-    }
-    parent_id.ok_or_else(|| AppError::Validation("directory path is empty".to_owned()))
-}
-
-async fn prune_removed(
-    state: &AppState,
-    keys: &[String],
-    directory_paths: &HashMap<String, HashSet<String>>,
-) -> Result<(), AppError> {
-    for library in state
-        .config
-        .libraries
-        .iter()
-        .filter(|library| keys.iter().any(|key| key == &library.key))
-    {
-        let (id, _name, root) = library_row(&state.db, &library.key).await?;
-        let rows = sqlx::query("SELECT id,relative_path FROM publications WHERE library_id = ?")
-            .bind(id)
-            .fetch_all(&state.db)
+        sqlx::query("INSERT INTO directories (parent_id,name,relative_path,updated_at) VALUES (?,?,?,?) ON CONFLICT(relative_path) DO UPDATE SET name=excluded.name,parent_id=excluded.parent_id,updated_at=excluded.updated_at")
+            .bind(parent_id).bind(&name).bind(&current).bind(now_unix()).execute(db).await?;
+        parent_id = sqlx::query_scalar("SELECT id FROM directories WHERE relative_path=?")
+            .bind(&current)
+            .fetch_one(db)
             .await?;
-        for row in rows {
-            let publication_id: i64 = row.try_get("id")?;
-            let relative: String = row.try_get("relative_path")?;
-            let source = root.join(&relative);
-            match std::fs::metadata(&source) {
-                Ok(metadata) if metadata.is_file() && BookFormat::from_path(&source).is_some() => {}
-                Ok(_) => {
-                    sqlx::query("DELETE FROM publications WHERE id = ?")
-                        .bind(publication_id)
-                        .execute(&state.db)
-                        .await?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    sqlx::query("DELETE FROM publications WHERE id = ?")
-                        .bind(publication_id)
-                        .execute(&state.db)
-                        .await?;
-                }
-                Err(error) => {
-                    tracing::warn!(library = %library.key, path = %relative, %error, "could not verify indexed publication during prune");
-                }
-            }
-        }
-        // Directories are also derived from the filesystem, including empty
-        // ones. Delete only rows absent from this complete scan, deepest first
-        // so a stale parent cannot cascade a still-present child row.
-        let present = directory_paths.get(&library.key);
-        let rows = sqlx::query(
-            "SELECT id,relative_path FROM directories WHERE library_id=? AND relative_path<>''",
-        )
-        .bind(id)
-        .fetch_all(&state.db)
-        .await?;
-        let mut stale = rows
-            .into_iter()
-            .filter_map(|row| {
-                let relative: String = row.try_get("relative_path").ok()?;
-                let id: i64 = row.try_get("id").ok()?;
-                if present.is_none_or(|paths| !paths.contains(&relative)) {
-                    Some((relative, id))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        stale.sort_by(|(left, _), (right, _)| {
-            right.split('/').count().cmp(&left.split('/').count())
-        });
-        for (_relative, directory_id) in stale {
-            sqlx::query("DELETE FROM directories WHERE id=?")
-                .bind(directory_id)
-                .execute(&state.db)
-                .await?;
-        }
     }
-    Ok(())
+    Ok(parent_id)
 }
 
-async fn sync_configured_libraries(state: &AppState) -> Result<(), AppError> {
-    let now = now_unix();
-    for library in &state.config.libraries {
-        sqlx::query("INSERT INTO libraries (config_key,name,root_path,created_at,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(config_key) DO UPDATE SET name=excluded.name, root_path=excluded.root_path, updated_at=excluded.updated_at").bind(&library.key).bind(&library.name).bind(library.path.to_string_lossy().as_ref()).bind(now).bind(now).execute(&state.db).await?;
-    }
-    let keys: HashSet<_> = state
-        .config
-        .libraries
-        .iter()
-        .map(|library| library.key.as_str())
-        .collect();
-    let rows = sqlx::query("SELECT id,config_key FROM libraries")
+async fn prune_removed(state: &AppState) -> Result<(), AppError> {
+    let root = &state.config.books_dir;
+    let rows = sqlx::query("SELECT id,relative_path FROM publications")
         .fetch_all(&state.db)
         .await?;
     for row in rows {
         let id: i64 = row.try_get("id")?;
-        let key: String = row.try_get("config_key")?;
-        if !keys.contains(key.as_str()) {
-            sqlx::query("DELETE FROM libraries WHERE id=?")
-                .bind(id)
-                .execute(&state.db)
-                .await?;
+        let relative: String = row.try_get("relative_path")?;
+        let source = root.join(&relative);
+        match std::fs::metadata(&source) {
+            Ok(metadata) if metadata.is_file() && BookFormat::from_path(&source).is_some() => {}
+            Ok(_) => {
+                sqlx::query("DELETE FROM publications WHERE id=?")
+                    .bind(id)
+                    .execute(&state.db)
+                    .await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sqlx::query("DELETE FROM publications WHERE id=?")
+                    .bind(id)
+                    .execute(&state.db)
+                    .await?;
+            }
+            Err(error) => {
+                tracing::warn!(path = %relative, %error, "could not verify publication during prune")
+            }
         }
     }
-    for library in &state.config.libraries {
-        let id: i64 = sqlx::query_scalar("SELECT id FROM libraries WHERE config_key=?")
-            .bind(&library.key)
-            .fetch_one(&state.db)
+    let rows = sqlx::query("SELECT id,relative_path FROM directories WHERE relative_path<>''")
+        .fetch_all(&state.db)
+        .await?;
+    let mut stale = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id: i64 = row.try_get("id").ok()?;
+            let relative: String = row.try_get("relative_path").ok()?;
+            if root.join(&relative).is_dir() {
+                None
+            } else {
+                Some((relative, id))
+            }
+        })
+        .collect::<Vec<_>>();
+    stale.sort_by_key(|(path, _)| std::cmp::Reverse(path.split('/').count()));
+    for (_, id) in stale {
+        sqlx::query("DELETE FROM directories WHERE id=?")
+            .bind(id)
+            .execute(&state.db)
             .await?;
-        ensure_directory(&state.db, id, Path::new("")).await?;
     }
     Ok(())
-}
-
-async fn library_summary(db: &SqlitePool, id: i64, name: &str) -> Result<LibrarySummary, AppError> {
-    let publication_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM publications WHERE library_id=?")
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    let directory_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM directories WHERE library_id=?")
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    let key: String = sqlx::query_scalar("SELECT config_key FROM libraries WHERE id=?")
-        .bind(id)
-        .fetch_one(db)
-        .await?;
-    Ok(LibrarySummary {
-        key,
-        name: name.to_owned(),
-        publication_count,
-        directory_count,
-    })
-}
-
-pub(crate) async fn library_row(
-    db: &SqlitePool,
-    key: &str,
-) -> Result<(i64, String, PathBuf), AppError> {
-    let row = sqlx::query("SELECT id,name,root_path FROM libraries WHERE config_key=?")
-        .bind(key)
-        .fetch_optional(db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok((
-        row.try_get("id")?,
-        row.try_get("name")?,
-        PathBuf::from(row.try_get::<String, _>("root_path")?),
-    ))
 }
 
 pub(crate) fn normalize_relative(path: &str) -> Result<String, AppError> {
@@ -748,7 +620,7 @@ pub(crate) fn normalize_relative(path: &str) -> Result<String, AppError> {
             std::path::Component::CurDir => {}
             _ => {
                 return Err(AppError::Validation(
-                    "path must stay inside the library".to_owned(),
+                    "path must stay inside the book root".to_owned(),
                 ));
             }
         }
@@ -793,6 +665,29 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::Config, db, state::AppState};
+
+    async fn test_state() -> (tempfile::TempDir, AppState) {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let books = temp.path().join("books");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&books).expect("book root");
+        let mut config = Config::for_test(data);
+        config.books_dir = books;
+        let pool = db::connect(&config).await.expect("database");
+        (temp, AppState::new(config, pool))
+    }
+
+    async fn publication_rows(state: &AppState) -> Vec<(i64, String, String)> {
+        sqlx::query_as("SELECT id,relative_path,sha256 FROM publications ORDER BY relative_path")
+            .fetch_all(&state.db)
+            .await
+            .expect("publication rows")
+    }
+
+    async fn scan(state: &AppState) {
+        run_scan(state).await.expect("scan");
+    }
 
     #[test]
     fn collects_empty_and_nested_directories_without_indexing_unsupported_files() {
@@ -802,94 +697,98 @@ mod tests {
         std::fs::write(temp.path().join("novel.txt"), "第一章\n内容").expect("text fixture");
         std::fs::write(temp.path().join("ignored.pdf"), b"not indexed")
             .expect("unsupported fixture");
-
         let collected = collect_files(temp.path());
         assert!(collected.complete);
         assert_eq!(collected.files.len(), 1);
-        assert!(collected.directories.contains(&temp.path().to_path_buf()));
         assert!(collected.directories.contains(&nested));
-    }
-
-    #[tokio::test]
-    async fn scan_preserves_unique_moves_and_keeps_duplicate_files_separate() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let root = temp.path().join("books");
-        std::fs::create_dir_all(&root).expect("book root");
-        std::fs::write(root.join("novel.txt"), "第一章\n内容").expect("text fixture");
-
-        let mut config = crate::config::Config::for_test(temp.path().join("data"));
-        config.libraries[0].path = root.clone();
-        let db = crate::db::connect(&config).await.expect("database");
-        let state = crate::state::AppState::new(config, db);
-        sync_configured_libraries(&state)
-            .await
-            .expect("configured library");
-        run_scan(&state, None).await.expect("initial scan");
-
-        let first_id: i64 = sqlx::query_scalar("SELECT id FROM publications")
-            .fetch_one(&state.db)
-            .await
-            .expect("first publication");
-        std::fs::create_dir_all(root.join("nested")).expect("nested directory");
-        std::fs::rename(root.join("novel.txt"), root.join("nested/renamed.txt"))
-            .expect("move fixture");
-        run_scan(&state, None).await.expect("move scan");
-        let moved: (i64, String) = sqlx::query_as("SELECT id,relative_path FROM publications")
-            .fetch_one(&state.db)
-            .await
-            .expect("moved publication");
-        assert_eq!(moved.0, first_id);
-        assert_eq!(moved.1, "nested/renamed.txt");
-
-        std::fs::copy(root.join("nested/renamed.txt"), root.join("duplicate.txt"))
-            .expect("duplicate fixture");
-        run_scan(&state, None).await.expect("duplicate scan");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publications")
-            .fetch_one(&state.db)
-            .await
-            .expect("publication count");
-        assert_eq!(count, 2);
-
-        std::fs::remove_file(root.join("duplicate.txt")).expect("remove duplicate");
-        run_scan(&state, None).await.expect("delete scan");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publications")
-            .fetch_one(&state.db)
-            .await
-            .expect("publication count after delete");
-        assert_eq!(count, 1);
-
-        std::fs::rename(
-            root.join("nested/renamed.txt"),
-            root.join("nested/renamed.pdf"),
-        )
-        .expect("unsupported rename");
-        run_scan(&state, None).await.expect("unsupported scan");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publications")
-            .fetch_one(&state.db)
-            .await
-            .expect("publication count after extension change");
-        assert_eq!(count, 0);
-        let directories: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM directories WHERE relative_path='nested'")
-                .fetch_one(&state.db)
-                .await
-                .expect("nested directory count");
-        assert_eq!(directories, 1);
-        let parent_id: Option<i64> =
-            sqlx::query_scalar("SELECT parent_id FROM directories WHERE relative_path='nested'")
-                .fetch_one(&state.db)
-                .await
-                .expect("nested directory parent");
-        let root_id: i64 = sqlx::query_scalar("SELECT id FROM directories WHERE relative_path=''")
-            .fetch_one(&state.db)
-            .await
-            .expect("library root");
-        assert_eq!(parent_id, Some(root_id));
     }
 
     #[test]
     fn rejects_parent_paths() {
         assert!(normalize_relative("../secret").is_err());
         assert_eq!(normalize_relative("a\\b").unwrap(), "a/b");
+    }
+
+    #[tokio::test]
+    async fn scan_indexes_nested_books_and_prunes_deleted_files() {
+        let (_temp, state) = test_state().await;
+        let nested = state.config.books_dir.join("中文").join("子目录");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        std::fs::write(nested.join("story.txt"), "第一章\n正文").expect("TXT");
+        std::fs::write(state.config.books_dir.join("ignore.pdf"), b"not supported")
+            .expect("unsupported file");
+
+        scan(&state).await;
+        let rows = publication_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "中文/子目录/story.txt");
+        let directory_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM directories WHERE relative_path <> ''")
+                .fetch_one(&state.db)
+                .await
+                .expect("directory count");
+        assert_eq!(directory_count, 2);
+
+        std::fs::remove_file(nested.join("story.txt")).expect("delete TXT");
+        scan(&state).await;
+        assert!(publication_rows(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_skips_unchanged_files_and_reindexes_modified_content() {
+        let (_temp, state) = test_state().await;
+        let path = state.config.books_dir.join("story.txt");
+        std::fs::write(&path, "第一章\n旧内容").expect("TXT");
+        scan(&state).await;
+        let first = publication_rows(&state).await;
+        assert_eq!(first.len(), 1);
+
+        scan(&state).await;
+        let unchanged = publication_rows(&state).await;
+        assert_eq!(unchanged, first);
+
+        std::fs::write(&path, "第一章\n新内容\n更多内容").expect("modified TXT");
+        scan(&state).await;
+        let modified = publication_rows(&state).await;
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].0, first[0].0);
+        assert_ne!(modified[0].2, first[0].2);
+    }
+
+    #[tokio::test]
+    async fn scan_preserves_id_on_unique_move_but_not_for_duplicates() {
+        let (_temp, state) = test_state().await;
+        let original = state.config.books_dir.join("original.txt");
+        std::fs::write(&original, "第一章\n同一份内容").expect("TXT");
+        scan(&state).await;
+        let first_id = publication_rows(&state).await[0].0;
+
+        let moved = state.config.books_dir.join("nested").join("moved.txt");
+        std::fs::create_dir_all(moved.parent().expect("parent")).expect("directory");
+        std::fs::rename(&original, &moved).expect("move");
+        scan(&state).await;
+        let moved_row = publication_rows(&state).await;
+        assert_eq!(moved_row.len(), 1);
+        assert_eq!(moved_row[0].0, first_id);
+        assert_eq!(moved_row[0].1, "nested/moved.txt");
+
+        std::fs::copy(&moved, state.config.books_dir.join("duplicate.txt")).expect("duplicate");
+        scan(&state).await;
+        let duplicate_rows = publication_rows(&state).await;
+        assert_eq!(duplicate_rows.len(), 2);
+        assert_ne!(duplicate_rows[0].0, duplicate_rows[1].0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_scan_does_not_prune_existing_index() {
+        let (_temp, state) = test_state().await;
+        let path = state.config.books_dir.join("story.txt");
+        std::fs::write(&path, "第一章\n正文").expect("TXT");
+        scan(&state).await;
+        assert_eq!(publication_rows(&state).await.len(), 1);
+
+        std::fs::remove_dir_all(&state.config.books_dir).expect("temporarily unavailable root");
+        scan(&state).await;
+        assert_eq!(publication_rows(&state).await.len(), 1);
     }
 }

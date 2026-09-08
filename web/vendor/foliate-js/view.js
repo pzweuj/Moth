@@ -1,9 +1,6 @@
 import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
-import { textWalker } from './text-walker.js'
-
-const SEARCH_PREFIX = 'foliate-search:'
 
 const isZip = async file => {
     const arr = new Uint8Array(await file.slice(0, 4).arrayBuffer())
@@ -170,9 +167,6 @@ export class View extends HTMLElement {
     #sectionProgress
     #tocProgress
     #pageProgress
-    #searchResults = new Map()
-    #searchDraw
-    #searchDrawOptions
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
     isFixedLayout = false
@@ -255,10 +249,8 @@ export class View extends HTMLElement {
         this.#sectionProgress = null
         this.#tocProgress = null
         this.#pageProgress = null
-        this.#searchResults = new Map()
         this.lastLocation = null
         this.history.clear()
-        this.tts = null
         this.mediaOverlay = null
     }
     goToTextStart() {
@@ -322,21 +314,6 @@ export class View extends HTMLElement {
     }
     async addAnnotation(annotation, remove) {
         const { value } = annotation
-        if (value.startsWith(SEARCH_PREFIX)) {
-            const cfi = value.replace(SEARCH_PREFIX, '')
-            const { index, anchor } = await this.resolveNavigation(cfi)
-            const obj = this.#getOverlayer(index)
-            if (obj) {
-                const { overlayer, doc } = obj
-                if (remove) {
-                    overlayer.remove(value)
-                    return
-                }
-                const range = doc ? anchor(doc) : anchor
-                overlayer.add(value, range, this.#searchDraw, this.#searchDrawOptions)
-            }
-            return
-        }
         const { index, anchor } = await this.resolveNavigation(value)
         const obj = this.#getOverlayer(index)
         if (obj) {
@@ -362,13 +339,10 @@ export class View extends HTMLElement {
         const overlayer = new Overlayer()
         doc.addEventListener('click', e => {
             const [value, range] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
+            if (value) {
                 this.#emit('show-annotation', { value, index, range })
             }
         }, false)
-
-        const list = this.#searchResults.get(index)
-        if (list) for (const item of list) this.addAnnotation(item)
 
         this.#emit('create-overlay', { index })
         return overlayer
@@ -476,72 +450,6 @@ export class View extends HTMLElement {
     }
     goRight() {
         return this.book.dir === 'rtl' ? this.prev() : this.next()
-    }
-    async * #searchSection(matcher, query, index) {
-        const doc = await this.book.sections[index].createDocument()
-        for (const { range, excerpt } of matcher(doc, query))
-            yield { cfi: this.getCFI(index, range), excerpt }
-    }
-    async * #searchBook(matcher, query) {
-        const { sections } = this.book
-        for (const [index, { createDocument }] of sections.entries()) {
-            if (!createDocument) continue
-            const doc = await createDocument()
-            const subitems = Array.from(matcher(doc, query), ({ range, excerpt }) =>
-                ({ cfi: this.getCFI(index, range), excerpt }))
-            const progress = (index + 1) / sections.length
-            yield { progress }
-            if (subitems.length) yield { index, subitems }
-        }
-    }
-    async * search(opts) {
-        this.clearSearch()
-        this.#searchDraw = opts.draw ?? Overlayer.outline
-        this.#searchDrawOptions = opts.drawOptions
-        const { searchMatcher } = await import('./search.js')
-        const { query, index } = opts
-        const matcher = searchMatcher(textWalker,
-            { defaultLocale: this.language, ...opts })
-        const iter = index != null
-            ? this.#searchSection(matcher, query, index)
-            : this.#searchBook(matcher, query)
-
-        const list = []
-        this.#searchResults.set(index, list)
-
-        for await (const result of iter) {
-            if (result.subitems){
-                const list = result.subitems
-                    .map(({ cfi }) => ({ value: SEARCH_PREFIX + cfi }))
-                this.#searchResults.set(result.index, list)
-                for (const item of list) this.addAnnotation(item)
-                yield {
-                    label: this.#tocProgress.getProgress(result.index)?.label ?? '',
-                    subitems: result.subitems,
-                }
-            }
-            else {
-                if (result.cfi) {
-                    const item = { value: SEARCH_PREFIX + result.cfi }
-                    list.push(item)
-                    this.addAnnotation(item)
-                }
-                yield result
-            }
-        }
-        yield 'done'
-    }
-    clearSearch() {
-        for (const list of this.#searchResults.values())
-            for (const item of list) this.deleteAnnotation(item)
-        this.#searchResults.clear()
-    }
-    async initTTS(granularity = 'word', highlight) {
-        const doc = this.renderer.getContents()[0].doc
-        if (this.tts && this.tts.doc === doc) return
-        const { TTS } = await import('./tts.js')
-        this.tts = new TTS(doc, textWalker, highlight || (range =>
-            this.renderer.scrollToAnchor(range, true)), granularity)
     }
     startMediaOverlay() {
         const { index } = this.renderer.getContents()[0]

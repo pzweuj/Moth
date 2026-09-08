@@ -38,14 +38,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(auth::logout),
         )
         .route("/home", get(books::home))
-        .route("/libraries", get(library::list_libraries))
-        .route("/libraries/{key}/browse", get(library::browse_library))
-        .route(
-            "/libraries/{key}/scan",
-            axum::routing::post(library::start_library_scan),
-        )
-        .route("/libraries/{key}/scan/status", get(library::scan_status))
-        .route("/publications", get(books::list_books))
+        .route("/browse", get(library::browse))
+        .route("/scan", axum::routing::post(library::start_scan))
+        .route("/scan/status", get(library::scan_status))
         .route("/publications/{id}", get(books::get_book))
         .route("/publications/{id}/cover", get(books::get_cover))
         .route("/publications/{id}/file", get(books::get_file))

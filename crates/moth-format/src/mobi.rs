@@ -6,50 +6,17 @@
 
 use std::path::Path;
 
-use crate::{ParseError, ParsedBook};
-
-/// Parse a MOBI file. Text is emitted as a small number of heuristically
-/// split chapters, rendered as HTML.
-pub fn parse(path: &Path) -> Result<ParsedBook, ParseError> {
-    let book = mobi::Mobi::from_path(path).map_err(|error| ParseError::Mobi(error.to_string()))?;
-    let text = match book.content_as_string() {
-        Ok(text) => text,
-        Err(_) => book.content_as_string_lossy(),
-    };
-    if text.trim().is_empty() {
-        return Err(ParseError::NoContent);
-    }
-
-    let title = book.title();
-    let author = book.author();
-    let cover = first_cover(&book);
-
-    let chapters = crate::txt::split_and_render(&text, path);
-
-    Ok(ParsedBook {
-        format: crate::BookFormat::Mobi,
-        title,
-        author,
-        cover,
-        chapters,
-        resources: Vec::new(),
-        pages: Vec::new(),
-    })
-}
+use crate::{Metadata, ParseError};
 
 /// Extract only MOBI metadata and the conventional first image cover. The
 /// scanner uses this path so opening a large MOBI is the only operation that
 /// decompresses its full text.
-pub fn parse_metadata(path: &Path) -> Result<ParsedBook, ParseError> {
+pub fn parse_metadata(path: &Path) -> Result<Metadata, ParseError> {
     let book = mobi::Mobi::from_path(path).map_err(|error| ParseError::Mobi(error.to_string()))?;
-    Ok(ParsedBook {
-        format: crate::BookFormat::Mobi,
+    Ok(Metadata {
         title: book.title(),
         author: book.author(),
         cover: first_cover(&book),
-        chapters: Vec::new(),
-        resources: Vec::new(),
-        pages: Vec::new(),
     })
 }
 
