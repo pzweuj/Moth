@@ -5,7 +5,7 @@ import { makeRangeLoader } from "./zipLoader";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
 import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
-import type { FoliateBook, FoliateViewElement } from "../../vendor/foliate-js/view.js";
+import type { FoliateBook, FoliateRenderer, FoliateViewElement } from "../../vendor/foliate-js/view.js";
 import { EPUB } from "../../vendor/foliate-js/epub.js";
 import "../../vendor/foliate-js/view.js";
 
@@ -41,6 +41,17 @@ type RelocateLocation = {
 type ResolvedNavigation = { index?: unknown };
 
 const LOAD_TIMEOUT_MS = 30_000;
+const READER_PAGE_GAP = "2%";
+const READER_PAGE_MARGIN = "16px";
+
+function applyReaderLayout(renderer: FoliateRenderer, settings: ReaderSettings): void {
+  // Foliate's paginator defaults to a 7% page gap and 48px top/bottom
+  // margins. Keep the layout compact for every reflowable format, including
+  // TXT and MOBI after MOBI conversion.
+  renderer.setAttribute("gap", READER_PAGE_GAP);
+  renderer.setAttribute("margin", READER_PAGE_MARGIN);
+  renderer.setAttribute("flow", settings.flow);
+}
 
 function sectionCount(book: FoliateBook): number {
   const sections = (book as { sections?: unknown }).sections;
@@ -263,7 +274,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     themeRef.current = theme;
     const renderer = viewRef.current?.renderer;
     if (!renderer) return;
-    renderer.setAttribute("flow", settings.flow);
+    applyReaderLayout(renderer, settings);
     renderer.setStyles(readerCss(settings, theme));
   }, [settings, theme]);
 
@@ -370,7 +381,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
 
       await withTimeout(view.open(book), "排版书籍超时，请重试");
       if (cancelled) return;
-      view.renderer.setAttribute("flow", settingsRef.current.flow);
+      applyReaderLayout(view.renderer, settingsRef.current);
       view.renderer.setStyles(readerCss(settingsRef.current, themeRef.current));
 
       const position = saved?.position;

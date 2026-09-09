@@ -95,7 +95,7 @@ a { color: inherit; }
 .series-cover span { color: var(--app-accent); font: 700 12px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
 .series-info h4 { color: var(--app-heading); font-size: 15px; font-weight: 500; line-height: 1.35; margin: 8px 0 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .series-info p { color: var(--app-muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; margin: 0; }
-.directory-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.directory-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-inline: auto; max-width: 1180px; }
 .directory-card { background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 12px; padding: 16px; text-decoration: none; }
 .directory-card span { color: var(--app-muted); font-size: 13px; margin: 0; }
 .directory-card { display: flex; flex-direction: column; gap: 5px; }
@@ -103,7 +103,7 @@ a { color: inherit; }
 .breadcrumbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 auto 20px; max-width: 1180px; }
 .breadcrumbs a { color: var(--app-accent-strong); font-size: 14px; text-decoration: none; }
 .breadcrumbs a:not(:last-child)::after { color: var(--app-muted); content: " /"; margin-left: 8px; }
-.book-grid { display: grid; gap: 22px 16px; grid-template-columns: repeat(auto-fill, minmax(144px, 1fr)); }
+.book-grid { display: grid; gap: 22px 16px; grid-template-columns: repeat(auto-fill, minmax(144px, 1fr)); margin-inline: auto; max-width: 1180px; }
 .book-card { min-width: 0; text-decoration: none; }
 .book-cover { aspect-ratio: 2 / 3; background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 8px; display: grid; place-items: center; overflow: hidden; }
 .book-cover img { height: 100%; object-fit: cover; width: 100%; }
@@ -137,7 +137,7 @@ a { color: inherit; }
 .sw-update button { background: #fff; border: 0; border-radius: 6px; color: var(--app-accent-strong); cursor: pointer; padding: 5px 9px; }
 .sw-update .quiet-button { background: transparent; color: #fff; }
 .reader-stage { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; position: relative; }
-.reader-content { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; overflow: auto; padding: 12px clamp(10px, 3vw, 48px) 72px; position: relative; }
+.reader-content { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; overflow: auto; padding: 8px clamp(6px, 1.5vw, 24px) 32px; position: relative; }
 .reader-shell .reader-content,
 .reader-shell .reader-navigation-list,
 .reader-shell .reader-host,
@@ -189,7 +189,7 @@ a { color: inherit; }
 .reader-page-drawer .reader-navigation-item img { aspect-ratio: 2 / 3; background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 4px; display: block; object-fit: contain; width: 100%; }
 .reader-page-drawer .reader-navigation-item small { padding: 0 4px 3px; text-align: center; }
 .comic-reader { --comic-page-height: calc(100dvh - 116px); }
-.comic-reader .reader-content { padding-inline: clamp(8px, 3vw, 48px); }
+.comic-reader .reader-content { padding-inline: clamp(2px, 1vw, 16px); }
 .comic-pages { align-items: stretch; display: flex; gap: 10px; justify-content: center; min-height: 100%; width: 100%; }
 .comic-page { align-items: center; display: flex; justify-content: center; min-width: 0; position: relative; }
 .comic-single .comic-page { width: 100%; }
@@ -204,6 +204,19 @@ a { color: inherit; }
 .comic-webtoon .comic-page { flex: 0 0 auto; min-height: 80px; width: 100%; }
 .comic-webtoon .comic-pages img { height: auto; max-height: none; max-width: 100%; width: 100%; }
 .comic-webtoon .comic-page .reader-loading { min-height: 160px; width: 100%; }
+
+@media (min-width: 761px) {
+  html:has(.reader-shell), body:has(.reader-shell) {
+    overflow: hidden;
+    scrollbar-width: none;
+  }
+  html:has(.reader-shell)::-webkit-scrollbar,
+  body:has(.reader-shell)::-webkit-scrollbar {
+    display: none;
+    height: 0;
+    width: 0;
+  }
+}
 
 @media (max-width: 760px) {
   .auth-shell { align-items: stretch; display: flex; flex-direction: column; justify-content: center; padding: 70px 20px 28px; }
