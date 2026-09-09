@@ -13,6 +13,8 @@ pub enum AppError {
     Validation(String),
     #[error("invalid credentials")]
     Unauthorized,
+    #[error("login rate limit exceeded")]
+    LoginThrottled(u64),
     #[error("not found")]
     NotFound,
     #[error("archive error: {0}")]
@@ -46,6 +48,11 @@ struct ErrorDetail {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match &self {
+            Self::LoginThrottled(seconds) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "login_throttled".to_owned(),
+                format!("登录尝试过于频繁，请在 {seconds} 秒后重试"),
+            ),
             Self::Validation(message) => (
                 StatusCode::BAD_REQUEST,
                 "validation_error".to_owned(),
@@ -83,12 +90,19 @@ impl IntoResponse for AppError {
                 )
             }
         };
-        (
+        let mut response = (
             status,
             axum::Json(ErrorBody {
                 error: ErrorDetail { code, message },
             }),
         )
-            .into_response()
+            .into_response();
+        if let Self::LoginThrottled(seconds) = self {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                seconds.to_string().parse().expect("numeric Retry-After"),
+            );
+        }
+        response
     }
 }

@@ -13,6 +13,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::time::{Duration, Instant};
 use time::{Duration as CookieDuration, OffsetDateTime};
 
 use crate::{error::AppError, state::AppState};
@@ -22,6 +23,47 @@ const MIN_PASSWORD_CHARS: usize = 10;
 const MAX_USERNAME_CHARS: usize = 64;
 /// Minimum gap between `last_used_at` refreshes for one session.
 const LAST_USED_REFRESH_SECS: i64 = 60;
+
+/// Global to this single-user server: changing usernames or proxy headers
+/// must not create a fresh guessing budget. Rejected requests do not extend it.
+#[derive(Default)]
+pub struct LoginThrottle {
+    attempts: u32,
+    last_attempt: Option<Instant>,
+    next_attempt: Option<Instant>,
+}
+
+impl LoginThrottle {
+    fn admit(&mut self, now: Instant) -> Result<(), AppError> {
+        if let Some(next) = self.next_attempt
+            && next > now
+        {
+            return Err(AppError::LoginThrottled(
+                next.duration_since(now).as_secs() + 1,
+            ));
+        }
+        if self
+            .last_attempt
+            .is_some_and(|last| now.duration_since(last) >= Duration::from_secs(900))
+        {
+            self.attempts = 0;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        let delay = if self.attempts < 5 {
+            1
+        } else {
+            (2_u64.pow((self.attempts - 4).min(6))).min(60)
+        };
+        self.last_attempt = Some(now);
+        self.next_attempt = Some(now + Duration::from_secs(delay));
+        Ok(())
+    }
+
+    fn success(&mut self) {
+        self.attempts = 0;
+        // Keep the minimum interval, even for repeated successful logins.
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Credentials {
@@ -73,12 +115,15 @@ pub async fn login(
     jar: CookieJar,
     payload: Result<Json<Credentials>, JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
+    state.login_throttle.lock().await.admit(Instant::now())?;
     let Json(credentials) =
         payload.map_err(|_| AppError::Validation("Request body must be valid JSON".to_owned()))?;
     let credentials = validate_credentials(credentials)?;
     if !verify_user(&state, &credentials).await? {
         return Err(AppError::Unauthorized);
     }
+
+    state.login_throttle.lock().await.success();
 
     let token = create_session(&state).await?;
     let cookie = session_cookie(&state, &token);
@@ -175,6 +220,11 @@ async fn create_user(state: &AppState, credentials: &Credentials) -> Result<(), 
 }
 
 async fn verify_user(state: &AppState, credentials: &Credentials) -> Result<bool, AppError> {
+    let permit = state
+        .login_verifications
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::LoginThrottled(1))?;
     let row = sqlx::query("SELECT username, password_hash FROM user_account WHERE id = 1")
         .fetch_optional(&state.db)
         .await?;
@@ -184,21 +234,24 @@ async fn verify_user(state: &AppState, credentials: &Credentials) -> Result<bool
 
     let username: String = row.try_get("username")?;
     let password_hash: String = row.try_get("password_hash")?;
-    if username != credentials.username {
-        return Ok(false);
-    }
+    let username_matches = username == credentials.username;
 
     // Password verification runs off the async runtime; it is deliberately slow.
     let password = credentials.password.clone();
-    let verified = tokio::task::spawn_blocking(move || match PasswordHash::new(&password_hash) {
-        Ok(parsed_hash) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_ok(),
-        Err(_) => false,
+    let verified = tokio::task::spawn_blocking(move || {
+        // Own the permit inside the blocking task so a disconnected client
+        // cannot free capacity while Argon2 is still running.
+        let _permit = permit;
+        match PasswordHash::new(&password_hash) {
+            Ok(parsed_hash) => Argon2::default()
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok(),
+            Err(_) => false,
+        }
     })
     .await
     .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
-    Ok(verified)
+    Ok(verified && username_matches)
 }
 
 fn hash_password(password: &str) -> Result<String, AppError> {
@@ -354,6 +407,96 @@ mod tests {
         let db = connect(&config).await.expect("database");
         let state = AppState::new(config, db);
         (temp, state)
+    }
+
+    #[test]
+    fn throttle_backs_off_without_extending_rejected_requests() {
+        let mut throttle = LoginThrottle::default();
+        let mut now = Instant::now();
+        for delay in [1, 1, 1, 1, 2, 4, 8, 16, 32, 60, 60] {
+            throttle.admit(now).expect("admitted after cooldown");
+            let next = throttle.next_attempt;
+            assert!(matches!(
+                throttle.admit(now),
+                Err(AppError::LoginThrottled(_))
+            ));
+            assert_eq!(throttle.next_attempt, next);
+            assert_eq!(next, Some(now + Duration::from_secs(delay)));
+            now += Duration::from_secs(delay);
+        }
+        throttle.success();
+        throttle.admit(now).expect("success resets backoff");
+        assert_eq!(throttle.next_attempt, Some(now + Duration::from_secs(1)));
+        throttle.attempts = 20;
+        now += Duration::from_secs(900);
+        throttle.admit(now).expect("idle resets backoff");
+        assert_eq!(throttle.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn login_throttle_is_shared_and_returns_retry_after() {
+        let (_temp, state) = test_state().await;
+        let cloned = state.clone();
+        state
+            .login_throttle
+            .lock()
+            .await
+            .admit(Instant::now())
+            .unwrap();
+        let result = login(
+            State(cloned),
+            CookieJar::new(),
+            Ok(Json(Credentials {
+                username: "another-user".to_owned(),
+                password: "another password".to_owned(),
+            })),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("must throttle"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn verification_rejects_wrong_username_and_bounds_concurrency() {
+        let (_temp, state) = test_state().await;
+        let credentials = Credentials {
+            username: "moth".to_owned(),
+            password: "a secure password".to_owned(),
+        };
+        create_user(&state, &credentials).await.unwrap();
+        let wrong_user = Credentials {
+            username: "unknown".to_owned(),
+            ..credentials.clone()
+        };
+        assert!(!verify_user(&state, &wrong_user).await.unwrap());
+        let permit = state
+            .login_verifications
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_user(&state, &credentials).await,
+            Err(AppError::LoginThrottled(1))
+        ));
+        drop(permit);
+        assert!(verify_user(&state, &credentials).await.unwrap());
+        let response = login(
+            State(state.clone()),
+            CookieJar::new(),
+            Ok(Json(credentials)),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(state.login_throttle.lock().await.attempts, 0);
     }
 
     #[test]

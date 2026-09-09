@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 
@@ -18,6 +18,8 @@ pub struct ScanStatus {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub login_throttle: Arc<Mutex<crate::auth::LoginThrottle>>,
+    pub login_verifications: Arc<Semaphore>,
     pub config: Config,
     pub db: SqlitePool,
     pub scan_status: Arc<Mutex<ScanStatus>>,
@@ -29,6 +31,8 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, db: SqlitePool) -> Self {
         Self {
+            login_throttle: Arc::new(Mutex::new(crate::auth::LoginThrottle::default())),
+            login_verifications: Arc::new(Semaphore::new(1)),
             config,
             db,
             scan_status: Arc::new(Mutex::new(ScanStatus::default())),
