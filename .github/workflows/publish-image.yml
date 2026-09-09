@@ -1,0 +1,75 @@
+name: Publish container image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Publish versioned image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect release commit
+        id: version
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          subject="${COMMIT_MESSAGE%%$'\n'*}"
+          subject="${subject%$'\r'}"
+          if [[ "$subject" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$subject" >> "$GITHUB_OUTPUT"
+            echo "Release commit detected: $subject"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "Commit subject is not a release version; skipping image publish."
+          fi
+
+      - name: Check out source
+        if: steps.version.outputs.matched == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.matched == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.version.outputs.matched == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase image name
+        if: steps.version.outputs.matched == 'true'
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        if: steps.version.outputs.matched == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push image
+        if: steps.version.outputs.matched == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

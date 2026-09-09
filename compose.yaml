@@ -1,27 +1,11 @@
 services:
   moth:
-    image: moth:dev
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/pzweuj/moth:latest
     ports:
       - "8080:8080"
-    environment:
-      MOTH_BIND_ADDR: 0.0.0.0:8080
-      MOTH_DATA_DIR: /data
-      MOTH_BOOKS_DIR: /books
-      MOTH_WEB_DIR: /app/web
-      MOTH_COOKIE_SECURE: ${MOTH_COOKIE_SECURE:-false}
-      MOTH_SESSION_TTL_DAYS: ${MOTH_SESSION_TTL_DAYS:-30}
-      MOTH_LOG: ${MOTH_LOG:-info}
     volumes:
-      - type: bind
-        source: ./data
-        target: /data
-      - type: bind
-        source: ${MOTH_BOOKS_PATH:-./books}
-        target: /books
-        read_only: true
+      - ./data:/data
+      - ./books:/books
     healthcheck:
       test:
         - CMD-SHELL

@@ -21,14 +21,14 @@ $env:MOTH_WEB_DIR = "web/dist"
 cargo run -p moth-server
 ```
 
-生产环境的重要变量：
+生产镜像内置以下配置：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MOTH_BIND_ADDR` | `0.0.0.0:8080` | 监听地址 |
 | `MOTH_DATA_DIR` | `/data` | SQLite、封面、TXT 和 MOBI 缓存目录 |
 | `MOTH_BOOKS_DIR` | `/books` | 只读书库根目录 |
-| `MOTH_WEB_DIR` | `web/dist` | 前端静态文件目录 |
+| `MOTH_WEB_DIR` | `/app/web` | 前端静态文件目录 |
 | `MOTH_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true` |
 | `MOTH_SESSION_TTL_DAYS` | `30` | 会话有效期 |
 | `MOTH_LOG` | `info` | tracing 过滤器 |
@@ -50,15 +50,18 @@ cargo run -p moth-server --example make_books -- .local/books
 
 ## Docker Compose
 
-准备一个数据目录和只读书库目录：
+Compose 默认使用 `ghcr.io/pzweuj/moth:latest`。私有镜像需先登录 GHCR。
+
+准备目录并启动：
 
 ```powershell
 New-Item -ItemType Directory -Force data, books
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 docker compose ps
 ```
 
-Compose 将宿主机的 `MOTH_BOOKS_PATH` 挂载到 `/books:ro`，将 `./data` 挂载到 `/data`。容器以 UID/GID `10001` 的非 root 用户运行。通过反向代理终止 TLS 时设置 `MOTH_COOKIE_SECURE=true`。
+Compose 将 `./data` 挂载到 `/data`，将 `./books` 挂载到 `/books`。容器以 UID/GID `10001` 的非 root 用户运行。要固定版本，修改 `image`，例如 `ghcr.io/pzweuj/moth:v0.0.1`。
 
 ## API 概览
 
