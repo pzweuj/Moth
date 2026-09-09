@@ -62,7 +62,7 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
 function HomeView({ value, loading }: { value: HomeResponse | null; loading: boolean }) {
   return <>
     <Section title="继续阅读" books={value?.continue_reading ?? []} loading={loading} />
-    <section className="library-section directory-section"><div className="section-heading"><h2>目录</h2></div>{loading ? <p className="shelf-hint">正在读取书库…</p> : value?.directories?.length ? <div className="directory-modules">{value.directories.map((directory) => <DirectoryModule directory={directory} key={directory.path} />)}</div> : <p className="shelf-hint">这里还没有目录。</p>}</section>
+    <section className="library-section directory-section"><div className="section-heading"><h2>目录</h2><Link className="section-link" to="/browse?view=browse&path=">浏览全部</Link></div>{loading ? <p className="shelf-hint">正在读取书库…</p> : value?.directories?.length ? <div className="directory-modules">{value.directories.map((directory) => <DirectoryModule directory={directory} key={directory.path} />)}</div> : <p className="shelf-hint">这里还没有目录。</p>}</section>
   </>;
 }
 

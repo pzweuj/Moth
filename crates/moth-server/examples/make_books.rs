@@ -122,7 +122,7 @@ fn main() {
             r#"<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Chapter One</title><link rel="stylesheet" href="../css/main.css"/></head>
-<body><h1>Chapter One</h1>{paragraphs}<img src="../Images/cover.png" alt="cover"/>
+<body><h1 id="chapter-one">Chapter One</h1>{paragraphs}<p><a href="ch2.xhtml#chapter-two">Continue to Chapter Two</a></p><img src="../Images/cover.png" alt="cover"/>
 <script>window.__mothBookScriptRan = true; fetch('https://moth-fixture.invalid/script');</script>
 <img src="https://moth-fixture.invalid/image" onerror="window.__mothBookScriptRan=true"/>
 </body></html>"#
@@ -136,7 +136,7 @@ fn main() {
         br#"<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Chapter Two</title></head>
-<body><h1>Chapter Two</h1><p>And then it continued.</p></body>
+<body><h1 id="chapter-two">Chapter Two</h1><p>And then it continued.</p></body>
 </html>"#,
     )
     .expect("ch2");

@@ -27,7 +27,7 @@ export type PublicationSummary = {
 
 export type BookDetail = PublicationSummary & {
   chapters: Array<{ idx: number; title: string; character_count: number }>;
-  pages: Array<{ idx: number; path: string; mime: string }>;
+  pages: Array<{ idx: number; path: string; mime: string; width?: number; height?: number }>;
 };
 
 export type DirectorySummary = { name: string; path: string; publication_count: number };
@@ -55,14 +55,23 @@ export class ApiError extends Error {
 export async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 30_000);
-  try { return await fetch(input, { ...init, signal: init.signal ?? controller.signal, credentials: "same-origin" }); }
-  finally { window.clearTimeout(timeout); }
+  const parentSignal = init.signal;
+  const abort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) abort();
+    else parentSignal.addEventListener("abort", abort, { once: true });
+  }
+  try { return await fetch(input, { ...init, signal: controller.signal, credentials: "same-origin" }); }
+  finally {
+    window.clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abort);
+  }
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const response = await fetch(`/api/v1${path}`, { ...init, headers, credentials: "same-origin" });
+  const response = await fetchWithTimeout(`/api/v1${path}`, { ...init, headers });
   if (response.status === 204) return undefined as T;
   const text = await response.text();
   let value: unknown = null;
@@ -82,12 +91,12 @@ export const api = {
   session: () => request<SessionState>("/session"),
   home: () => request<HomeResponse>("/home"),
   browse: (path = "") => request<BrowseResponse>(`/browse?path=${encodeURIComponent(path)}`),
-  book: (id: number) => request<BookDetail>(`/publications/${id}`),
-  progress: (id: number) => request<ProgressBody | null>(`/publications/${id}/progress`),
-  saveProgress: (id: number, value: ProgressBody) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value) }),
-  chapter: (id: number, index: number, encoding?: string) => request<ChapterContent>(`/publications/${id}/chapters/${index}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`),
-  conversion: (id: number) => request<ConversionResponse>(`/publications/${id}/conversion`),
-  startConversion: (id: number) => request<ConversionResponse>(`/publications/${id}/conversion`, { method: "POST" }),
+  book: (id: number, encoding?: string, signal?: AbortSignal) => request<BookDetail>(`/publications/${id}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
+  progress: (id: number, signal?: AbortSignal) => request<ProgressBody | null>(`/publications/${id}/progress`, { signal }),
+  saveProgress: (id: number, value: ProgressBody, options: { keepalive?: boolean } = {}) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value), keepalive: options.keepalive }),
+  chapter: (id: number, index: number, encoding?: string, signal?: AbortSignal) => request<ChapterContent>(`/publications/${id}/chapters/${index}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
+  conversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { signal }),
+  startConversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { method: "POST", signal }),
   scan: () => request<void>("/scan", { method: "POST" }),
   scanStatus: () => request<ScanStatus>("/scan/status"),
 };

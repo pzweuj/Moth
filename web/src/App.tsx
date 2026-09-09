@@ -44,7 +44,7 @@ export default function App() {
   return <BrowserRouter>{update && <UpdateNotice registration={update} onDismiss={() => setUpdate(null)} />}<Routes>
     <Route path="/setup" element={setup ? <Navigate to="/login" replace /> : <SetupPage onDone={refresh} {...{ theme, onToggleTheme }} />} />
     <Route path="/login" element={!setup ? <Navigate to="/setup" replace /> : session.authenticated ? <Navigate to="/" replace /> : <LoginPage onDone={refresh} {...{ theme, onToggleTheme }} />} />
-    <Route path="/reader/:id" element={<Protected session={session}><ReaderPage theme={theme} /></Protected>} />
+    <Route path="/reader/:id" element={<Protected session={session}><ReaderPage theme={theme} onToggleTheme={onToggleTheme} /></Protected>} />
     <Route path="*" element={<Protected session={session}><LibraryPage onLogout={async () => { await api.logout(); await refresh(); }} {...{ theme, onToggleTheme }} /></Protected>} />
   </Routes></BrowserRouter>;
 }

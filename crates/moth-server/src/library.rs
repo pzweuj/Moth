@@ -479,11 +479,12 @@ pub(crate) async fn write_text_cache(
         let start = bytes.len() as i64;
         bytes.extend_from_slice(body.as_bytes());
         let end = bytes.len() as i64;
-        // The virtual TXT section renders its chapter title as an h1, then a
-        // single newline, before the normalized body. The locator covers
-        // exactly those visible UTF-16 code units.
+        // The virtual TXT section renders a title as an h1 followed by one
+        // newline. Untitled chunks contain only their body; keeping this
+        // conditional is what makes UTF-16 offsets agree with Range#toString.
+        let title_break = usize::from(!title.trim().is_empty());
         let character_count =
-            (title.encode_utf16().count() + 1 + body.encode_utf16().count()) as i64;
+            (title.encode_utf16().count() + title_break + body.encode_utf16().count()) as i64;
         ranges.push((idx as i64, title.clone(), start, end, character_count));
     }
     let target = dir.join("book.utf8");

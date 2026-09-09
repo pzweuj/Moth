@@ -62,6 +62,15 @@ describe("useProgressSaver", () => {
     expect(saveProgress.mock.calls[2][1].position.page_index).toBe(2);
   });
 
+  it("uses a keepalive request when the page is hidden", async () => {
+    render(<Harness />);
+    fireEvent.click(screen.getByRole("button", { name: "save one" }));
+    fireEvent(window, new Event("pagehide"));
+    await settle();
+    expect(saveProgress).toHaveBeenCalledTimes(1);
+    expect(saveProgress.mock.calls[0][2]).toEqual({ keepalive: true });
+  });
+
   it("flushes the previous publication when the reader route changes", async () => {
     const view = render(<SwitchingHarness publicationId={7} />);
     fireEvent.click(screen.getByRole("button", { name: "save" }));

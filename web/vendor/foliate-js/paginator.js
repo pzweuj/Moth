@@ -241,7 +241,10 @@ class View {
         })
         // Book XHTML is untrusted input. Reader events are handled by the
         // parent renderer and do not require scripts in the book iframe.
-        this.#iframe.setAttribute('sandbox', 'allow-same-origin')
+        // WebKit does not dispatch clicks from a sandboxed document without
+        // allow-scripts. Book XHTML receives a strict script-free CSP in the
+        // loader, so this only restores host-side link/event delivery.
+        this.#iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         this.#iframe.setAttribute('scrolling', 'no')
     }
     get element() {
@@ -253,7 +256,12 @@ class View {
     async load(src, afterLoad, beforeRender) {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
+            let settled = false
+            let fallbackTimer
+            const finish = () => {
+                if (settled) return
+                settled = true
+                clearTimeout(fallbackTimer)
                 const doc = this.document
                 afterLoad?.(doc)
 
@@ -278,7 +286,31 @@ class View {
                 doc.fonts.ready.then(() => this.expand())
 
                 resolve()
+            }
+            this.#iframe.addEventListener('load', finish, { once: true })
+            this.#iframe.addEventListener('error', () => {
+                void loadAsSrcdoc()
             }, { once: true })
+            const loadAsSrcdoc = async () => {
+                if (settled || !/^(?:blob|data):/i.test(src)) return
+                try {
+                    const response = await fetch(src)
+                    if (!response.ok || settled) return
+                    const text = await response.text()
+                    if (settled) return
+                    this.#iframe.removeAttribute('src')
+                    this.#iframe.srcdoc = text
+                } catch {
+                    // Keep the original navigation in place. The reader-level
+                    // timeout will report a retryable error if it also fails.
+                }
+            }
+            // Some embedded WebKit shells do not dispatch load for a sandboxed
+            // blob iframe even though the same document is readable. Give the
+            // normal navigation a short head start, then use srcdoc without
+            // enabling scripts or changing the document's resource URLs.
+            fallbackTimer = setTimeout(() => { void loadAsSrcdoc() }, 1500)
+            this.#iframe.removeAttribute('srcdoc')
             this.#iframe.src = src
         })
     }
@@ -507,6 +539,13 @@ export class Paginator extends HTMLElement {
             grid-column: 2 / 5;
             grid-row: 2;
             overflow: hidden;
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+        #container::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 1 / -1;
@@ -1120,7 +1159,7 @@ export class Paginator extends HTMLElement {
     }
     destroy() {
         this.#observer.unobserve(this)
-        this.#view.destroy()
+        this.#view?.destroy()
         this.#view = null
         this.sections[this.#index]?.unload?.()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)

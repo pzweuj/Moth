@@ -67,7 +67,7 @@ impl AppState {
             .data_dir
             .join("mobi")
             .join(version)
-            .join("mobi-epub-v1")
+            .join("mobi-epub-v2")
     }
 }
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type ProgressBody, type ReadingPosition } from "../api";
 
 type PendingWrite = { publicationId: number; value: ProgressBody };
-type QueuedWrite = { pending: PendingWrite; allowStale: boolean };
+type QueuedWrite = { pending: PendingWrite; allowStale: boolean; keepalive: boolean };
 
 type Options = {
   publicationId: number;
@@ -36,15 +36,16 @@ export function useProgressSaver({ publicationId, contentVersion }: Options): Pr
   const mounted = useRef(true);
   const [error, setError] = useState("");
 
-  const enqueue = useCallback((pending: PendingWrite, allowStale = false): Promise<void> => {
+  const enqueue = useCallback((pending: PendingWrite, allowStale = false, keepalive = false): Promise<void> => {
     if (queued.current?.pending === pending) {
       // A route-change flush can upgrade a write that was already queued by
       // the debounce timer. It must not be discarded merely because the new
       // book produced a position before the old request reached the queue.
       queued.current.allowStale ||= allowStale;
+      queued.current.keepalive ||= keepalive;
       return queue.current;
     }
-    const queuedWrite: QueuedWrite = { pending, allowStale };
+    const queuedWrite: QueuedWrite = { pending, allowStale, keepalive };
     queued.current = queuedWrite;
     const task = queue.current
       .catch(() => undefined)
@@ -54,7 +55,7 @@ export function useProgressSaver({ publicationId, contentVersion }: Options): Pr
         // a stale success that clears the newer dirty value.
         if (!queuedWrite.allowStale && latest.current !== pending) return;
         try {
-          await api.saveProgress(pending.publicationId, pending.value);
+          await api.saveProgress(pending.publicationId, pending.value, { keepalive: queuedWrite.keepalive });
           if (latest.current === pending) dirty.current = false;
         } catch (reason) {
           if (latest.current === pending) {
@@ -70,14 +71,14 @@ export function useProgressSaver({ publicationId, contentVersion }: Options): Pr
     return task;
   }, []);
 
-  const flush = useCallback((allowStale = false): Promise<void> => {
+  const flush = useCallback((allowStale = false, keepalive = false): Promise<void> => {
     if (timer.current !== null) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
     const pending = latest.current;
     if (!pending || !dirty.current) return queue.current;
-    return enqueue(pending, allowStale);
+    return enqueue(pending, allowStale, keepalive);
   }, [enqueue]);
 
   const save = useCallback((position: ReadingPosition, version = contentVersion): void => {
@@ -106,9 +107,9 @@ export function useProgressSaver({ publicationId, contentVersion }: Options): Pr
   useEffect(() => {
     mounted.current = true;
     const onVisibilityChange = () => {
-      if (document.visibilityState === "hidden") void flush(true).catch(() => undefined);
+      if (document.visibilityState === "hidden") void flush(true, true).catch(() => undefined);
     };
-    const onPageHide = () => { void flush(true).catch(() => undefined); };
+    const onPageHide = () => { void flush(true, true).catch(() => undefined); };
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("pagehide", onPageHide);
     return () => {
@@ -117,7 +118,7 @@ export function useProgressSaver({ publicationId, contentVersion }: Options): Pr
       // The dependency list includes the publication identity. React runs
       // this cleanup before a new book's effects, so a route change flushes
       // the old book while its pending value is still current.
-      void flush(true).catch(() => undefined);
+      void flush(true, true).catch(() => undefined);
       if (timer.current !== null) {
         window.clearTimeout(timer.current);
         timer.current = null;

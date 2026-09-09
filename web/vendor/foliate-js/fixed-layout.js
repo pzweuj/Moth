@@ -55,6 +55,13 @@ export class FixedLayout extends HTMLElement {
             justify-content: center;
             align-items: center;
             overflow: auto;
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+        :host::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
         }`)
 
         this.#observer.observe(this)
@@ -81,9 +88,10 @@ export class FixedLayout extends HTMLElement {
             display: 'none',
             overflow: 'hidden',
         })
-        // Book documents are untrusted input; reader events are handled by
-        // the parent renderer and do not require scripts in the book iframe.
-        iframe.setAttribute('sandbox', 'allow-same-origin')
+        // WebKit does not dispatch clicks from a sandboxed document without
+        // allow-scripts. The EPUB loader injects a strict script-free CSP, so
+        // this only restores host-side link/event delivery.
+        iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)

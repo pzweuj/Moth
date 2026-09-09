@@ -1,9 +1,10 @@
 //! Publication API and format-specific reader endpoints.
 
 use std::{
-    io::{Read, Write},
+    collections::HashMap,
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use axum::{
@@ -13,6 +14,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
+use quick_xml::{Reader as XmlReader, events::Event};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -24,7 +27,7 @@ use crate::{
     state::{AppState, ConversionState},
 };
 
-const CONTENT_ADAPTER_VERSION: &str = "core-v1";
+const CONTENT_ADAPTER_VERSION: &str = "core-v2";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicationSummary {
@@ -54,6 +57,10 @@ pub struct PageInfo {
     pub idx: i64,
     pub path: String,
     pub mime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +144,11 @@ pub struct ConversionResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ChapterQuery {
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BookQuery {
     pub encoding: Option<String>,
 }
 
@@ -308,15 +320,48 @@ pub async fn get_book(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<BookQuery>,
 ) -> Result<Json<BookDetail>, AppError> {
     let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    ensure_source_current(&row).await?;
+    let encoding = query
+        .encoding
+        .as_deref()
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    if row.format == "txt" {
+        ensure_txt_encoding(&state, &row, &encoding).await?;
+    }
     let summary = fetch_publications(&state.db, Some(row.directory_id), Some("title"))
         .await?
         .into_iter()
         .find(|value| value.id == id)
         .ok_or(AppError::NotFound)?;
-    let chapters = sqlx::query("SELECT idx,title,character_count FROM text_chapters WHERE publication_id=? AND encoding='auto' ORDER BY idx").bind(id).fetch_all(&state.db).await?.into_iter().map(|row| Ok(ChapterInfo { idx: row.try_get("idx")?, title: row.try_get("title")?, character_count: row.try_get("character_count")? })).collect::<Result<Vec<_>, sqlx::Error>>()?;
-    let pages =
+    let mut summary = summary;
+    if row.format == "txt" {
+        summary.content_version = current_content_version(&row, Some(&encoding));
+    }
+    let chapters = sqlx::query(
+        "SELECT idx,title,character_count FROM text_chapters WHERE publication_id=? AND encoding=? ORDER BY idx",
+    )
+    .bind(id)
+    .bind(if row.format == "txt" {
+        encoding.as_str()
+    } else {
+        "auto"
+    })
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(ChapterInfo {
+            idx: row.try_get("idx")?,
+            title: row.try_get("title")?,
+            character_count: row.try_get("character_count")?,
+        })
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let mut pages =
         sqlx::query("SELECT idx,path,mime FROM cbz_pages WHERE publication_id=? ORDER BY idx")
             .bind(id)
             .fetch_all(&state.db)
@@ -327,9 +372,22 @@ pub async fn get_book(
                     idx: row.try_get("idx")?,
                     path: row.try_get("path")?,
                     mime: row.try_get("mime")?,
+                    width: None,
+                    height: None,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    if row.format == "cbz" {
+        let source = ensure_source_current(&row).await?;
+        let entries = pages.iter().map(|page| page.path.clone()).collect();
+        let dimensions = page_dimensions(source, entries).await?;
+        for (page, dimensions) in pages.iter_mut().zip(dimensions) {
+            if let Some((width, height)) = dimensions {
+                page.width = Some(width);
+                page.height = Some(height);
+            }
+        }
+    }
     Ok(Json(BookDetail {
         summary,
         chapters,
@@ -364,6 +422,63 @@ pub async fn get_cover(
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("cover response"))
+}
+
+async fn ensure_txt_encoding(
+    state: &AppState,
+    row: &PublicationRow,
+    encoding: &str,
+) -> Result<(), AppError> {
+    if !supported_encoding(encoding) {
+        return Err(AppError::Validation("unsupported TXT encoding".to_owned()));
+    }
+    if encoding == "auto" {
+        return Ok(());
+    }
+    let chapter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
+    )
+    .bind(row.id)
+    .bind(encoding)
+    .fetch_one(&state.db)
+    .await?;
+    if chapter_count == 0 {
+        let path = ensure_source_current(row).await?;
+        let version = current_content_version(row, Some(encoding));
+        crate::library::write_text_cache(state, row.id, &version, &path, encoding).await?;
+    }
+    Ok(())
+}
+
+async fn page_dimensions(
+    source: PathBuf,
+    entries: Vec<String>,
+) -> Result<Vec<Option<(u32, u32)>>, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(source)?;
+        let mut archive = ZipArchive::new(file).map_err(std::io::Error::other)?;
+        let mut dimensions = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Ok(mut item) = archive.by_name(&entry) else {
+                dimensions.push(None);
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if item.read_to_end(&mut bytes).is_err() {
+                dimensions.push(None);
+                continue;
+            }
+            let value = image::ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|reader| reader.into_dimensions().ok());
+            dimensions.push(value);
+        }
+        Ok::<_, std::io::Error>(dimensions)
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))?
+    .map_err(AppError::Io)
 }
 
 pub async fn get_file(
@@ -436,21 +551,7 @@ pub async fn get_chapter(
         .as_deref()
         .unwrap_or("auto")
         .to_ascii_lowercase();
-    if !supported_encoding(&encoding) {
-        return Err(AppError::Validation("unsupported TXT encoding".to_owned()));
-    }
-    let chapter_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
-    )
-    .bind(id)
-    .bind(&encoding)
-    .fetch_one(&state.db)
-    .await?;
-    if chapter_count == 0 && encoding != "auto" {
-        let path = row.root.join(&row.relative_path);
-        let version = current_content_version(&row, Some(&encoding));
-        crate::library::write_text_cache(&state, id, &version, &path, &encoding).await?;
-    }
+    ensure_txt_encoding(&state, &row, &encoding).await?;
     let chapter = sqlx::query(
         "SELECT title,byte_start,byte_end,character_count FROM text_chapters WHERE publication_id=? AND encoding=? AND idx=?",
     )
@@ -1086,8 +1187,6 @@ fn parse_range(value: &str, total: u64) -> Option<(u64, u64)> {
 }
 
 fn convert_mobi(source: &Path, directory: &Path) -> Result<(), AppError> {
-    std::fs::create_dir_all(directory)?;
-    let target = directory.join("book.epub");
     let book = mobi::Mobi::from_path(source).map_err(mobi_conversion_error)?;
     let text = match book.content_as_string() {
         Ok(text) => text,
@@ -1096,33 +1195,895 @@ fn convert_mobi(source: &Path, directory: &Path) -> Result<(), AppError> {
     if text.trim().is_empty() {
         return Err(mobi_conversion_error("没有可读取的正文"));
     }
-    let title = xml_escape(&book.title());
-    let author = xml_escape(&book.author().unwrap_or_default());
+    let raw_title = book.title();
+    let title = if raw_title.trim().is_empty() {
+        "未命名 MOBI".to_owned()
+    } else {
+        raw_title
+    };
+    let author = book.author().unwrap_or_default();
     let mut image_items = Vec::new();
-    let mut image_paths = std::collections::HashMap::new();
-    for record in book.image_records() {
+    let mut image_paths = HashMap::new();
+    for (ordinal, record) in book.image_records().into_iter().enumerate() {
         let Some((extension, mime)) = mobi_image_type(record.content) else {
             continue;
         };
         let path = format!("images/record-{}.{}", record.record.id, extension);
-        image_paths.insert(record.record.id, path.clone());
+        image_paths
+            .entry(record.record.id)
+            .or_insert_with(|| path.clone());
+        image_paths
+            .entry(u32::try_from(ordinal).unwrap_or(u32::MAX))
+            .or_insert_with(|| path.clone());
+        image_paths
+            .entry(u32::try_from(ordinal + 1).unwrap_or(u32::MAX))
+            .or_insert_with(|| path.clone());
         image_items.push((path, mime, record.content.to_vec()));
     }
-    let mut html = if text.to_ascii_lowercase().contains("<html") {
-        moth_format::html::sanitize_html(&text)
-    } else {
-        format!("<p>{}</p>", xml_escape(&text).replace('\n', "</p><p>"))
-    };
-    // Classic MOBI embeds image references as `recindex` attributes. Repoint
-    // those references at the image entries written into the generated EPUB.
-    for (record_id, path) in &image_paths {
-        for quote in [
-            format!("recindex=\"{record_id}\""),
-            format!("recindex='{record_id}'"),
-        ] {
-            html = html.replace(&quote, &format!("src=\"{path}\""));
+
+    let mut chapters = mobi_chapters(&text, &image_paths);
+    if chapters.is_empty() {
+        return Err(mobi_conversion_error("没有可读取的正文"));
+    }
+    rewrite_mobi_links(&mut chapters);
+    let bytes = build_mobi_epub(&title, &author, &chapters, &image_items)?;
+    let image_paths = image_items
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .collect::<Vec<_>>();
+    validate_generated_epub(&bytes, chapters.len(), &image_paths)?;
+
+    let target = directory.join("book.epub");
+    std::fs::create_dir_all(directory)?;
+    let temp = directory.join("book.epub.tmp");
+    std::fs::write(&temp, bytes)?;
+    match std::fs::rename(&temp, &target) {
+        Ok(()) => Ok(()),
+        Err(_error) if target.exists() => {
+            let _ = std::fs::remove_file(&temp);
+            Ok(())
+        }
+        Err(error) => Err(AppError::Io(error)),
+    }
+}
+
+const MOBI_CHAPTER_CHAR_LIMIT: usize = 80_000;
+
+#[derive(Debug, Clone)]
+struct MobiChapter {
+    title: Option<String>,
+    body: String,
+}
+
+fn mobi_chapters(text: &str, image_paths: &HashMap<u32, String>) -> Vec<MobiChapter> {
+    let body = normalize_mobi_markup(&extract_mobi_body(text));
+    let html_like = Regex::new(
+        r"(?is)<(?:p|div|h[1-6]|br|img|a|ul|ol|li|table|blockquote|pre|section|article)\b",
+    )
+    .expect("MOBI HTML detector");
+    if html_like.is_match(&body) {
+        let body = rewrite_mobi_images(&body, image_paths);
+        let mut chapters = Vec::new();
+        for piece in body.split("<!--MOTH-PAGEBREAK-->") {
+            let piece = repair_mobi_fragment(piece);
+            for fragment in split_long_markup(&piece) {
+                let fragment = repair_mobi_fragment(&fragment);
+                if !mobi_fragment_has_content(&fragment) {
+                    continue;
+                }
+                chapters.push(MobiChapter {
+                    title: mobi_heading_title(&fragment),
+                    body: fragment,
+                });
+            }
+        }
+        return chapters;
+    }
+
+    // Some classic MOBI producers store plain text in PalmDOC records. Use
+    // paragraph and heading rules for that input without pretending generated
+    // chunks are an original publisher TOC.
+    plain_mobi_chapters(&body.replace("<!--MOTH-PAGEBREAK-->", "\n\n"))
+}
+
+fn extract_mobi_body(text: &str) -> String {
+    let body_re = Regex::new(r"(?is)<body\b[^>]*>(.*?)</body\s*>").expect("MOBI body extractor");
+    if let Some(captures) = body_re.captures(text) {
+        return captures
+            .get(1)
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default();
+    }
+
+    let mut body = text.to_owned();
+    for pattern in [
+        r"(?is)<head\b[^>]*>.*?</head\s*>",
+        r"(?is)<!doctype[^>]*>",
+        r"(?is)<\?xml[^>]*\?>",
+        r"(?is)</?html\b[^>]*>",
+        r"(?is)</?body\b[^>]*>",
+    ] {
+        body = Regex::new(pattern)
+            .expect("MOBI wrapper pattern")
+            .replace_all(&body, "")
+            .into_owned();
+    }
+    body
+}
+
+fn normalize_mobi_markup(value: &str) -> String {
+    let mut body = value
+        .chars()
+        .filter(|character| {
+            matches!(character, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}')
+        })
+        .collect::<String>();
+    body = Regex::new(r"(?is)<\s*mbp:pagebreak\b[^>]*>|<\s*pagebreak\b[^>]*>")
+        .expect("MOBI page break pattern")
+        .replace_all(&body, "<!--MOTH-PAGEBREAK-->")
+        .into_owned();
+    body = Regex::new(r"(?is)</?\s*mbp:[^>]*>")
+        .expect("MOBI namespace pattern")
+        .replace_all(&body, "")
+        .into_owned();
+    body = moth_format::html::sanitize_html(&body);
+    body = escape_stray_markup(&body);
+    body = normalize_named_entities(&body);
+    normalize_void_elements(&body)
+}
+
+fn escape_stray_markup(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let rest = &value[index..];
+        if rest.starts_with('<') {
+            let next = rest.as_bytes().get(1).copied();
+            let valid = next.is_some_and(|byte| byte.is_ascii_alphabetic())
+                || rest.starts_with("<!--")
+                || rest.starts_with("</")
+                || rest.starts_with("<!");
+            if !valid {
+                output.push_str("&lt;");
+                index += '<'.len_utf8();
+                continue;
+            }
+        }
+        let character = rest.chars().next().unwrap_or_default();
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
+}
+
+fn normalize_named_entities(value: &str) -> String {
+    let entity = Regex::new(r"&([A-Za-z][A-Za-z0-9]+);").expect("HTML entity pattern");
+    let normalized = entity
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let name = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            match name.to_ascii_lowercase().as_str() {
+                "amp" => "&amp;".to_owned(),
+                "lt" => "&lt;".to_owned(),
+                "gt" => "&gt;".to_owned(),
+                "quot" => "&quot;".to_owned(),
+                "apos" => "&apos;".to_owned(),
+                "nbsp" => "&#160;".to_owned(),
+                "copy" => "&#169;".to_owned(),
+                "reg" => "&#174;".to_owned(),
+                "trade" => "&#8482;".to_owned(),
+                "mdash" => "&#8212;".to_owned(),
+                "ndash" => "&#8211;".to_owned(),
+                "hellip" => "&#8230;".to_owned(),
+                "ldquo" => "&#8220;".to_owned(),
+                "rdquo" => "&#8221;".to_owned(),
+                "lsquo" => "&#8216;".to_owned(),
+                "rsquo" => "&#8217;".to_owned(),
+                "bull" => "&#8226;".to_owned(),
+                "middot" => "&#183;".to_owned(),
+                _ => format!("&amp;{name};"),
+            }
+        })
+        .into_owned();
+    escape_bare_ampersands(&normalized)
+}
+
+fn escape_bare_ampersands(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.find('&') {
+        output.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        if let Some(length) = xml_entity_length(tail) {
+            output.push_str(&tail[..length]);
+            rest = &tail[length..];
+        } else {
+            output.push_str("&amp;");
+            rest = &tail[1..];
         }
     }
+    output.push_str(rest);
+    output
+}
+
+fn xml_entity_length(value: &str) -> Option<usize> {
+    for entity in ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"] {
+        if value.starts_with(entity) {
+            return Some(entity.len());
+        }
+    }
+    let bytes = value.as_bytes();
+    if !bytes.starts_with(b"&#") {
+        return None;
+    }
+    let mut index = 2;
+    if matches!(bytes.get(index), Some(b'x' | b'X')) {
+        index += 1;
+        let start = index;
+        while matches!(bytes.get(index), Some(byte) if byte.is_ascii_hexdigit()) {
+            index += 1;
+        }
+        if index == start || bytes.get(index) != Some(&b';') {
+            return None;
+        }
+    } else {
+        let start = index;
+        while matches!(bytes.get(index), Some(byte) if byte.is_ascii_digit()) {
+            index += 1;
+        }
+        if index == start || bytes.get(index) != Some(&b';') {
+            return None;
+        }
+    }
+    Some(index + 1)
+}
+
+fn normalize_void_elements(value: &str) -> String {
+    let void = Regex::new(
+        r"(?is)<(area|base|br|embed|hr|img|input|link|meta|param|source|track|wbr)\b([^>]*?)(?:\s*/)?\s*>",
+    )
+    .expect("MOBI XHTML void pattern");
+    let normalized = void
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            format!(
+                "<{}{} />",
+                captures[1].to_ascii_lowercase(),
+                captures
+                    .get(2)
+                    .map(|value| value.as_str())
+                    .unwrap_or_default()
+            )
+        })
+        .into_owned();
+    Regex::new(r"(?is)</(?:area|base|br|embed|hr|img|input|link|meta|param|source|track|wbr)\s*>")
+        .expect("MOBI XHTML closing pattern")
+        .replace_all(&normalized, "")
+        .into_owned()
+}
+
+fn repair_mobi_fragment(value: &str) -> String {
+    let token =
+        Regex::new(r"(?is)<!--.*?-->|<\s*/?\s*[A-Za-z][^>]*>").expect("MOBI tag token pattern");
+    let tag = Regex::new(r"(?is)^<\s*(/?)\s*([A-Za-z][A-Za-z0-9:._-]*)\b([^>]*)>$")
+        .expect("MOBI tag parser pattern");
+    let mut output = String::with_capacity(value.len() + 32);
+    let mut stack: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    for match_ in token.find_iter(value) {
+        output.push_str(&escape_unterminated_markup(&value[cursor..match_.start()]));
+        let raw = match_.as_str();
+        if raw.starts_with("<!--") {
+            output.push_str(raw);
+            cursor = match_.end();
+            continue;
+        }
+        let Some(captures) = tag.captures(raw) else {
+            cursor = match_.end();
+            continue;
+        };
+        let name = captures[2].to_ascii_lowercase();
+        if !is_mobi_tag(&name) {
+            output.push_str(&raw.replace('<', "&lt;").replace('>', "&gt;"));
+            cursor = match_.end();
+            continue;
+        }
+        let closing = !captures[1].is_empty();
+        let attributes = normalize_mobi_attributes(
+            captures
+                .get(3)
+                .map(|value| value.as_str())
+                .unwrap_or_default(),
+        );
+        let void = matches!(
+            name.as_str(),
+            "area"
+                | "base"
+                | "br"
+                | "embed"
+                | "hr"
+                | "img"
+                | "input"
+                | "link"
+                | "meta"
+                | "param"
+                | "source"
+                | "track"
+                | "wbr"
+        ) || attributes.trim_end().ends_with('/');
+        if closing {
+            if let Some(index) = stack.iter().rposition(|value| value == &name) {
+                while stack.len() > index + 1 {
+                    if let Some(open) = stack.pop() {
+                        output.push_str("</");
+                        output.push_str(&open);
+                        output.push('>');
+                    }
+                }
+                stack.pop();
+                output.push_str("</");
+                output.push_str(&name);
+                output.push('>');
+            }
+        } else if void {
+            output.push('<');
+            output.push_str(&name);
+            output.push_str(attributes.trim_end_matches('/').trim_end());
+            output.push_str(" />");
+        } else {
+            output.push('<');
+            output.push_str(&name);
+            output.push_str(&attributes);
+            output.push('>');
+            stack.push(name);
+        }
+        cursor = match_.end();
+    }
+    output.push_str(&escape_unterminated_markup(&value[cursor..]));
+    while let Some(open) = stack.pop() {
+        output.push_str("</");
+        output.push_str(&open);
+        output.push('>');
+    }
+    output
+}
+
+fn escape_unterminated_markup(value: &str) -> String {
+    value.replace('<', "&lt;")
+}
+
+fn normalize_mobi_attributes(value: &str) -> String {
+    let attribute = Regex::new(
+        r#"(?is)([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))"#,
+    )
+    .expect("MOBI attribute pattern");
+    let mut seen = std::collections::HashSet::new();
+    let mut output = String::new();
+    for captures in attribute.captures_iter(value) {
+        let name = captures[1].to_ascii_lowercase();
+        if name.contains(':') || name.starts_with("on") || !seen.insert(name.clone()) {
+            continue;
+        }
+        let value = captures
+            .get(2)
+            .or_else(|| captures.get(3))
+            .or_else(|| captures.get(4))
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        if value
+            .chars()
+            .any(|character| character == '<' || character == '>' || character == '\0')
+        {
+            continue;
+        }
+        output.push(' ');
+        output.push_str(&name);
+        output.push_str("=\"");
+        output.push_str(&escape_mobi_attribute(value));
+        output.push('"');
+    }
+    output
+}
+
+fn escape_mobi_attribute(value: &str) -> String {
+    let value = normalize_named_entities(value);
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value.as_str();
+    while let Some(index) = rest.find('&') {
+        output.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        if tail.starts_with("&amp;")
+            || tail.starts_with("&lt;")
+            || tail.starts_with("&gt;")
+            || tail.starts_with("&quot;")
+            || tail.starts_with("&apos;")
+            || tail.starts_with("&#")
+        {
+            output.push('&');
+            rest = &tail[1..];
+        } else {
+            output.push_str("&amp;");
+            rest = &tail[1..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn is_mobi_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "abbr"
+            | "b"
+            | "big"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "caption"
+            | "center"
+            | "cite"
+            | "code"
+            | "col"
+            | "dd"
+            | "del"
+            | "div"
+            | "dl"
+            | "dt"
+            | "em"
+            | "font"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "html"
+            | "i"
+            | "img"
+            | "li"
+            | "ol"
+            | "p"
+            | "pre"
+            | "q"
+            | "s"
+            | "small"
+            | "span"
+            | "strike"
+            | "strong"
+            | "sub"
+            | "sup"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "title"
+            | "tr"
+            | "tt"
+            | "u"
+            | "ul"
+            | "var"
+    )
+}
+
+fn rewrite_mobi_images(value: &str, image_paths: &HashMap<u32, String>) -> String {
+    let image = Regex::new(r"(?is)<img\b([^>]*?)>").expect("MOBI image pattern");
+    let recindex =
+        Regex::new(r#"(?i)\brecindex\s*=\s*["']?(\d+)["']?"#).expect("MOBI recindex pattern");
+    let embed = Regex::new(r"(?i)kindle:(?:embed|image):(\d+)").expect("MOBI embed pattern");
+    let src = Regex::new(r#"(?i)\s+src\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#)
+        .expect("MOBI image src pattern");
+    image
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let attrs = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let record = recindex
+                .captures(attrs)
+                .and_then(|value| value.get(1))
+                .and_then(|value| value.as_str().parse::<u32>().ok())
+                .or_else(|| {
+                    embed
+                        .captures(attrs)
+                        .and_then(|value| value.get(1))
+                        .and_then(|value| value.as_str().parse::<u32>().ok())
+                });
+            let Some(path) = record.and_then(|value| image_paths.get(&value)) else {
+                return captures[0].to_owned();
+            };
+            let attrs = recindex.replace_all(attrs, "").into_owned();
+            let attrs = embed.replace_all(&attrs, "").into_owned();
+            let attrs = src.replace_all(&attrs, "").into_owned();
+            format!("<img{attrs} src=\"{path}\" />")
+        })
+        .into_owned()
+}
+
+fn split_long_markup(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.chars().count() <= MOBI_CHAPTER_CHAR_LIMIT {
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value.to_owned()]
+        };
+    }
+
+    let mut output = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let remaining = &value[start..];
+        if remaining.chars().count() <= MOBI_CHAPTER_CHAR_LIMIT {
+            if !remaining.trim().is_empty() {
+                output.push(remaining.trim().to_owned());
+            }
+            break;
+        }
+
+        let target = byte_index_after_chars(remaining, MOBI_CHAPTER_CHAR_LIMIT);
+        let max_boundary = byte_index_after_chars(remaining, MOBI_CHAPTER_CHAR_LIMIT * 2);
+        let boundaries = mobi_paragraph_boundaries(remaining);
+        let end = boundaries
+            .iter()
+            .copied()
+            .take_while(|end| *end <= target)
+            .last()
+            .or_else(|| boundaries.iter().copied().find(|end| *end <= max_boundary))
+            .unwrap_or(target);
+        let end = safe_markup_boundary(remaining, end);
+        let end = if end == 0 { target.max(1) } else { end };
+        let fragment = remaining[..end].trim();
+        if !fragment.is_empty() {
+            output.push(fragment.to_owned());
+        }
+        start += end;
+    }
+    output
+}
+
+fn safe_markup_boundary(value: &str, target: usize) -> usize {
+    let target = target.min(value.len());
+    let before = &value[..target];
+    let last_lt = before.rfind('<');
+    let last_gt = before.rfind('>');
+    if last_lt.is_some_and(|index| Some(index) > last_gt) {
+        return value[target..]
+            .find('>')
+            .map(|index| target + index + 1)
+            .unwrap_or(target);
+    }
+    let last_amp = before.rfind('&');
+    let last_semicolon = before.rfind(';');
+    if last_amp.is_some_and(|index| Some(index) > last_semicolon) {
+        return value[target..]
+            .find(';')
+            .map(|index| target + index + 1)
+            .unwrap_or(target);
+    }
+    target
+}
+
+fn mobi_paragraph_boundaries(value: &str) -> Vec<usize> {
+    let bytes = value.as_bytes();
+    let mut boundaries = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        let mut quote = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(mark) = quote {
+                if byte == mark {
+                    quote = None;
+                }
+            } else if byte == b'\'' || byte == b'"' {
+                quote = Some(byte);
+            } else if byte == b'>' {
+                let raw = &value[start..=index];
+                if mobi_is_paragraph_boundary(raw) {
+                    boundaries.push(index + 1);
+                }
+                index += 1;
+                break;
+            }
+            index += 1;
+        }
+        if index >= bytes.len() && quote.is_some() {
+            break;
+        }
+    }
+    boundaries
+}
+
+fn mobi_is_paragraph_boundary(raw: &str) -> bool {
+    let mut tag = raw.strip_prefix('<').unwrap_or(raw).trim_start_matches('/');
+    tag = tag.trim_start();
+    let name = tag
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if raw
+        .strip_prefix('<')
+        .is_some_and(|value| value.trim_start().starts_with('/'))
+    {
+        matches!(
+            name.as_str(),
+            "p" | "li" | "blockquote" | "pre" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        )
+    } else {
+        name == "br"
+    }
+}
+
+fn byte_index_after_chars(value: &str, count: usize) -> usize {
+    value
+        .char_indices()
+        .nth(count)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+fn mobi_fragment_has_content(value: &str) -> bool {
+    let text = mobi_markup_text(value);
+    !text.trim().is_empty()
+        || Regex::new(r"(?is)<img\b")
+            .expect("MOBI image content pattern")
+            .is_match(value)
+}
+
+fn mobi_heading_title(value: &str) -> Option<String> {
+    let heading =
+        Regex::new(r"(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>").expect("MOBI heading pattern");
+    heading
+        .captures(value)
+        .and_then(|captures| captures.get(1))
+        .map(|value| mobi_markup_text(value.as_str()))
+        .filter(|value| !value.is_empty())
+}
+
+fn mobi_markup_text(value: &str) -> String {
+    let value = Regex::new(r"(?is)<br\s*/?>")
+        .expect("MOBI line break pattern")
+        .replace_all(value, "\n")
+        .into_owned();
+    let value = Regex::new(r"(?is)<[^>]+>")
+        .expect("MOBI tag pattern")
+        .replace_all(&value, "")
+        .into_owned();
+    value
+        .replace("&#160;", " ")
+        .replace("&#xa0;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn plain_mobi_chapters(text: &str) -> Vec<MobiChapter> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut logical = Vec::new();
+    let mut title = None;
+    let mut lines = Vec::new();
+    for line in normalized.lines() {
+        if let Some(next_title) = plain_mobi_heading(line) {
+            push_plain_logical(&mut logical, title.take(), &lines);
+            lines.clear();
+            title = Some(next_title);
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    push_plain_logical(&mut logical, title, &lines);
+
+    let mut chapters = Vec::new();
+    for (title, body) in logical {
+        let chunks = split_plain_body(&body);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            chapters.push(MobiChapter {
+                title: (index == 0).then(|| title.clone()).flatten(),
+                body: render_plain_mobi_fragment(
+                    (index == 0).then_some(title.as_deref()).flatten(),
+                    &chunk,
+                ),
+            });
+        }
+    }
+    chapters
+}
+
+fn plain_mobi_heading(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    static HEADING: OnceLock<Regex> = OnceLock::new();
+    let pattern = HEADING.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:chapter|part|volume|book|section)\s+[0-9ivxlcdm]+(?:\s*[:.\-].*|\s+.*)?$|^第\s*\d+\s*[章节回卷部篇].*$|^(?:序章|楔子|终章|尾声|番外(?:篇)?).*$",
+        )
+        .expect("MOBI plain heading pattern")
+    });
+    pattern.is_match(line).then(|| line.to_owned())
+}
+
+fn push_plain_logical(
+    output: &mut Vec<(Option<String>, String)>,
+    title: Option<String>,
+    lines: &[String],
+) {
+    let body = lines.join("\n").trim().to_owned();
+    if !body.is_empty() || title.is_some() {
+        output.push((title, body));
+    }
+}
+
+fn split_plain_body(value: &str) -> Vec<String> {
+    if value.trim().is_empty() {
+        return vec![String::new()];
+    }
+    let paragraphs = value
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let units = if paragraphs.len() == 1 && paragraphs[0].chars().count() > MOBI_CHAPTER_CHAR_LIMIT
+    {
+        value
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        paragraphs
+    };
+    let mut output = Vec::new();
+    let mut current = String::new();
+    for unit in units {
+        let separator = if current.is_empty() { "" } else { "\n\n" };
+        if !current.is_empty()
+            && current.chars().count() + separator.chars().count() + unit.chars().count()
+                > MOBI_CHAPTER_CHAR_LIMIT
+        {
+            output.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(unit);
+    }
+    if !current.is_empty() {
+        output.push(current);
+    }
+    if output.is_empty() {
+        vec![String::new()]
+    } else {
+        output
+    }
+}
+
+fn render_plain_mobi_fragment(title: Option<&str>, body: &str) -> String {
+    let mut html = String::new();
+    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+        html.push_str("<h1>");
+        html.push_str(&xml_escape(title));
+        html.push_str("</h1>");
+    }
+    for paragraph in body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        html.push_str("<p>");
+        html.push_str(&xml_escape(paragraph).replace('\n', "<br />"));
+        html.push_str("</p>");
+    }
+    html
+}
+
+fn rewrite_mobi_links(chapters: &mut [MobiChapter]) {
+    let anchor =
+        Regex::new(r#"(?i)\b(?:id|name)\s*=\s*["']([^"']+)["']"#).expect("MOBI anchor pattern");
+    let href = Regex::new(r#"(?i)(href\s*=\s*)(["'])([^"']*)(["'])"#).expect("MOBI href pattern");
+    let mut owners = HashMap::new();
+    for (index, chapter) in chapters.iter().enumerate() {
+        for captures in anchor.captures_iter(&chapter.body) {
+            if let Some(value) = captures.get(1) {
+                owners.entry(value.as_str().to_owned()).or_insert(index);
+            }
+        }
+    }
+    for (index, chapter) in chapters.iter_mut().enumerate() {
+        chapter.body = href
+            .replace_all(&chapter.body, |captures: &regex::Captures<'_>| {
+                let target = &captures[3];
+                let Some((path, fragment)) = target.split_once('#') else {
+                    return captures[0].to_owned();
+                };
+                if path.contains(':') || fragment.is_empty() {
+                    return captures[0].to_owned();
+                }
+                let Some(owner) = owners.get(fragment).copied() else {
+                    return captures[0].to_owned();
+                };
+                if owner == index && path.is_empty() {
+                    return captures[0].to_owned();
+                }
+                format!(
+                    "{}{}chapter-{}.xhtml#{}{}",
+                    &captures[1],
+                    &captures[2],
+                    owner + 1,
+                    fragment,
+                    &captures[4]
+                )
+            })
+            .into_owned();
+    }
+}
+
+fn build_mobi_epub(
+    title: &str,
+    author: &str,
+    chapters: &[MobiChapter],
+    image_items: &[(String, &'static str, Vec<u8>)],
+) -> Result<Vec<u8>, AppError> {
+    let title = xml_escape(title);
+    let author = xml_escape(author);
+    let author_element = if author.trim().is_empty() {
+        String::new()
+    } else {
+        format!("<dc:creator>{author}</dc:creator>")
+    };
+    let chapter_manifest = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            format!(
+                "<item id=\"chapter-{}\" href=\"chapter-{}.xhtml\" media-type=\"application/xhtml+xml\"/>",
+                index + 1,
+                index + 1
+            )
+        })
+        .collect::<String>();
+    let spine = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("<itemref idref=\"chapter-{}\"/>", index + 1))
+        .collect::<String>();
+    let image_manifest = image_items
+        .iter()
+        .enumerate()
+        .map(|(index, (path, mime, _))| {
+            format!("<item id=\"image-{index}\" href=\"{path}\" media-type=\"{mime}\"/>")
+        })
+        .collect::<String>();
+    let nav_items = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, chapter)| {
+            let label = chapter
+                .title
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("内容分段 {}", index + 1));
+            format!(
+                "<li><a href=\"chapter-{}.xhtml\">{}</a></li>",
+                index + 1,
+                xml_escape(&label)
+            )
+        })
+        .collect::<String>();
+
     let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default();
@@ -1133,40 +2094,173 @@ fn convert_mobi(source: &Path, directory: &Path) -> Result<(), AppError> {
     writer
         .start_file("META-INF/container.xml", deflated)
         .map_err(|error| AppError::Archive(error.to_string()))?;
-    writer.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
+    writer.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
     writer
         .start_file("OEBPS/content.opf", deflated)
         .map_err(|error| AppError::Archive(error.to_string()))?;
-    let image_manifest = image_items
-        .iter()
-        .enumerate()
-        .map(|(index, (path, mime, _))| {
-            format!("<item id=\"image-{index}\" href=\"{path}\" media-type=\"{mime}\"/>")
-        })
-        .collect::<String>();
-    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">moth-{}</dc:identifier><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator></metadata><manifest><item id="chapter-1" href="chapter-1.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{image_manifest}</manifest><spine><itemref idref="chapter-1"/></spine></package>"#, uuidish(&title)).as_bytes())?;
-    writer
-        .start_file("OEBPS/chapter-1.xhtml", deflated)
-        .map_err(|error| AppError::Archive(error.to_string()))?;
-    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body>{html}</body></html>"#).as_bytes())?;
+    writer.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">moth-{}</dc:identifier><dc:title>{title}</dc:title>{author_element}<dc:language>und</dc:language></metadata><manifest>{chapter_manifest}<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>{image_manifest}</manifest><spine>{spine}</spine></package>"#,
+            uuidish(title.as_str())
+        )
+        .as_bytes(),
+    )?;
+    for (index, chapter) in chapters.iter().enumerate() {
+        writer
+            .start_file(format!("OEBPS/chapter-{}.xhtml", index + 1), deflated)
+            .map_err(|error| AppError::Archive(error.to_string()))?;
+        writer.write_all(
+            format!(
+                r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body>{}</body></html>"#,
+                chapter.body
+            )
+            .as_bytes(),
+        )?;
+    }
     writer
         .start_file("OEBPS/nav.xhtml", deflated)
         .map_err(|error| AppError::Archive(error.to_string()))?;
-    writer.write_all(format!(r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{title}</title></head><body><nav epub:type="toc" id="toc"><h2>{title}</h2><ol><li><a href="chapter-1.xhtml">{title}</a></li></ol></nav></body></html>"#).as_bytes())?;
+    writer.write_all(
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{title}</title></head><body><nav epub:type="toc" id="toc"><h2>{title}</h2><ol>{nav_items}</ol></nav></body></html>"#
+        )
+        .as_bytes(),
+    )?;
     for (path, _mime, bytes) in image_items {
         writer
             .start_file(format!("OEBPS/{path}"), deflated)
             .map_err(|error| AppError::Archive(error.to_string()))?;
-        writer.write_all(&bytes)?;
+        writer.write_all(bytes)?;
     }
-    let bytes = writer
+    writer
         .finish()
-        .map_err(|error| AppError::Archive(error.to_string()))?
-        .into_inner();
-    let temp = target.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(temp, target)?;
+        .map_err(|error| AppError::Archive(error.to_string()))
+        .map(|cursor| cursor.into_inner())
+}
+
+fn validate_generated_epub(
+    bytes: &[u8],
+    chapter_count: usize,
+    image_paths: &[&str],
+) -> Result<(), AppError> {
+    if chapter_count == 0 {
+        return Err(AppError::Validation("MOBI 转换没有生成任何章节".to_owned()));
+    }
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| AppError::Validation(format!("生成的 EPUB 不是有效 ZIP：{error}")))?;
+    if archive.is_empty() {
+        return Err(AppError::Validation("生成的 EPUB 为空".to_owned()));
+    }
+    let (name, compression, content) = {
+        let mut entry = archive
+            .by_index(0)
+            .map_err(|error| AppError::Validation(format!("生成的 EPUB 缺少 mimetype：{error}")))?;
+        let name = entry.name().to_owned();
+        let compression = entry.compression();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content)?;
+        (name, compression, content)
+    };
+    if name != "mimetype"
+        || compression != zip::CompressionMethod::Stored
+        || content != b"application/epub+zip"
+    {
+        return Err(AppError::Validation(
+            "生成的 EPUB 的 mimetype 不符合规范".to_owned(),
+        ));
+    }
+
+    let names = (0..archive.len())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .map(|entry| entry.name().to_owned())
+                .map_err(|error| AppError::Validation(format!("读取 EPUB 目录失败：{error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let names = names.into_iter().collect::<std::collections::HashSet<_>>();
+    for required in [
+        "META-INF/container.xml",
+        "OEBPS/content.opf",
+        "OEBPS/nav.xhtml",
+    ] {
+        if !names.contains(required) {
+            return Err(AppError::Validation(format!("生成的 EPUB 缺少 {required}")));
+        }
+    }
+    for index in 1..=chapter_count {
+        let name = format!("OEBPS/chapter-{index}.xhtml");
+        if !names.contains(&name) {
+            return Err(AppError::Validation(format!("生成的 EPUB 缺少 {name}")));
+        }
+    }
+    for path in image_paths {
+        let name = format!("OEBPS/{path}");
+        if !names.contains(&name) {
+            return Err(AppError::Validation(format!(
+                "生成的 EPUB 缺少图片资源 {name}"
+            )));
+        }
+    }
+
+    let xml_names = names
+        .iter()
+        .filter(|name| name.ends_with(".xml") || name.ends_with(".opf") || name.ends_with(".xhtml"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in &xml_names {
+        let content = archive_entry_bytes(&mut archive, name)?;
+        validate_xml_document(&content, name)?;
+    }
+
+    let reference =
+        Regex::new(r#"(?i)\b(?:href|src)\s*=\s*["']([^"']+)["']"#).expect("EPUB reference pattern");
+    for name in xml_names {
+        let content = archive_entry_bytes(&mut archive, &name)?;
+        let text = String::from_utf8_lossy(&content);
+        let base = name.rsplit_once('/').map(|(base, _)| base).unwrap_or("");
+        for captures in reference.captures_iter(&text) {
+            let value = captures.get(1).map(|value| value.as_str()).unwrap_or("");
+            let local = value.split('#').next().unwrap_or("");
+            if local.is_empty() || local.contains(':') {
+                continue;
+            }
+            let resolved = moth_format::resolve_reference(base, local);
+            if !names.contains(&resolved) {
+                return Err(AppError::Validation(format!(
+                    "生成的 EPUB 引用了不存在的资源 {resolved}"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+fn archive_entry_bytes<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>, AppError> {
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|error| AppError::Validation(format!("读取生成的 EPUB {name} 失败：{error}")))?;
+    let mut content = Vec::new();
+    entry.read_to_end(&mut content)?;
+    Ok(content)
+}
+
+fn validate_xml_document(bytes: &[u8], name: &str) -> Result<(), AppError> {
+    let mut reader = XmlReader::from_reader(bytes);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => return Ok(()),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(AppError::Validation(format!(
+                    "生成的 EPUB 文档 {name} 不是合法 XML：{error}"
+                )));
+            }
+        }
+    }
 }
 
 fn mobi_conversion_error(error: impl std::fmt::Display) -> AppError {
@@ -1267,6 +2361,55 @@ mod tests {
         let decoded = image::load_from_memory(&thumbnail).expect("decode thumbnail");
         assert_eq!(decoded.width(), 240);
         assert_eq!(decoded.height(), 150);
+    }
+
+    #[test]
+    fn repairs_malformed_mobi_markup_and_xml_entities() {
+        let normalized = normalize_mobi_markup(
+            r#"<p>Tom & Jerry</p><p>宽度 <3pt" width="1em"</p><img recindex="7">"#,
+        );
+        let repaired = repair_mobi_fragment(&normalized);
+        assert!(repaired.contains("&amp;"));
+        assert!(repaired.contains("&lt;3pt"));
+        validate_xml_document(
+            format!(r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>{repaired}</body></html>"#)
+                .as_bytes(),
+            "malformed-test.xhtml",
+        )
+        .expect("repaired MOBI fragment should be XML");
+    }
+
+    #[test]
+    fn builds_mobi_epub_with_chapters_images_and_cross_chapter_links() {
+        let mut chapters = vec![
+            MobiChapter {
+                title: Some("第一章".to_owned()),
+                body: r#"<h1 id="start">第一章</h1><p><a href="source.xhtml#ending">继续</a></p>"#
+                    .to_owned(),
+            },
+            MobiChapter {
+                title: Some("第二章".to_owned()),
+                body: r#"<h1 id="ending">第二章</h1><p>结束</p>"#.to_owned(),
+            },
+        ];
+        rewrite_mobi_links(&mut chapters);
+        assert!(chapters[0].body.contains("chapter-2.xhtml#ending"));
+
+        let image = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let image_items = vec![("images/record-7.png".to_owned(), "image/png", image)];
+        let bytes = build_mobi_epub("Alice", "Author", &chapters, &image_items)
+            .expect("build converted EPUB");
+        validate_generated_epub(&bytes, chapters.len(), &["images/record-7.png"])
+            .expect("converted EPUB should validate");
+
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("valid EPUB zip");
+        let mut nav = String::new();
+        archive
+            .by_name("OEBPS/nav.xhtml")
+            .expect("nav document")
+            .read_to_string(&mut nav)
+            .expect("read nav document");
+        assert_eq!(nav.matches("<a href=").count(), 2);
     }
 
     #[test]

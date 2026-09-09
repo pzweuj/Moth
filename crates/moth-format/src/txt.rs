@@ -135,7 +135,9 @@ fn normalize(text: &str) -> String {
 /// Split decoded text into `(title, body)` chapters. Heading markers
 /// (`第N章`, `Chapter N`, ...) start chapters; without them, separator rules
 /// (`----`, `* * *`) split sections; with neither, the text is chunked into
-/// fixed-size pieces so the reader can still paginate.
+/// fixed-size pieces so the reader can still paginate. When a chapter has a
+/// title, that title is removed from the body so the reader can render it
+/// exactly once and keep its UTF-16 locator stable.
 fn split_chapters(text: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -177,27 +179,24 @@ fn split_chapters(text: &str) -> Vec<(String, String)> {
         let front = &lines[..cuts[0]];
         let body = strip_separators(&front.join("\n"));
         if !body.trim().is_empty() {
-            let title = if use_headings {
-                String::new()
-            } else {
-                first_non_empty(front).to_owned()
-            };
-            chapters.push((title, body));
+            chapters.push((String::new(), body));
         }
     }
 
     for (index, &start) in cuts.iter().enumerate() {
         let end = cuts.get(index + 1).copied().unwrap_or(lines.len());
         let slice = &lines[start..end];
-        let body = strip_separators(&slice.join("\n"));
-        if body.trim().is_empty() {
+        let (title, body_start) = if use_headings {
+            (slice[0].trim().to_owned(), 1)
+        } else {
+            (String::new(), 0)
+        };
+        let body = strip_separators(&slice[body_start..].join("\n"))
+            .trim_matches('\n')
+            .to_owned();
+        if body.trim().is_empty() && title.is_empty() {
             continue;
         }
-        let title = if use_headings {
-            slice[0].trim().to_owned()
-        } else {
-            first_non_empty(slice).to_owned()
-        };
         chapters.push((title, body));
     }
 
@@ -205,14 +204,6 @@ fn split_chapters(text: &str) -> Vec<(String, String)> {
         chapters.push(("".to_owned(), text.to_owned()));
     }
     chapters
-}
-
-fn first_non_empty<'a>(lines: &[&'a str]) -> &'a str {
-    lines
-        .iter()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim())
-        .unwrap_or("")
 }
 
 fn strip_separators(body: &str) -> String {
@@ -372,6 +363,22 @@ mod tests {
         let text = "Part one\n\n----\n\nPart two";
         let chapters = split_chapters(text);
         assert_eq!(chapters.len(), 2);
+        assert!(chapters.iter().all(|(title, _)| title.is_empty()));
+        assert!(chapters[0].1.contains("Part one"));
+        assert!(chapters[1].1.contains("Part two"));
+    }
+
+    #[test]
+    fn removes_only_recognized_heading_from_body() {
+        let text = "第一章 标题\n\n正文第一行\n正文第二行";
+        let chapters = split_chapters(text);
+        assert_eq!(
+            chapters,
+            vec![(
+                "第一章 标题".to_owned(),
+                "正文第一行\n正文第二行".to_owned()
+            )]
+        );
     }
 
     #[test]

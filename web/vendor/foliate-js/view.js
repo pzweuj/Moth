@@ -1,6 +1,8 @@
 import * as CFI from './epubcfi.js'
 import { TOCProgress, SectionProgress } from './progress.js'
 import { Overlayer } from './overlayer.js'
+import { EPUB } from './epub.js'
+import './paginator.js'
 
 const isZip = async file => {
     const arr = new Uint8Array(await file.slice(0, 4).arrayBuffer())
@@ -61,7 +63,6 @@ export const makeBook = async file => {
     let book
     if (file.isDirectory) {
         const loader = await makeDirectoryLoader(file)
-        const { EPUB } = await import('./epub.js')
         book = await new EPUB(loader).init()
     }
     else if (!file.size) throw new NotFoundError('File not found')
@@ -180,11 +181,13 @@ export class View extends HTMLElement {
         })
     }
     async open(book) {
+        this.#emit('open-stage', '准备书籍')
         if (typeof book === 'string'
         || typeof book.arrayBuffer === 'function'
         || book.isDirectory) book = await makeBook(book)
         this.book = book
         this.language = languageInfo(book.metadata?.language)
+        this.#emit('open-stage', '建立目录')
 
         if (book.splitTOCHref && book.getTOCFragment) {
             const ids = book.sections.map(s => s.id)
@@ -199,12 +202,12 @@ export class View extends HTMLElement {
                 toc: book.pageList ?? [], ids, splitHref, getFragment })
         }
 
+        this.#emit('open-stage', '加载排版引擎')
         this.isFixedLayout = this.book.rendition?.layout === 'pre-paginated'
         if (this.isFixedLayout) {
             await import('./fixed-layout.js')
             this.renderer = document.createElement('foliate-fxl')
         } else {
-            await import('./paginator.js')
             this.renderer = document.createElement('foliate-paginator')
         }
         this.renderer.setAttribute('exportparts', 'head,foot,filter')
@@ -214,6 +217,7 @@ export class View extends HTMLElement {
             e.detail.attach(this.#createOverlayer(e.detail)))
         this.renderer.open(book)
         this.#root.append(this.renderer)
+        this.#emit('open-stage', '准备正文')
 
         if (book.sections.some(section => section.mediaOverlay)) {
             const activeClass = book.media.activeClass

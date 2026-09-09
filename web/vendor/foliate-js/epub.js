@@ -79,16 +79,24 @@ const getElementText = el => normalizeWhitespace(el?.textContent)
 
 const childGetter = (doc, ns) => {
     // ignore the namespace if it doesn't appear in document at all
-    const useNS = doc.lookupNamespaceURI(null) === ns || doc.lookupPrefix(ns)
+    // A declared nav/NCX entry may still be missing from a damaged EPUB. The
+    // caller deliberately treats that as an empty document and falls back to
+    // the other navigation source or the spine; never dereference null here.
+    const useNS = !!doc && (doc.lookupNamespaceURI?.(null) === ns
+        || doc.lookupPrefix?.(ns))
     const f = useNS
         ? (el, name) => el => el.namespaceURI === ns && el.localName === name
         : (el, name) => el => el.localName === name
     return {
-        $: (el, name) => [...el.children].find(f(el, name)),
-        $$: (el, name) => [...el.children].filter(f(el, name)),
+        $: (el, name) => el?.children
+            ? [...el.children].find(f(el, name)) : undefined,
+        $$: (el, name) => el?.children
+            ? [...el.children].filter(f(el, name)) : [],
         $$$: useNS
-            ? (el, name) => [...el.getElementsByTagNameNS(ns, name)]
-            : (el, name) => [...el.getElementsByTagName(name)],
+            ? (el, name) => el?.getElementsByTagNameNS
+                ? [...el.getElementsByTagNameNS(ns, name)] : []
+            : (el, name) => el?.getElementsByTagName
+                ? [...el.getElementsByTagName(name)] : [],
     }
 }
 
@@ -858,6 +866,17 @@ class Loader {
             for (const el of doc.querySelectorAll('[style]'))
                 el.setAttribute('style',
                     await this.replaceCSS(el.getAttribute('style'), href, parents))
+            // The parent application must allow host-installed event handlers
+            // in WebKit, but book scripts and network access remain disabled.
+            // All referenced assets have already been rewritten to blob/data
+            // URLs above, so this policy preserves layout without executing
+            // untrusted EPUB code.
+            if (doc.head) {
+                const policy = doc.createElement('meta')
+                policy.setAttribute('http-equiv', 'Content-Security-Policy')
+                policy.setAttribute('content', "default-src 'none'; script-src 'none'; connect-src 'none'; img-src blob: data:; style-src blob: data: 'unsafe-inline'; font-src blob: data:; media-src blob: data:; frame-src 'none'; object-src 'none'; base-uri 'none'")
+                doc.head.prepend(policy)
+            }
             // TODO: replace inline scripts? probably not worth the trouble
             const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent)

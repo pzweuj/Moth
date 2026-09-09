@@ -20,15 +20,25 @@ export function readerCss({
 html {
   background: ${background};
   color: ${foreground};
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  display: none;
+  height: 0;
+  width: 0;
 }
 body {
   margin: 0;
-  padding: 0 clamp(16px, 6vw, 96px);
+  padding: 0;
   /* Keep the reading face local so the reader never depends on a remote font request. */
   font-family: "Noto Serif SC", "Noto Serif CJK SC", "Source Han Serif SC", "Source Han Serif", "STSong", "Songti SC", "SimSun", "NSimSun", Georgia, serif;
   font-size: ${fontSize}px !important;
   line-height: ${lineHeight};
   overflow-wrap: break-word;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 /* A number of books carry fixed inline sizes on every paragraph. Override
    those values while retaining the semantic heading scale below. */
