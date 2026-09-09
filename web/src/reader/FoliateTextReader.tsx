@@ -480,11 +480,11 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     <div className="reader-content">
       <div ref={hostRef} className="reader-host" />
       {loading && <div className="reader-loading" role="status" aria-live="polite"><span>{loadingStage}…</span></div>}
-      {error && <div className="reader-error" role="alert"><p>{error}</p><button type="button" onClick={retry}>重试</button></div>}
+      {error && <div className="reader-error" role="alert"><p>{error}</p><button className="reader-control-button reader-control-button--danger" type="button" onClick={retry}>重试</button></div>}
     </div>
     <div className="reader-bottom-bar">
-      <button type="button" onClick={() => move("prev")} disabled={loading}>上一页</button>
-      <button type="button" onClick={() => move("next")} disabled={loading}>下一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move("prev")} disabled={loading}>上一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move("next")} disabled={loading}>下一页</button>
     </div>
   </div>;
 }

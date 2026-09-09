@@ -185,17 +185,17 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
 
   return <main className="reader-shell">
     <header className="reader-titlebar">
-      <button className="quiet-button reader-back-button" type="button" onClick={() => navigate(-1)}>← 返回</button>
-      <button className="quiet-button reader-icon-button" type="button" onClick={openNavigation} aria-label={text ? "打开章节" : "打开页码"} aria-expanded={navigationOpen}>☰</button>
+      <button className="quiet-button reader-control-button reader-back-button" type="button" onClick={() => navigate(-1)}>← 返回</button>
+      <button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={openNavigation} aria-label={text ? "打开章节" : "打开页码"} aria-expanded={navigationOpen}>☰</button>
       <strong>{detail.title}</strong>
       <span className="reader-format">{detail.source_format.toUpperCase()}</span>
       <MobileClock />
-      <button className="quiet-button reader-theme-button" type="button" onClick={onToggleTheme} aria-label="切换主题">{theme === "dark" ? "日间" : "夜间"}</button>
-      <button className="quiet-button reader-icon-button" type="button" onClick={openSettings} aria-label="阅读设置" aria-expanded={settingsOpen}>Aa</button>
+      <button className="quiet-button reader-control-button reader-theme-button" type="button" onClick={onToggleTheme} aria-label="切换主题">{theme === "dark" ? "日间" : "夜间"}</button>
+      <button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={openSettings} aria-label="阅读设置" aria-expanded={settingsOpen}>Aa</button>
     </header>
     {settingsOpen && <ReaderSettingsPanel detail={detail} settings={settings} setSettings={setSettings} comicSettings={comicSettings} setComicSettings={setComicSettings} encoding={encoding} onEncodingChange={onEncodingChange} text={text} />}
     {navigationOpen && <ReaderNavigationDrawer items={navigationItems} activeId={activeNavigationId} kind={text ? "chapters" : "pages"} onSelect={selectNavigation} onClose={() => setNavigationOpen(false)} />}
-    {progressError && <div className="reader-save-status" role="status">{progressError}<button type="button" onClick={() => void retrySave()}>重试保存</button></div>}
+    {progressError && <div className="reader-save-status" role="status">{progressError}<button className="reader-control-button" type="button" onClick={() => void retrySave()}>重试保存</button></div>}
     {text
       ? <FoliateTextReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={settings} theme={theme} encoding={encoding} navigationRequest={navigationRequest} onProgress={save} onNavigationChange={(items, activeId) => { setTextNavigation(items); if (activeId) setActiveNavigationId(activeId); }} />
       : <ComicReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={comicSettings} navigationRequest={navigationRequest} onCurrentPageChange={(page) => setActiveNavigationId(String(page))} onProgress={save} />}
@@ -236,5 +236,5 @@ function ReaderSettingsPanel({ detail, settings, setSettings, comicSettings, set
 }
 
 function ReaderNavigationDrawer({ items, activeId, kind, onSelect, onClose }: { items: ReaderNavigationItem[]; activeId: string; kind: "chapters" | "pages"; onSelect: (item: ReaderNavigationItem) => void; onClose: () => void }) {
-  return <><button className="reader-drawer-backdrop" type="button" aria-label="关闭导航" onClick={onClose} /><aside className={`reader-drawer ${kind === "pages" ? "reader-page-drawer" : ""}`} aria-label={kind === "pages" ? "页码选择器" : "章节选择器"}><div className="reader-drawer-header"><h2>{kind === "pages" ? "页码" : "章节"}</h2><button className="quiet-button reader-icon-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>{items.length === 0 ? <p className="shelf-hint">正在读取…</p> : <div className="reader-navigation-list">{items.map((item) => <button className={`reader-navigation-item ${item.id === activeId ? "is-active" : ""}`} style={item.depth ? { paddingInlineStart: `${14 + Math.min(item.depth, 4) * 14}px` } : undefined} type="button" key={item.id} onClick={() => onSelect(item)}>{item.thumbnailUrl ? <img src={item.thumbnailUrl} alt="" loading="lazy" /> : <span>{item.label}</span>}{item.thumbnailUrl && <small>{item.label}</small>}</button>)}</div>}</aside></>;
+  return <><button className="reader-drawer-backdrop" type="button" aria-label="关闭导航" onClick={onClose} /><aside className={`reader-drawer ${kind === "pages" ? "reader-page-drawer" : ""}`} aria-label={kind === "pages" ? "页码选择器" : "章节选择器"}><div className="reader-drawer-header"><h2>{kind === "pages" ? "页码" : "章节"}</h2><button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>{items.length === 0 ? <p className="shelf-hint">正在读取…</p> : <div className="reader-navigation-list">{items.map((item) => <button className={`reader-navigation-item ${item.id === activeId ? "is-active" : ""}`} style={item.depth ? { paddingInlineStart: `${14 + Math.min(item.depth, 4) * 14}px` } : undefined} type="button" key={item.id} onClick={() => onSelect(item)}>{item.thumbnailUrl ? <img src={item.thumbnailUrl} alt="" loading="lazy" /> : <span>{item.label}</span>}{item.thumbnailUrl && <small>{item.label}</small>}</button>)}</div>}</aside></>;
 }

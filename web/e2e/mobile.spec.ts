@@ -10,6 +10,9 @@ async function homePublications(page: Parameters<typeof login>[0], url: string):
 test("mobile text reader uses compact chrome and a collapsible chapter drawer", async ({ page, app }) => {
   await login(page, app.url);
   await waitForScan(page, app.url);
+  await expect(page.locator(".series-cover").first()).toBeVisible();
+  const coverWidths = await page.locator(".series-cover").evaluateAll((covers) => covers.map((cover) => cover.getBoundingClientRect().width));
+  expect(Math.max(...coverWidths)).toBeLessThanOrEqual(120);
   const txt = (await homePublications(page, app.url)).find((publication) => publication.source_format === "txt");
   expect(txt).toBeTruthy();
   await page.goto(`${app.url}/reader/${txt!.id}`);
@@ -33,6 +36,8 @@ test("mobile text reader uses compact chrome and a collapsible chapter drawer", 
   expect(headerSpacing.clock && headerSpacing.theme && headerSpacing.settings).toBeTruthy();
   expect(headerSpacing.theme!.left - headerSpacing.clock!.right).toBeGreaterThanOrEqual(9);
   expect(headerSpacing.settings!.left - headerSpacing.theme!.right).toBeGreaterThanOrEqual(5);
+  const buttonHeights = await page.locator(".reader-titlebar .reader-control-button").evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().height)));
+  expect([...new Set(buttonHeights)]).toHaveLength(1);
   await expect(page.locator(".reader-bottom-bar")).toBeHidden();
   await expect(page.locator(".reader-tools")).toHaveCount(0);
   await page.getByRole("button", { name: "阅读设置", exact: true }).click();

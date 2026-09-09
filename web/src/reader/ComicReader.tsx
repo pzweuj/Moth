@@ -300,7 +300,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
             else pageRefs.current.delete(page);
           }} style={aspectRatio ? { aspectRatio } : undefined}>
             {failed.has(page)
-              ? <div className="reader-error"><p>第 {page + 1} 页加载失败</p><button type="button" onClick={() => retryPage(page)}>重试</button></div>
+              ? <div className="reader-error"><p>第 {page + 1} 页加载失败</p><button className="reader-control-button reader-control-button--danger" type="button" onClick={() => retryPage(page)}>重试</button></div>
               : loaded.has(page)
                 ? <img key={`${page}-${attempt}`} src={`/api/v1/publications/${detail.id}/pages/${page}${attempt ? `?retry=${attempt}` : ""}`} alt={`第 ${page + 1} 页`} loading={settings.mode === "webtoon" ? "lazy" : "eager"} decoding="async" onLoad={() => {
                   if (settings.mode === "webtoon" && pendingScrollRef.current?.page === page) scheduleWebtoonRestore(pendingScrollRef.current);
@@ -311,9 +311,9 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       </div>
     </div>
     <div className="reader-bottom-bar">
-      <button type="button" onClick={() => move(-step)} disabled={index <= 0}>上一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move(-step)} disabled={index <= 0}>上一页</button>
       <span>{pageCount ? `${index + 1} / ${pageCount}` : "0 / 0"}</span>
-      <button type="button" onClick={() => move(step)} disabled={!pageCount || index >= pageCount - 1}>下一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move(step)} disabled={!pageCount || index >= pageCount - 1}>下一页</button>
     </div>
   </div>;
 }
