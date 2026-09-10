@@ -55,6 +55,10 @@ test("TXT and CBZ readers use the online publication API", async ({ page, app })
     return (await progress.json())?.position?.type ?? "";
   }).toBe("txt");
   await page.goto(`${app.url}/reader/${cbz!.id}`);
+  await expect(page.locator(".comic-page img").first()).toHaveAttribute("src", /\/pages\/0/);
+  await page.getByRole("button", { name: "下一页", exact: true }).click();
+  await expect(page.locator(".comic-page img").first()).toHaveAttribute("src", /\/pages\/1/);
+  await expect.poll(async () => page.locator(".comic-page img").first().evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
   await page.getByRole("button", { name: "阅读设置", exact: true }).click();
   await expect(page.getByLabel("漫画模式", { exact: true })).toBeVisible();
   await page.getByLabel("漫画模式", { exact: true }).selectOption("double");

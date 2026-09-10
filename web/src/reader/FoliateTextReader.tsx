@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import type { BookDetail, ProgressBody, ReadingPosition } from "../api";
 import { api, bookFileUrl } from "../api";
 import { makeRangeLoader } from "./zipLoader";
+import { framePointToViewport, installPageGestures } from "./pageGestures";
 import { readerCss } from "./readerCss";
 import type { ReaderSettings } from "./settings";
 import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
@@ -287,7 +288,8 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     let publication: TextPublication | null = null;
     let suppressRelocate = true;
     const controller = new AbortController();
-    const cleanups: Array<() => void> = [];
+    const cleanups = new Map<Document, () => void>();
+    let cleanupMargins: (() => void) | undefined;
     const saved = progressRef.current;
     const isTxt = detail.source_format === "txt";
 
@@ -372,10 +374,25 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
         const detail = (event as CustomEvent<{ doc?: Document; index?: number }>).detail;
         const doc = detail?.doc;
         if (doc && view) {
-          cleanups.push(installMobileTapNavigation(doc, view, settingsRef));
+          // Release old chapter documents instead of retaining every loaded iframe.
+          for (const [previous, cleanup] of cleanups) {
+            if (previous === doc || !previous.defaultView?.frameElement?.isConnected) {
+              cleanup();
+              cleanups.delete(previous);
+            }
+          }
+          cleanups.set(doc, installMobileTapNavigation(doc, view, settingsRef, () => setError("翻页失败，请重试")));
         }
       }) as EventListener);
       host.append(view);
+      const content = host.parentElement!;
+      const currentView = view;
+      cleanupMargins = installPageGestures(content, {
+        enabled: () => settingsRef.current.flow === "paginated" && !cancelled,
+        bounds: () => content.getBoundingClientRect(),
+        left: () => { void currentView.goLeft().catch(() => setError("翻页失败，请重试")); },
+        right: () => { void currentView.goRight().catch(() => setError("翻页失败，请重试")); },
+      });
       viewRef.current = view;
       if (publication) publicationRef.current = publication;
 
@@ -454,6 +471,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
       cancelled = true;
       controller.abort();
       cleanups.forEach((cleanup) => cleanup());
+      cleanupMargins?.();
       if (viewRef.current === view) viewRef.current = null;
       view?.close();
       view?.remove();
@@ -500,38 +518,13 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
   </div>;
 }
 
-function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>): () => void {
-  let startX: number | null = null;
-  let moved = false;
-  const touchStart = (event: TouchEvent) => {
-    startX = event.changedTouches[0]?.clientX ?? null;
-    moved = false;
-  };
-  const touchMove = (event: TouchEvent) => {
-    if (startX === null) return;
-    const x = event.changedTouches[0]?.clientX;
-    if (x !== undefined && Math.abs(x - startX) > 12) moved = true;
-  };
-  const touchEnd = (event: TouchEvent) => {
-    const start = startX;
-    startX = null;
-    if (start === null || moved || settingsRef.current.flow !== "paginated" || !window.matchMedia("(max-width: 760px)").matches) return;
-    if (event.changedTouches.length !== 1) return;
-    const target = event.target as Element | null;
-    if (target instanceof Element && target.closest("a,button,input,select,textarea,video,img")) return;
-    const selection = doc.getSelection();
-    if (selection && !selection.isCollapsed) return;
-    const x = event.changedTouches[0]?.clientX ?? start;
-    const width = doc.documentElement.clientWidth || window.innerWidth;
-    if (x < width * 0.3) view.goLeft();
-    else if (x > width * 0.7) view.goRight();
-  };
-  doc.addEventListener("touchstart", touchStart, { capture: true, passive: true });
-  doc.addEventListener("touchmove", touchMove, { capture: true, passive: true });
-  doc.addEventListener("touchend", touchEnd, { capture: true, passive: true });
-  return () => {
-    doc.removeEventListener("touchstart", touchStart, true);
-    doc.removeEventListener("touchmove", touchMove, true);
-    doc.removeEventListener("touchend", touchEnd, true);
-  };
+function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>, onError: () => void): () => void {
+  return installPageGestures(doc, {
+    enabled: () => settingsRef.current.flow === "paginated",
+    bounds: () => (view.closest(".reader-content") ?? view).getBoundingClientRect(),
+    toViewport: (point) => framePointToViewport(doc, point),
+    left: () => { void view.goLeft().catch(onError); },
+    right: () => { void view.goRight().catch(onError); },
+    excludeImages: true,
+  });
 }

@@ -8,7 +8,7 @@ Moth 是一个单用户、filesystem-first 自托管 PWA 阅读器。它只读�
 - 要把一级书架收进首页的“更多书架”，在 `MOTH_BOOKS_DIR/<书架>/hide` 放置一个普通文件（空文件即可，内容不会读取）；只检查一级书架，根目录或系列目录中的同名文件不生效。刷新首页即可生效。隐藏书架仍可从“更多书架”进入，里面的书不会出现在“继续阅读”。
 - 首页显示继续阅读和按“分类/系列/作品”层级组织的目录预览；没有搜索、作者筛选、系列管理或文件整理。
 - EPUB 使用 HTTP Range 和 CFI；TXT 使用编码检测、中文章节索引和 UTF-16 字符定位；CBZ 按页解压；MOBI 首次打开时转成 EPUB 缓存。
-- PWA 只缓存应用外壳和构建资源。阅读资源和进度请求需要连接服务器。
+- PWA 从安卓桌面启动时请求全屏显示，并通过 `viewport-fit=cover` 适配刘海、挖孔屏和底部手势区域；系统手势或不支持全屏的浏览器仍可能临时显示系统栏。更新后的 manifest 可能要等 Service Worker 更新，已安装应用仍可重新安装后生效。阅读资源和进度请求需要连接服务器。
 - 设置保存在浏览器 `localStorage`；登录会话使用 HttpOnly cookie。
 
 不支持离线书籍、多用户、上传、OPDS、Kobo/KOReader、在线书源、元数据抓取、文件整理、推荐、AZW3/KF8、PDF 或 FB2。
@@ -33,6 +33,7 @@ cargo run -p moth-server
 | `MOTH_COOKIE_SECURE` | `false` | HTTPS 反向代理后设为 `true` |
 | `MOTH_SESSION_TTL_DAYS` | `30` | 会话有效期 |
 | `MOTH_LOG` | `info` | tracing 过滤器 |
+| `MALLOC_ARENA_MAX` | `2`（镜像默认） | glibc 分配区上限；可在容器运行时覆盖 |
 
 首次访问 `/setup` 创建单用户账户。升级到不兼容 schema 时，服务会拒绝启动；请先备份并删除 `moth.db`、`moth.db-wal`、`moth.db-shm`，然后重新扫描。
 

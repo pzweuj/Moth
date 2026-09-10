@@ -3,7 +3,7 @@
   "short_name": "Moth",
   "start_url": "/",
   "scope": "/",
-  "display": "standalone",
+  "display": "fullscreen",
   "orientation": "any",
   "background_color": "#f5f5ef",
   "theme_color": "#f5f5ef",

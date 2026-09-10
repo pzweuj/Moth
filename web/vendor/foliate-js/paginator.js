@@ -607,10 +607,12 @@ export class Paginator extends HTMLElement {
         this.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
         this.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
         this.addEventListener('touchend', this.#onTouchEnd.bind(this))
+        this.addEventListener('touchcancel', this.#onTouchCancel.bind(this))
         this.addEventListener('load', ({ detail: { doc } }) => {
             doc.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
             doc.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
             doc.addEventListener('touchend', this.#onTouchEnd.bind(this))
+            doc.addEventListener('touchcancel', this.#onTouchCancel.bind(this))
         })
 
         this.addEventListener('relocate', ({ detail }) => {
@@ -860,27 +862,44 @@ export class Paginator extends HTMLElement {
         })
     }
     #onTouchStart(e) {
+        if (e.touches.length !== 1) {
+            this.#onTouchCancel()
+            return
+        }
         const touch = e.changedTouches[0]
+        this.#touchScrolled = false
         this.#touchState = {
             x: touch?.screenX, y: touch?.screenY,
+            originX: touch?.screenX, originY: touch?.screenY,
+            originOffset: this.#container[this.scrollProp],
+            startedAt: e.timeStamp,
+            blocked: !!e.target?.closest?.('a,button,input,select,textarea,video,audio,img,label,summary,[role=button],[contenteditable]:not([contenteditable=false])'),
             t: e.timeStamp,
-            vx: 0, xy: 0,
+            vx: 0, vy: 0,
         }
     }
     #onTouchMove(e) {
         const state = this.#touchState
-        if (state.pinched) return
-        state.pinched = globalThis.visualViewport.scale > 1
-        if (this.scrolled || state.pinched) return
-        if (e.touches.length > 1) {
-            if (this.#touchScrolled) e.preventDefault()
+        if (!state || state.blocked || this.scrolled) return
+        if (e.touches.length !== 1 || (globalThis.visualViewport?.scale ?? 1) > 1
+            || e.target?.ownerDocument?.getSelection()?.toString()) {
+            this.#onTouchCancel()
             return
         }
-        e.preventDefault()
         const touch = e.changedTouches[0]
+        if (!touch) return
         const x = touch.screenX, y = touch.screenY
+        if (!this.#touchScrolled) {
+            const dx = Math.abs(x - state.originX), dy = Math.abs(y - state.originY)
+            if (Math.max(dx, dy) <= 12) return
+            if (e.timeStamp - state.startedAt > 500 || (this.#vertical ? dy <= dx : dx <= dy)) {
+                state.blocked = true
+                return
+            }
+        }
+        e.preventDefault()
         const dx = state.x - x, dy = state.y - y
-        const dt = e.timeStamp - state.t
+        const dt = Math.max(1, e.timeStamp - state.t)
         state.x = x
         state.y = y
         state.t = e.timeStamp
@@ -889,16 +908,28 @@ export class Paginator extends HTMLElement {
         this.#touchScrolled = true
         this.scrollBy(dx, dy)
     }
-    #onTouchEnd() {
+    #onTouchCancel() {
+        if (this.#touchScrolled && this.#touchState)
+            this.#container[this.scrollProp] = this.#touchState.originOffset
         this.#touchScrolled = false
-        if (this.scrolled) return
+        this.#touchState = null
+    }
+    #onTouchEnd(e) {
+        if (e.touches.length) return
+        const moved = this.#touchScrolled
+        const state = this.#touchState
+        this.#touchScrolled = false
+        this.#touchState = null
+        // A tap is handled by Moth's click zones. Snapping it again can race
+        // that navigation and turn an extra page.
+        if (!moved || !state || state.blocked || this.scrolled) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
         // anything that doesn't work
         requestAnimationFrame(() => {
-            if (globalThis.visualViewport.scale === 1)
-                this.snap(this.#touchState.vx, this.#touchState.vy)
+            if ((globalThis.visualViewport?.scale ?? 1) === 1)
+                this.snap(state.vx, state.vy)
         })
     }
     // allows one to process rects as if they were LTR and horizontal

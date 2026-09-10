@@ -12,11 +12,13 @@ const swPath = join(distDir, "sw.js");
 const assets = (await readdir(assetsDir)).sort().map((file) => `  "/assets/${file}",`);
 const source = await readFile(swPath, "utf8");
 const index = await readFile(join(distDir, "index.html"));
+const manifest = await readFile(join(distDir, "manifest.webmanifest"));
 const marker = "  /* __MOTH_PRECACHE_ASSETS__ */";
 if (!source.includes(marker)) throw new Error("Service worker precache marker is missing");
 const version = createHash("sha256")
   .update(source)
   .update(index)
+  .update(manifest)
   .update(assets.join("\n"))
   .digest("hex")
   .slice(0, 12);

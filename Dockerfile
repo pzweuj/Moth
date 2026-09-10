@@ -37,6 +37,7 @@ COPY --from=web-builder /src/web/dist /app/web
 RUN chown -R moth:moth /app
 
 ENV MOTH_BIND_ADDR=0.0.0.0:8080 \
+    MALLOC_ARENA_MAX=2 \
     MOTH_DATA_DIR=/data \
     MOTH_BOOKS_DIR=/books \
     MOTH_WEB_DIR=/app/web \

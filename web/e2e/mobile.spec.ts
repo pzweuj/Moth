@@ -1,4 +1,9 @@
 import { test, expect, login, waitForScan } from "./fixtures";
+import { contentPoint, syntheticGesture, textLocation } from "./gestures";
+
+// Network failure injection must reach Playwright in WebKit as well.
+// Service Worker behavior has its own coverage in core.spec.ts.
+test.use({ serviceWorkers: "block" });
 
 type HomePublication = { id: number; source_format: string; reader_format: string };
 
@@ -66,4 +71,160 @@ test("mobile CBZ reader exposes lazy page thumbnails and no bottom pager", async
   await page.getByRole("button", { name: "打开页码", exact: true }).click();
   await expect(page.locator(".reader-page-drawer")).toBeVisible();
   await expect(page.locator(".reader-page-drawer img").first()).toHaveAttribute("src", /thumbnail/);
+});
+
+test("mobile CBZ tap, swipe, jump, retry, RTL spreads and restore load actual images", async ({ page, app, browserName }) => {
+  await login(page, app.url);
+  await waitForScan(page, app.url);
+  const cbz = (await homePublications(page, app.url)).find((book) => book.source_format === "cbz")!;
+  await page.goto(`${app.url}/reader/${cbz.id}`);
+  const loaded = async (index: number) => {
+    const img = page.locator(`.comic-page[data-page="${index}"] img`);
+    await expect(img).toBeVisible();
+    await expect.poll(() => img.evaluate((node: HTMLImageElement) => node.complete && node.naturalWidth > 0)).toBe(true);
+  };
+  await loaded(0);
+  const left = await contentPoint(page, 0.1), right = await contentPoint(page, 0.9), middle = await contentPoint(page, 0.5);
+  for (let index = 1; index <= 4; index++) {
+    await page.touchscreen.tap(right.x, right.y);
+    await loaded(index);
+  }
+  await page.touchscreen.tap(left.x, left.y); await loaded(3);
+  await page.touchscreen.tap(middle.x, middle.y); await loaded(3);
+  await syntheticGesture(page, [right, { x: right.x - 5, y: right.y + 110 }]); await loaded(3);
+  await syntheticGesture(page, [right], { cancel: true }); await loaded(3);
+  await syntheticGesture(page, [right], { multi: true }); await loaded(3);
+  await syntheticGesture(page, [right, { x: right.x - 110, y: right.y }]); await loaded(4);
+  if (browserName === "chromium") {
+    const session = await page.context().newCDPSession(page);
+    await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [right] });
+    for (let step = 1; step <= 4; step++) {
+      await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: right.x - step * 35, y: right.y }] });
+    }
+    await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await loaded(5);
+    await session.detach();
+  }
+  await page.getByRole("button", { name: "打开页码", exact: true }).click();
+  await page.locator(".reader-navigation-item").filter({ hasText: "第 7 页" }).click();
+  await loaded(6);
+  let failed = false;
+  await page.route(`**/api/v1/publications/${cbz.id}/pages/7`, async (route) => {
+    failed = true;
+    await route.fulfill({ status: 500, body: "temporary failure" });
+  });
+  await page.touchscreen.tap(right.x, right.y);
+  await expect(page.getByRole("button", { name: "重试", exact: true })).toBeVisible();
+  expect(failed).toBe(true);
+  await page.unroute(`**/api/v1/publications/${cbz.id}/pages/7`);
+  await page.getByRole("button", { name: "重试", exact: true }).tap();
+  await loaded(7);
+  await page.getByRole("button", { name: "阅读设置", exact: true }).click();
+  await page.getByLabel("漫画模式", { exact: true }).selectOption("double");
+  await page.getByLabel("阅读方向", { exact: true }).selectOption("rtl");
+  await page.getByRole("button", { name: "阅读设置", exact: true }).click();
+  await loaded(7);
+  await page.touchscreen.tap(right.x, right.y); await loaded(5); await loaded(6);
+  const spread = await page.locator(".comic-page").evaluateAll((nodes) => nodes.map((node) => ({ page: node.getAttribute("data-page"), x: node.getBoundingClientRect().x, y: node.getBoundingClientRect().y })));
+  expect(spread[0].page).toBe("5");
+  expect(spread[0].x).toBeGreaterThan(spread[1].x);
+  expect(Math.abs(spread[0].y - spread[1].y)).toBeLessThan(2);
+  await page.touchscreen.tap(left.x, left.y); await loaded(7);
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  await expect.poll(async () => (await (await page.request.get(`${app.url}/api/v1/publications/${cbz.id}/progress`)).json()).position.page_index).toBe(7);
+  await page.reload(); await loaded(7);
+});
+
+test("text tap zones stay aligned after multiple pages in the same chapter", async ({ page, app, browserName }) => {
+  await login(page, app.url);
+  await waitForScan(page, app.url);
+  const txt = (await homePublications(page, app.url)).find((book) => book.source_format === "txt")!;
+  await page.goto(`${app.url}/reader/${txt.id}`);
+  await expect(page.locator(".reader-loading")).toHaveCount(0);
+  await expect.poll(async () => (await textLocation(page)).cfi).toMatch(/^epubcfi/);
+  const initial = await textLocation(page);
+  const right = await contentPoint(page, 0.85), left = await contentPoint(page, 0.15), middle = await contentPoint(page, 0.5);
+  for (let index = 0; index < 5; index++) {
+    const before = await textLocation(page);
+    if (index % 2) await page.mouse.click(right.x, right.y);
+    else await page.touchscreen.tap(right.x, right.y);
+    await expect.poll(async () => (await textLocation(page)).cfi).not.toBe(before.cfi);
+    expect((await textLocation(page)).chapter).toBe(initial.chapter);
+    // A mouse event immediately after touch is intentionally suppressed.
+    await page.waitForTimeout(850);
+  }
+  const forward = await textLocation(page);
+  await page.touchscreen.tap(left.x, left.y);
+  await expect.poll(async () => (await textLocation(page)).cfi).not.toBe(forward.cfi);
+  const stable = await textLocation(page);
+  await page.touchscreen.tap(middle.x, middle.y);
+  await syntheticGesture(page, [right, { x: right.x - 3, y: right.y + 100 }], { text: true });
+  await syntheticGesture(page, [right], { text: true, cancel: true });
+  await syntheticGesture(page, [right], { text: true, multi: true });
+  await page.waitForTimeout(300);
+  expect(await textLocation(page)).toEqual(stable);
+  if (browserName === "chromium") {
+    const session = await page.context().newCDPSession(page);
+    await session.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [right] });
+    for (let step = 1; step <= 6; step++) {
+      await session.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: right.x - step * 35, y: right.y }] });
+      await page.waitForTimeout(20);
+    }
+    await session.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await expect.poll(async () => (await textLocation(page)).cfi).not.toBe(stable.cfi);
+    await session.detach();
+  }
+  await page.getByRole("button", { name: "阅读设置", exact: true }).click();
+  await page.getByLabel("阅读模式", { exact: true }).selectOption("scrolled");
+  await page.getByRole("button", { name: "阅读设置", exact: true }).click();
+  await page.waitForTimeout(300);
+  const scrolled = await textLocation(page);
+  await page.touchscreen.tap(right.x, right.y);
+  await page.waitForTimeout(200);
+  expect(await textLocation(page)).toEqual(scrolled);
+});
+
+test("fullscreen manifest and asymmetric safe areas fit portrait and landscape", async ({ page, app }) => {
+  const manifest = await (await page.request.get(`${app.url}/manifest.webmanifest`)).json();
+  expect(manifest).toMatchObject({ display: "fullscreen", start_url: "/", scope: "/", orientation: "any" });
+  const insets = { top: 44, right: 28, bottom: 34, left: 64 };
+  const injectInsets = () => page.evaluate((insets) => {
+    // Browser emulation does not provide real cutouts. Substitute asymmetric
+    // insets into the built CSS to verify the physical sides, including RTL.
+    const css = [...document.styleSheets].flatMap((sheet) => [...sheet.cssRules].map((rule) => rule.cssText)).join("\n");
+    const style = document.createElement("style");
+    style.textContent = css.replace(/env\(safe-area-inset-(top|right|bottom|left)\)/g, (_, side: keyof typeof insets) => `${insets[side]}px`);
+    document.head.append(style);
+  }, insets);
+  const checkPadding = async (selector: string) => {
+    const padding = await page.locator(selector).evaluate((node) => {
+      const css = getComputedStyle(node);
+      return { left: parseFloat(css.paddingLeft), right: parseFloat(css.paddingRight), top: parseFloat(css.paddingTop), bottom: parseFloat(css.paddingBottom) };
+    });
+    for (const side of ["left", "right", "top", "bottom"] as const) expect(padding[side]).toBeGreaterThanOrEqual(insets[side]);
+  };
+  await page.goto(app.url);
+  await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/);
+  await injectInsets(); await checkPadding(".auth-shell");
+  await login(page, app.url); await waitForScan(page, app.url);
+  await injectInsets(); await checkPadding(".home-shell");
+  const cbz = (await homePublications(page, app.url)).find((book) => book.source_format === "cbz")!;
+  await page.goto(`${app.url}/reader/${cbz.id}`);
+  await expect(page.locator(".comic-page img")).toBeVisible();
+  await injectInsets();
+  for (const size of [{ width: 390, height: 844 }, { width: 844, height: 390 }]) {
+    await page.setViewportSize(size);
+    const metrics = await page.evaluate(() => {
+      const content = document.querySelector(".reader-content")!;
+      const css = getComputedStyle(content);
+      const button = document.querySelector(".reader-titlebar button")!.getBoundingClientRect();
+      const shell = document.querySelector(".reader-shell")!.getBoundingClientRect();
+      return { left: parseFloat(css.paddingLeft), right: parseFloat(css.paddingRight), buttonTop: button.top, buttonLeft: button.left, shellBottom: shell.bottom, height: window.innerHeight };
+    });
+    expect(metrics.left).toBeGreaterThanOrEqual(insets.left);
+    expect(metrics.right).toBeGreaterThanOrEqual(insets.right);
+    expect(metrics.buttonTop).toBeGreaterThanOrEqual(insets.top);
+    expect(metrics.buttonLeft).toBeGreaterThanOrEqual(insets.left);
+    expect(metrics.shellBottom).toBeLessThanOrEqual(metrics.height + 1);
+  }
 });

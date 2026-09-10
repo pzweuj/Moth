@@ -13,6 +13,7 @@ axum = "0.8.4"
 argon2 = "0.5.3"
 axum-extra = { version = "0.10.3", features = ["cookie"] }
 base64 = "0.22.1"
+bytes = "1.10.1"
 chardetng = "1.0.0"
 encoding_rs = "0.8.35"
 hex = "0.4.3"
@@ -28,6 +29,8 @@ sha2 = "0.10.9"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.19", features = ["io"] }
 time = "0.3.41"
 tower-http = { version = "0.6.6", features = ["fs", "trace"] }
 tracing = "0.1.41"

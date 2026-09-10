@@ -466,18 +466,46 @@ async fn store_publication(
     let cache_version = crate::books::content_version(&hash, format.as_str(), None);
     let txt_cache_target = (format == BookFormat::Txt)
         .then(|| state.txt_dir(&cache_version, "auto").join("book.utf8"));
+    // Parsing reads the cover. The blocking task owns its permit through the
+    // cache write, including when the awaiting scan future is cancelled.
+    let permit = if format == BookFormat::Txt {
+        None
+    } else {
+        Some(
+            state
+                .image_tasks
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| AppError::Io(std::io::Error::other(error)))?,
+        )
+    };
     let parsed = tokio::task::spawn_blocking({
         let path = path.to_owned();
-        move || parse_index(&path, format, txt_cache_target.as_deref())
+        let state = state.clone();
+        move || {
+            let _permit = permit;
+            parse_index(&path, format, txt_cache_target.as_deref()).map(|mut book| {
+                let mut has_cover = false;
+                if let Some(cover) = book.cover.take() {
+                    let result = write_cover(&state, &cache_version, cover.data);
+                    has_cover = result.written;
+                    if let Some(error) = result.error {
+                        book.cover_error = Some(append_error(book.cover_error, error));
+                    }
+                }
+                (book, has_cover)
+            })
+        }
     })
     .await
     .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
     let now = now_unix();
-    let (title, author, cover, pages, mut parse_error, text_index, parsed_ok) = match parsed {
-        Ok(book) => (
+    let (title, author, has_cover, pages, parse_error, text_index, parsed_ok) = match parsed {
+        Ok((book, has_cover)) => (
             book.title,
             book.author,
-            book.cover,
+            has_cover,
             book.pages,
             book.cover_error,
             book.text_index,
@@ -488,21 +516,13 @@ async fn store_publication(
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未命名".to_owned()),
             None,
-            None,
+            false,
             Vec::new(),
             Some(error.to_string()),
             None,
             false,
         ),
     };
-    let mut has_cover = false;
-    if let Some(cover) = cover {
-        let result = write_cover(state, &cache_version, cover.data).await?;
-        has_cover = result.written;
-        if let Some(error) = result.error {
-            parse_error = Some(append_error(parse_error, error));
-        }
-    }
     let status = if parsed_ok { "ok" } else { "error" };
     // Keep the publication row and its derived indexes in one SQLite
     // transaction. This avoids exposing a half-written chapter/page list to
@@ -659,32 +679,29 @@ fn append_error(previous: Option<String>, next: String) -> String {
     previous.map_or(next.clone(), |value| format!("{value}; {next}"))
 }
 
-async fn write_cover(
-    state: &AppState,
-    content_version: &str,
-    bytes: Vec<u8>,
-) -> Result<CoverWriteResult, AppError> {
+// Caller holds the shared image permit before reading the source cover.
+fn write_cover(state: &AppState, content_version: &str, bytes: Vec<u8>) -> CoverWriteResult {
     if bytes.len() > COVER_MAX_BYTES {
-        return Ok(CoverWriteResult {
+        return CoverWriteResult {
             written: false,
             error: Some("cover exceeds the 16 MiB scan limit".to_owned()),
-        });
+        };
     }
     let dir = state.covers_dir();
-    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
-        return Ok(CoverWriteResult {
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return CoverWriteResult {
             written: false,
             error: Some(format!("could not create cover cache: {error}")),
-        });
+        };
     }
     let target = state.cover_path(content_version);
     if target.exists() {
-        return Ok(CoverWriteResult {
+        return CoverWriteResult {
             written: true,
             error: None,
-        });
+        };
     }
-    let encoded = tokio::task::spawn_blocking(move || {
+    let encoded = (|| {
         // Read only the image header first. This lets us reject pathological
         // dimensions and pixel counts before the decoder allocates a frame.
         let header_reader = ImageReader::new(Cursor::new(bytes.as_slice()))
@@ -711,43 +728,32 @@ async fn write_cover(
         let image = reader
             .decode()
             .map_err(|error| format!("invalid cover: {error}"))?;
-        let image = image.thumbnail(COVER_MAX_EDGE, COVER_MAX_EDGE);
+        let image = image.thumbnail(COVER_MAX_EDGE, COVER_MAX_EDGE).to_rgb8();
         let mut output = Vec::new();
         JpegEncoder::new_with_quality(&mut output, 84)
             .encode_image(&image)
             .map_err(|error| format!("could not encode cover: {error}"))?;
         Ok::<_, String>(output)
-    })
-    .await
-    .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    })();
     let encoded = match encoded {
         Ok(encoded) => encoded,
         Err(error) => {
-            return Ok(CoverWriteResult {
+            return CoverWriteResult {
                 written: false,
                 error: Some(error),
-            });
+            };
         }
     };
-    let temp = target.with_extension("tmp");
-    if let Err(error) = tokio::fs::write(&temp, encoded).await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Ok(CoverWriteResult {
+    if let Err(error) = crate::state::write_cache(&target, &encoded) {
+        return CoverWriteResult {
             written: false,
             error: Some(format!("could not write cover cache: {error}")),
-        });
+        };
     }
-    if let Err(error) = tokio::fs::rename(&temp, &target).await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Ok(CoverWriteResult {
-            written: false,
-            error: Some(format!("could not finalize cover cache: {error}")),
-        });
-    }
-    Ok(CoverWriteResult {
+    CoverWriteResult {
         written: true,
         error: None,
-    })
+    }
 }
 
 async fn ensure_directory(db: &SqlitePool, relative: &Path) -> Result<i64, AppError> {
@@ -1014,9 +1020,7 @@ mod tests {
             .write_to(&mut png, image::ImageFormat::Png)
             .expect("PNG fixture");
 
-        let result = write_cover(&state, "oversized", png.into_inner())
-            .await
-            .expect("cover result");
+        let result = write_cover(&state, "oversized", png.into_inner());
         assert!(!result.written);
         assert!(
             result

@@ -18,6 +18,9 @@ use quick_xml::{Reader as XmlReader, events::Event};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -28,6 +31,14 @@ use crate::{
 };
 
 const CONTENT_ADAPTER_VERSION: &str = "core-v2";
+const IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const IMAGE_MAX_ALLOC: u64 = 64 * 1024 * 1024;
+const IMAGE_MAX_DIMENSION: u32 = 8192;
+const IMAGE_MAX_PIXELS: u64 = 16_000_000;
+const DIMENSION_HEADER_MAX_BYTES: u64 = 1024 * 1024;
+
+#[cfg(test)]
+mod stream_tests;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicationSummary {
@@ -369,6 +380,21 @@ pub(crate) async fn fetch_publications(
     Ok(out)
 }
 
+async fn fetch_publication(db: &SqlitePool, id: i64) -> Result<PublicationSummary, AppError> {
+    let row = sqlx::query(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress
+         FROM publications p
+         JOIN directories d ON d.id=p.directory_id
+         LEFT JOIN reading_progress r ON r.publication_id=p.id
+         WHERE p.id=?",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    Ok(summary_from_row(&row)?)
+}
+
 fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PublicationSummary, sqlx::Error> {
     let source: String = row.try_get("format")?;
     let hash: String = row.try_get("sha256")?;
@@ -414,11 +440,7 @@ pub async fn get_book(
     if row.format == "txt" {
         ensure_txt_encoding(&state, &row, &encoding).await?;
     }
-    let summary = fetch_publications(&state.db, Some(row.directory_id), Some("title"))
-        .await?
-        .into_iter()
-        .find(|value| value.id == id)
-        .ok_or(AppError::NotFound)?;
+    let summary = fetch_publication(&state.db, id).await?;
     let mut summary = summary;
     if row.format == "txt" {
         summary.content_version = current_content_version(&row, Some(&encoding));
@@ -461,8 +483,8 @@ pub async fn get_book(
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
     if row.format == "cbz" {
         let source = ensure_source_current(&row).await?;
-        let entries = pages.iter().map(|page| page.path.clone()).collect();
-        let dimensions = page_dimensions(source, entries).await?;
+        let version = current_content_version(&row, None);
+        let dimensions = page_dimensions(&state, &version, source, &pages).await?;
         for (page, dimensions) in pages.iter_mut().zip(dimensions) {
             if let Some((width, height)) = dimensions {
                 page.width = Some(width);
@@ -533,28 +555,63 @@ async fn ensure_txt_encoding(
 }
 
 async fn page_dimensions(
+    state: &AppState,
+    version: &str,
     source: PathBuf,
-    entries: Vec<String>,
+    pages: &[PageInfo],
 ) -> Result<Vec<Option<(u32, u32)>>, AppError> {
+    let cache = state.page_dimensions_path(version);
+    let entries = pages
+        .iter()
+        .map(|page| page.path.clone())
+        .collect::<Vec<_>>();
+    let permit = state
+        .dimension_tasks
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // Recheck after acquiring the permit: simultaneous opens share a rebuild.
+        // Bound cache reads too, since corrupt caches are simply rebuildable.
+        if let Ok(file) = std::fs::File::open(&cache) {
+            let limit = (entries.len() as u64).saturating_mul(32).saturating_add(64);
+            if let Ok(value) =
+                serde_json::from_reader::<_, Vec<Option<(u32, u32)>>>(file.take(limit))
+                && value.len() == entries.len()
+                && value
+                    .iter()
+                    .flatten()
+                    .all(|&(width, height)| width > 0 && height > 0)
+            {
+                return Ok(value);
+            }
+        }
         let file = std::fs::File::open(source)?;
         let mut archive = ZipArchive::new(file).map_err(std::io::Error::other)?;
         let mut dimensions = Vec::with_capacity(entries.len());
         for entry in entries {
-            let Ok(mut item) = archive.by_name(&entry) else {
-                dimensions.push(None);
-                continue;
-            };
-            let mut bytes = Vec::new();
-            if item.read_to_end(&mut bytes).is_err() {
-                dimensions.push(None);
-                continue;
-            }
-            let value = image::ImageReader::new(Cursor::new(bytes))
-                .with_guessed_format()
-                .ok()
-                .and_then(|reader| reader.into_dimensions().ok());
+            let value = archive.by_name(&entry).ok().and_then(|item| {
+                let mut bytes =
+                    Vec::with_capacity(item.size().min(DIMENSION_HEADER_MAX_BYTES) as usize);
+                item.take(DIMENSION_HEADER_MAX_BYTES)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                image::ImageReader::new(Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+                    .filter(|&(width, height)| width > 0 && height > 0)
+            });
             dimensions.push(value);
+        }
+        if let Err(error) = serde_json::to_vec(&dimensions)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::state::write_cache(&cache, &bytes))
+        {
+            tracing::debug!(%error, "could not persist page dimensions");
         }
         Ok::<_, std::io::Error>(dimensions)
     })
@@ -690,16 +747,7 @@ pub async fn get_page(
     let entry: String = page.try_get("path")?;
     let mime: String = page.try_get("mime")?;
     let source = row.root.join(&row.relative_path);
-    let bytes = tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(source)?;
-        let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
-        let mut item = zip.by_name(&entry).map_err(std::io::Error::other)?;
-        let mut bytes = Vec::new();
-        item.read_to_end(&mut bytes)?;
-        Ok::<_, std::io::Error>(bytes)
-    })
-    .await
-    .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
+    let (size, stream) = cbz_page_stream(source, entry, Arc::clone(&state.page_streams)).await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
@@ -708,9 +756,71 @@ pub async fn get_page(
             format!("\"{}-page-{idx}\"", current_content_version(&row, None)),
         )
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONTENT_LENGTH, bytes.len())
-        .body(Body::from(bytes))
+        .header(header::CONTENT_LENGTH, size)
+        .body(Body::from_stream(stream))
         .expect("page response"))
+}
+
+const PAGE_STREAM_CHUNK: usize = 64 * 1024;
+const PAGE_STREAM_BUFFER: usize = 2;
+
+async fn cbz_page_stream(
+    source: PathBuf,
+    entry: String,
+    page_streams: Arc<tokio::sync::Semaphore>,
+) -> Result<(u64, ReceiverStream<Result<bytes::Bytes, std::io::Error>>), AppError> {
+    // Acquire before opening the ZIP central directory, and open it only once.
+    let permit = page_streams
+        .acquire_owned()
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let (ready, metadata) = tokio::sync::oneshot::channel();
+    let (sender, receiver) = tokio::sync::mpsc::channel(PAGE_STREAM_BUFFER);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut ready = Some(ready);
+        let result = (|| -> Result<(), std::io::Error> {
+            if sender.is_closed() {
+                return Ok(());
+            }
+            let file = std::fs::File::open(source)?;
+            let mut archive = ZipArchive::new(file).map_err(std::io::Error::other)?;
+            let mut item = archive.by_name(&entry).map_err(std::io::Error::other)?;
+            if ready
+                .take()
+                .expect("metadata sender")
+                .send(Ok(item.size()))
+                .is_err()
+            {
+                return Ok(());
+            }
+            let mut buffer = [0_u8; PAGE_STREAM_CHUNK];
+            while !sender.is_closed() {
+                let read = item.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                if sender
+                    .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buffer[..read])))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(error));
+            } else {
+                let _ = sender.blocking_send(Err(error));
+            }
+        }
+    });
+    let size = metadata
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
+    Ok((size, ReceiverStream::new(receiver)))
 }
 
 pub async fn get_page_thumbnail(
@@ -734,26 +844,7 @@ pub async fn get_page_thumbnail(
     let (entry,) = page.ok_or(AppError::NotFound)?;
     let version = current_content_version(&row, None);
     let target = state.thumbnail_path(&version, idx);
-    if !target.exists() {
-        let target_dir = state.thumbnails_dir(&version);
-        tokio::fs::create_dir_all(&target_dir).await?;
-        let raw = tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(source)?;
-            let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
-            let mut item = zip.by_name(&entry).map_err(std::io::Error::other)?;
-            let mut bytes = Vec::new();
-            item.read_to_end(&mut bytes)?;
-            Ok::<_, std::io::Error>(bytes)
-        })
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
-        let encoded = tokio::task::spawn_blocking(move || encode_page_thumbnail(&raw))
-            .await
-            .map_err(|error| AppError::Io(std::io::Error::other(error)))??;
-        let temp = target.with_extension("tmp");
-        tokio::fs::write(&temp, encoded).await?;
-        tokio::fs::rename(&temp, &target).await?;
-    }
+    ensure_page_thumbnail(state.image_tasks.clone(), source, entry, target.clone()).await?;
     let bytes = tokio::fs::read(&target).await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -765,14 +856,97 @@ pub async fn get_page_thumbnail(
         .expect("thumbnail response"))
 }
 
+async fn ensure_page_thumbnail(
+    image_tasks: Arc<tokio::sync::Semaphore>,
+    source: PathBuf,
+    entry: String,
+    target: PathBuf,
+) -> Result<(), AppError> {
+    if target.is_file() {
+        return Ok(());
+    }
+    let permit = image_tasks
+        .acquire_owned()
+        .await
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if target.is_file() {
+            return Ok(());
+        }
+        let encoded = (|| {
+            let file = std::fs::File::open(source)?;
+            let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
+            let item = zip.by_name(&entry).map_err(std::io::Error::other)?;
+            if item.size() > IMAGE_MAX_BYTES as u64 {
+                return Err(AppError::Validation(
+                    "CBZ page exceeds the 16 MiB thumbnail limit".to_owned(),
+                ));
+            }
+            let mut raw = Vec::with_capacity(item.size() as usize);
+            item.take(IMAGE_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut raw)?;
+            encode_page_thumbnail(&raw)
+        })()
+        .or_else(|error| {
+            tracing::debug!(%error, "using placeholder for unavailable CBZ thumbnail");
+            placeholder_thumbnail()
+        })?;
+        crate::state::write_cache(&target, &encoded)?;
+        Ok::<_, AppError>(())
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))?
+}
+
 fn encode_page_thumbnail(raw: &[u8]) -> Result<Vec<u8>, AppError> {
-    let image = image::load_from_memory(raw)
+    if raw.len() > IMAGE_MAX_BYTES {
+        return Err(AppError::Validation(
+            "CBZ page exceeds the 16 MiB thumbnail limit".to_owned(),
+        ));
+    }
+    let header_reader = image::ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|error| AppError::Validation(format!("invalid CBZ page: {error}")))?;
+    let (width, height) = header_reader
+        .into_dimensions()
+        .map_err(|error| AppError::Validation(format!("invalid CBZ page dimensions: {error}")))?;
+    if width > IMAGE_MAX_DIMENSION
+        || height > IMAGE_MAX_DIMENSION
+        || u64::from(width).saturating_mul(u64::from(height)) > IMAGE_MAX_PIXELS
+    {
+        return Err(AppError::Validation(
+            "CBZ page dimensions exceed the thumbnail limit".to_owned(),
+        ));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_MAX_DIMENSION);
+    limits.max_image_height = Some(IMAGE_MAX_DIMENSION);
+    limits.max_alloc = Some(IMAGE_MAX_ALLOC);
+    let mut reader = image::ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|error| AppError::Validation(format!("invalid CBZ page: {error}")))?;
+    reader.limits(limits);
+    let image = reader
+        .decode()
         .map_err(|error| AppError::Validation(format!("invalid CBZ page: {error}")))?
-        .thumbnail(240, 240);
+        .thumbnail(240, 240)
+        .to_rgb8();
     let mut output = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 78)
         .encode_image(&image)
         .map_err(|error| AppError::Validation(format!("could not encode thumbnail: {error}")))?;
+    Ok(output)
+}
+
+fn placeholder_thumbnail() -> Result<Vec<u8>, AppError> {
+    let image = image::RgbImage::from_pixel(2, 2, image::Rgb([214, 220, 211]));
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 78)
+        .encode_image(&image)
+        .map_err(|error| {
+            AppError::Validation(format!("could not encode thumbnail placeholder: {error}"))
+        })?;
     Ok(output)
 }
 
@@ -1114,10 +1288,9 @@ async fn publication_row(
     root: &Path,
     id: i64,
 ) -> Result<PublicationRow, AppError> {
-    let row = sqlx::query("SELECT id,directory_id,relative_path,format,sha256,file_size,mtime_ns,has_cover FROM publications WHERE id=?").bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT id,relative_path,format,sha256,file_size,mtime_ns,has_cover FROM publications WHERE id=?").bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
     Ok(PublicationRow {
         id: row.try_get("id")?,
-        directory_id: row.try_get("directory_id")?,
         relative_path: row.try_get("relative_path")?,
         format: row.try_get("format")?,
         sha256: row.try_get("sha256")?,
@@ -1130,7 +1303,6 @@ async fn publication_row(
 
 struct PublicationRow {
     id: i64,
-    directory_id: i64,
     relative_path: String,
     format: String,
     sha256: String,
@@ -1207,11 +1379,11 @@ async fn range_response(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
     else {
-        let bytes = tokio::fs::read(path).await?;
+        let file = tokio::fs::File::open(path).await?;
         return Ok(common(Response::builder())
             .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
+            .header(header::CONTENT_LENGTH, total)
+            .body(Body::from_stream(ReaderStream::new(file)))
             .expect("file response"));
     };
     let Some((start, end)) = parse_range(value, total) else {
@@ -1223,22 +1395,16 @@ async fn range_response(
     };
     let length = end - start + 1;
     let mut file = tokio::fs::File::open(path).await?;
-    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start)).await?;
-    let mut body = vec![
-        0_u8;
-        usize::try_from(length).map_err(|_| AppError::Validation(
-            "requested range is too large".to_owned()
-        ))?
-    ];
-    tokio::io::AsyncReadExt::read_exact(&mut file, &mut body).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let stream = ReaderStream::new(file.take(length));
     Ok(common(Response::builder())
         .status(StatusCode::PARTIAL_CONTENT)
         .header(
             header::CONTENT_RANGE,
             format!("bytes {start}-{end}/{total}"),
         )
-        .header(header::CONTENT_LENGTH, body.len())
-        .body(Body::from(body))
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from_stream(stream))
         .expect("range response"))
 }
 
@@ -2397,6 +2563,34 @@ mod tests {
         assert_eq!(parse_range("bytes=-4", 20), Some((16, 19)));
         assert_eq!(parse_range("bytes=20-", 20), None);
         assert_eq!(parse_range("bytes=0-1,4-5", 20), Some((0, 1)));
+    }
+
+    #[tokio::test]
+    async fn range_response_streams_full_and_partial_files() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("book.epub");
+        let source = (0_u8..=255).collect::<Vec<_>>();
+        tokio::fs::write(&path, &source).await.expect("fixture");
+
+        let response = range_response(&path, &HeaderMap::new(), "application/epub+zip", "\"v1\"")
+            .await
+            .expect("full response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("full body");
+        assert_eq!(body.as_ref(), source.as_slice());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=10-19".parse().expect("range header"));
+        let response = range_response(&path, &headers, "application/epub+zip", "\"v1\"")
+            .await
+            .expect("partial response");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("partial body");
+        assert_eq!(body.as_ref(), &source[10..20]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type TouchEvent as ReactTouchEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BookDetail, ProgressBody, ReadingPosition } from "../api";
 import type { ComicSettings } from "./settings";
 import type { ReaderNavigationRequest } from "./navigation";
@@ -11,6 +11,8 @@ type Props = {
   onCurrentPageChange: (page: number) => void;
   onProgress: (position: ReadingPosition, contentVersion?: string) => void;
 };
+
+import { installPageGestures } from "./pageGestures";
 
 type PagePosition = { page: number; progress: number };
 
@@ -33,7 +35,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     progress: saved?.page_index === initialPage ? clampProgress(saved.page_progress) : 0,
   };
   const [index, setIndex] = useState(initialPage);
-  const [loaded, setLoaded] = useState<Set<number>>(() => new Set());
+  const [eligible, setEligible] = useState<Set<number>>(() => new Set());
   const [failed, setFailed] = useState<Set<number>>(() => new Set());
   const [retryNonce, setRetryNonce] = useState<Map<number, number>>(() => new Map());
   const contentRef = useRef<HTMLDivElement>(null);
@@ -46,7 +48,6 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   const pendingScrollRef = useRef<PagePosition | null>(settings.mode === "webtoon" ? initialPosition : null);
   const restoreFrameRef = useRef<number | null>(null);
   const settingsSnapshotRef = useRef(settings);
-  const touchStart = useRef<{ x: number; y: number } | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
   const onProgressRef = useRef(onProgress);
   const onCurrentPageChangeRef = useRef(onCurrentPageChange);
@@ -56,9 +57,9 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   useEffect(() => { indexRef.current = index; }, [index]);
   useEffect(() => { onCurrentPageChangeRef.current(index); }, [index]);
 
-  const markLoaded = useCallback((page: number) => {
+  const markEligible = useCallback((page: number) => {
     if (page < 0 || page >= pageCount) return;
-    setLoaded((current) => current.has(page) ? current : new Set(current).add(page));
+    setEligible((current) => current.has(page) ? current : new Set(current).add(page));
   }, [pageCount]);
 
   const scheduleWebtoonRestore = useCallback((target: PagePosition) => {
@@ -85,26 +86,22 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   }, [pageCount, settings.mode]);
 
   useEffect(() => {
-    if (settings.mode !== "webtoon") {
-      markLoaded(indexRef.current);
-      if (settings.mode === "double") markLoaded(indexRef.current + 1);
-      return;
-    }
+    if (settings.mode !== "webtoon") return;
     const root = contentRef.current;
     if (!root) return;
     if (typeof IntersectionObserver === "undefined") {
-      markLoaded(indexRef.current);
-      markLoaded(indexRef.current + 1);
+      markEligible(indexRef.current);
+      markEligible(indexRef.current + 1);
       return;
     }
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
-        if (entry.isIntersecting) markLoaded(Number((entry.target as HTMLElement).dataset.page));
+        if (entry.isIntersecting) markEligible(Number((entry.target as HTMLElement).dataset.page));
       }
     }, { root, rootMargin: "900px 0px" });
     for (const node of pageRefs.current.values()) observer.observe(node);
     return () => observer.disconnect();
-  }, [markLoaded, pageCount, settings.mode]);
+  }, [markEligible, pageCount, settings.mode]);
 
   const updateWebtoonProgress = useCallback(() => {
     const container = contentRef.current;
@@ -217,18 +214,10 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     });
   }, [index, pageCount, settings.mode]);
 
-  useEffect(() => {
-    const onResize = () => {
-      if (settings.mode === "webtoon") return;
-      // The image is constrained by CSS, so a viewport change does not need
-      // to change the page locator. The current page remains the anchor.
-    };
-    window.addEventListener("orientationchange", onResize);
-    return () => window.removeEventListener("orientationchange", onResize);
-  }, [settings.mode]);
-
   const move = useCallback((delta: number) => {
     if (!pageCount) return;
+    // The final spread is already visible; do not shift it by one page.
+    if (delta > 0 && indexRef.current + (settings.mode === "double" ? 2 : 1) >= pageCount) return;
     const page = clampPage(indexRef.current + delta, pageCount);
     const position = { page, progress: 0 };
     indexRef.current = page;
@@ -249,7 +238,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       next.set(page, (next.get(page) ?? 0) + 1);
       return next;
     });
-    markLoaded(page);
+    markEligible(page);
   };
 
   const visible = useMemo(() => settings.mode === "webtoon"
@@ -259,38 +248,23 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       : pageCount ? [index] : [], [detail.pages, index, pageCount, settings.mode]);
   const step = settings.mode === "double" ? 2 : 1;
 
-  const touchHandlers = {
-    onTouchStart: (event: ReactTouchEvent<HTMLDivElement>) => {
-      const touch = event.changedTouches[0];
-      touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
-    },
-    onTouchEnd: (event: ReactTouchEvent<HTMLDivElement>) => {
-      const start = touchStart.current;
-      touchStart.current = null;
-      const touch = event.changedTouches[0];
-      if (!start || !touch || settings.mode === "webtoon") return;
-      const distance = touch.clientX - start.x;
-      const verticalDistance = touch.clientY - start.y;
-      if (Math.abs(distance) >= 48 && Math.abs(distance) >= Math.abs(verticalDistance)) {
-        const forward = settings.direction === "rtl" ? distance > 0 : distance < 0;
-        move(forward ? step : -step);
-        return;
-      }
-      if (Math.abs(distance) > 12 || Math.abs(verticalDistance) > 12) return;
-      const rect = event.currentTarget.getBoundingClientRect();
-      const left = rect.left + rect.width * 0.3;
-      const right = rect.left + rect.width * 0.7;
-      if (touch.clientX <= left || touch.clientX >= right) {
-        const forward = settings.direction === "rtl" ? touch.clientX <= left : touch.clientX >= right;
-        move(forward ? step : -step);
-      }
-    },
-  };
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const left = () => move(settings.direction === "rtl" ? step : -step);
+    const right = () => move(settings.direction === "rtl" ? -step : step);
+    return installPageGestures(content, {
+      enabled: () => settings.mode !== "webtoon",
+      bounds: () => content.getBoundingClientRect(),
+      left, right,
+      swipe: (direction) => direction === "left" ? right() : left(),
+    });
+  }, [move, settings.direction, settings.mode, step]);
 
   return <div className={`reader-stage comic-reader comic-${settings.mode} comic-${settings.fit}`} dir={settings.direction}>
     <div className="reader-content" ref={contentRef}>
       {!pageCount && <div className="reader-error"><p>CBZ 中没有可阅读的图片</p></div>}
-      <div className="comic-pages" {...touchHandlers}>
+      <div className="comic-pages">
         {visible.map((page) => {
           const info = detail.pages[page];
           const aspectRatio = info?.width && info.height ? `${info.width} / ${info.height}` : undefined;
@@ -301,8 +275,8 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
           }} style={aspectRatio ? { aspectRatio } : undefined}>
             {failed.has(page)
               ? <div className="reader-error"><p>第 {page + 1} 页加载失败</p><button className="reader-control-button reader-control-button--danger" type="button" onClick={() => retryPage(page)}>重试</button></div>
-              : loaded.has(page)
-                ? <img key={`${page}-${attempt}`} src={`/api/v1/publications/${detail.id}/pages/${page}${attempt ? `?retry=${attempt}` : ""}`} alt={`第 ${page + 1} 页`} loading={settings.mode === "webtoon" ? "lazy" : "eager"} decoding="async" onLoad={() => {
+              : settings.mode !== "webtoon" || eligible.has(page)
+                ? <img key={`${page}-${attempt}`} src={`/api/v1/publications/${detail.id}/pages/${page}${attempt ? `?retry=${attempt}` : ""}`} draggable={false} alt={`第 ${page + 1} 页`} loading={settings.mode === "webtoon" ? "lazy" : "eager"} decoding="async" onLoad={() => {
                   if (settings.mode === "webtoon" && pendingScrollRef.current?.page === page) scheduleWebtoonRestore(pendingScrollRef.current);
                 }} onError={() => setFailed((current) => new Set(current).add(page))} />
                 : <div className="reader-loading">正在加载第 {page + 1} 页…</div>}
@@ -313,7 +287,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     <div className="reader-bottom-bar">
       <button className="reader-control-button" type="button" onClick={() => move(-step)} disabled={index <= 0}>上一页</button>
       <span>{pageCount ? `${index + 1} / ${pageCount}` : "0 / 0"}</span>
-      <button className="reader-control-button" type="button" onClick={() => move(step)} disabled={!pageCount || index >= pageCount - 1}>下一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move(step)} disabled={!pageCount || index + step >= pageCount}>下一页</button>
     </div>
   </div>;
 }

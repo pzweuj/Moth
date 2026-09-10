@@ -49,6 +49,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
         setError("");
         setLoadingStage("读取进度");
         setLoadRequest(null);
+        setNavigationRequest(null);
         const saved = await api.progress(id, controller.signal);
         if (cancelled) return;
         const requestedEncoding = saved?.position.type === "txt"
@@ -166,6 +167,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   const onEncodingChange = (value: string) => {
     if (!detail || detail.source_format !== "txt" || value === encoding) return;
     setEncoding(value);
+    setNavigationRequest(null);
     setDetail(null);
     setProgress(null);
     setTextNavigation([]);
