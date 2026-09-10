@@ -2,8 +2,9 @@ import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import type { BookDetail, ProgressBody, ReadingPosition } from "../api";
 import { api, bookFileUrl } from "../api";
 import { makeRangeLoader } from "./zipLoader";
-import { framePointToViewport, installPageGestures } from "./pageGestures";
+import { framePointToViewport, installPageGestures, type PageGestureState } from "./pageGestures";
 import { readerCss } from "./readerCss";
+import { cacheSections } from "./sectionCache";
 import type { ReaderSettings } from "./settings";
 import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
 import type { FoliateBook, FoliateRenderer, FoliateViewElement } from "../../vendor/foliate-js/view.js";
@@ -274,7 +275,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     settingsRef.current = settings;
     themeRef.current = theme;
     const renderer = viewRef.current?.renderer;
-    if (!renderer) return;
+    if (!renderer || viewRef.current?.isFixedLayout) return;
     applyReaderLayout(renderer, settings);
     renderer.setStyles(readerCss(settings, theme));
   }, [settings, theme]);
@@ -286,9 +287,12 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     let loader: Awaited<ReturnType<typeof makeRangeLoader>> | null = null;
     let view: FoliateViewElement | null = null;
     let publication: TextPublication | null = null;
+    let epub: EPUB | null = null;
+    let sectionCache: ReturnType<typeof cacheSections> | null = null;
     let suppressRelocate = true;
     const controller = new AbortController();
     const cleanups = new Map<Document, () => void>();
+    const gestureState: PageGestureState = { lastTouch: -Infinity };
     let cleanupMargins: (() => void) | undefined;
     const saved = progressRef.current;
     const isTxt = detail.source_format === "txt";
@@ -326,6 +330,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     const handleRelocate = (event: Event) => {
       if (cancelled) return;
       const location = ((event as CustomEvent).detail ?? {}) as RelocateLocation;
+      if (typeof location.section?.current === "number") sectionCache?.relocate(location.section.current);
       if (!suppressRelocate) publishLocation(location, true);
     };
 
@@ -351,8 +356,9 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
         );
         if (cancelled) return;
         setLoadingStage("解析书籍");
-        const epub = await withTimeout(new EPUB(loader).init(), "解析 EPUB 失败或超时，请重试");
-        if (cancelled) return;
+        epub = await withTimeout(new EPUB(loader).init(), "解析 EPUB 失败或超时，请重试");
+        if (cancelled) { epub.destroy(); return; }
+        sectionCache = cacheSections(epub.sections, epub.rendition?.layout === "pre-paginated");
         book = epub as unknown as FoliateBook;
         const parsedToc = flattenToc((epub as { toc?: unknown }).toc);
         const items = parsedToc.length > 0 ? parsedToc : spineNavigation(book);
@@ -381,14 +387,15 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
               cleanups.delete(previous);
             }
           }
-          cleanups.set(doc, installMobileTapNavigation(doc, view, settingsRef, () => setError("翻页失败，请重试")));
+          cleanups.set(doc, installMobileTapNavigation(doc, view, settingsRef, gestureState, () => setError("翻页失败，请重试")));
         }
       }) as EventListener);
       host.append(view);
       const content = host.parentElement!;
       const currentView = view;
       cleanupMargins = installPageGestures(content, {
-        enabled: () => settingsRef.current.flow === "paginated" && !cancelled,
+        state: gestureState,
+        enabled: () => (!!currentView.isFixedLayout || settingsRef.current.flow === "paginated") && !cancelled,
         bounds: () => content.getBoundingClientRect(),
         left: () => { void currentView.goLeft().catch(() => setError("翻页失败，请重试")); },
         right: () => { void currentView.goRight().catch(() => setError("翻页失败，请重试")); },
@@ -398,8 +405,10 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
 
       await withTimeout(view.open(book), "排版书籍超时，请重试");
       if (cancelled) return;
-      applyReaderLayout(view.renderer, settingsRef.current);
-      view.renderer.setStyles(readerCss(settingsRef.current, themeRef.current));
+      if (!view.isFixedLayout) {
+        applyReaderLayout(view.renderer, settingsRef.current);
+        view.renderer.setStyles(readerCss(settingsRef.current, themeRef.current));
+      }
 
       const position = saved?.position;
       let restored = false;
@@ -477,7 +486,11 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
       view?.remove();
       if (publicationRef.current === publication) publicationRef.current = null;
       publication?.destroy();
-      void loader?.close();
+      void (async () => {
+        await sectionCache?.destroy();
+        epub?.destroy();
+        await loader?.close();
+      })();
     };
   }, [detail, encoding, retryToken]);
 
@@ -518,13 +531,13 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
   </div>;
 }
 
-function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>, onError: () => void): () => void {
+function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>, state: PageGestureState, onError: () => void): () => void {
   return installPageGestures(doc, {
-    enabled: () => settingsRef.current.flow === "paginated",
+    state,
+    enabled: () => !!view.isFixedLayout || settingsRef.current.flow === "paginated",
     bounds: () => (view.closest(".reader-content") ?? view).getBoundingClientRect(),
     toViewport: (point) => framePointToViewport(doc, point),
     left: () => { void view.goLeft().catch(onError); },
     right: () => { void view.goRight().catch(onError); },
-    excludeImages: true,
   });
 }

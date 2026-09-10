@@ -88,4 +88,38 @@ describe("reader gestures", () => {
     gesture(link, [touch(1450)]);
     expect(left).toHaveBeenCalledTimes(1); expect(right).toHaveBeenCalledTimes(1);
   });
+
+  it("turns pages on iframe images and SVG artwork but preserves linked images", () => {
+    const frame = document.createElement("iframe"); document.body.append(frame);
+    const doc = frame.contentDocument!;
+    const left = vi.fn(), right = vi.fn();
+    cleanups.push(installPageGestures(doc, { enabled: () => true, bounds: () => rect, left, right }));
+    doc.body.innerHTML = '<img/><svg xmlns="http://www.w3.org/2000/svg"><image/></svg><a href="#chapter"><img/></a>';
+    gesture(doc.querySelector("img")!, [touch(900)]);
+    gesture(doc.querySelector("image")!, [touch(100)]);
+    gesture(doc.querySelector("a img")!, [touch(900)]);
+    fireEvent.click(doc.querySelector("img")!, { clientX: 900, clientY: 200 });
+    expect(left).toHaveBeenCalledTimes(1);
+    expect(right).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses the compatibility click even after a touch replaces the chapter", () => {
+    const state = { lastTouch: -Infinity };
+    const right = vi.fn();
+    const chapter = () => {
+      const frame = document.createElement("iframe"); document.body.append(frame);
+      const doc = frame.contentDocument!;
+      doc.body.innerHTML = "<img/>";
+      cleanups.push(installPageGestures(doc, { state, enabled: () => true, bounds: () => rect, left: vi.fn(), right }));
+      return { frame, image: doc.querySelector("img")! };
+    };
+    const first = chapter();
+    gesture(first.image, [touch(900)]);
+    first.frame.remove();
+    const next = chapter();
+    fireEvent.click(next.image, { clientX: 900, clientY: 200 });
+    expect(right).toHaveBeenCalledTimes(1);
+    gesture(next.image, [touch(900)]);
+    expect(right).toHaveBeenCalledTimes(2);
+  });
 });

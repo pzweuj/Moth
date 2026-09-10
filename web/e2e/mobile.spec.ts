@@ -1,11 +1,12 @@
 import { test, expect, login, waitForScan } from "./fixtures";
 import { contentPoint, syntheticGesture, textLocation } from "./gestures";
+import { makeEpubComic } from "./epubComic";
 
 // Network failure injection must reach Playwright in WebKit as well.
 // Service Worker behavior has its own coverage in core.spec.ts.
 test.use({ serviceWorkers: "block" });
 
-type HomePublication = { id: number; source_format: string; reader_format: string };
+type HomePublication = { id: number; title: string; source_format: string; reader_format: string };
 
 async function homePublications(page: Parameters<typeof login>[0], url: string): Promise<HomePublication[]> {
   const home = await (await page.request.get(`${url}/api/v1/home`)).json() as { directories: Array<{ series: Array<{ representative: HomePublication | null }> }> };
@@ -228,3 +229,67 @@ test("fullscreen manifest and asymmetric safe areas fit portrait and landscape",
     expect(metrics.shellBottom).toBeLessThanOrEqual(metrics.height + 1);
   }
 });
+
+for (const fixed of [false, true]) {
+  test(`EPUB comic ${fixed ? "fixed RTL" : "reflowable"} images turn pages and reuse prefetched resources`, async ({ page, app }) => {
+    const title = await makeEpubComic(app.books, fixed);
+    await login(page, app.url);
+    await waitForScan(page, app.url);
+    await page.request.post(`${app.url}/api/v1/scan`);
+    await waitForScan(page, app.url);
+    const book = (await homePublications(page, app.url)).find((entry) => entry.title === title)!;
+    expect(book).toBeTruthy();
+    await page.goto(`${app.url}/reader/${book.id}`);
+    await expect(page.locator(".reader-loading")).toHaveCount(0);
+    await expect(page.locator(".reader-error")).toHaveCount(0);
+    await expect.poll(async () => (await textLocation(page)).chapter).toBe(0);
+    const artworkPoint = async (forward: boolean) => {
+      const point = await contentPoint(page, (forward !== fixed) ? 0.85 : 0.15);
+      // Verify native touch coordinates hit the artwork inside the scaled iframe.
+      const hit = await page.locator("foliate-view").evaluate((element, point) => {
+        const view = element as HTMLElement & { renderer: { getContents(): Array<{ doc: Document }> } };
+        return view.renderer.getContents().some(({ doc }) => {
+          const frame = doc.defaultView?.frameElement as HTMLIFrameElement;
+          const rect = frame.getBoundingClientRect();
+          const localX = (point.x - rect.left) * frame.offsetWidth / rect.width;
+          const localY = (point.y - rect.top) * frame.offsetHeight / rect.height;
+          return !!doc.elementFromPoint(localX, localY)?.closest("img,svg,image");
+        });
+      }, point);
+      expect(hit).toBe(true);
+      return point;
+    };
+    for (let index = 1; index <= 3; index++) {
+      await page.waitForLoadState("networkidle");
+      const point = await artworkPoint(true);
+      await page.touchscreen.tap(point.x, point.y);
+      await expect.poll(async () => (await textLocation(page)).chapter).toBe(index);
+    }
+    await page.waitForLoadState("networkidle");
+    // Once prepared, the next and previous page must work with archive reads
+    // blocked; this catches both missing prefetch and premature URL revocation.
+    await page.route(`**/api/v1/publications/${book.id}/file`, (route) => route.abort());
+    const forward = await artworkPoint(true);
+    await page.touchscreen.tap(forward.x, forward.y);
+    await expect.poll(async () => (await textLocation(page)).chapter).toBe(4);
+    await page.waitForTimeout(150); // paginator releases its turn lock after relocation
+    const back = await artworkPoint(false);
+    await page.touchscreen.tap(back.x, back.y);
+    await expect.poll(async () => (await textLocation(page)).chapter).toBe(3);
+    await expect(page.locator(".reader-error")).toHaveCount(0);
+    const ready = await page.locator("foliate-view").evaluate(async (element) => {
+      const view = element as HTMLElement & { renderer: { getContents(): Array<{ doc: Document }> } };
+      const doc = view.renderer.getContents()[0].doc;
+      const source = doc.querySelector("image")?.getAttributeNS("http://www.w3.org/1999/xlink", "href") ?? doc.querySelector("img")?.src;
+      const img = new Image(); img.src = source!;
+      await img.decode();
+      return img.naturalWidth;
+    });
+    expect(ready).toBe(600);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    await expect.poll(async () => (await (await page.request.get(`${app.url}/api/v1/publications/${book.id}/progress`)).json()).position.cfi).toBe((await textLocation(page)).cfi);
+    await page.unroute(`**/api/v1/publications/${book.id}/file`);
+    await page.reload();
+    await expect.poll(async () => (await textLocation(page)).chapter).toBe(3);
+  });
+}

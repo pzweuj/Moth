@@ -11,5 +11,8 @@ export type FoliateBook = Record<string, unknown>;
 
 export class EPUB {
   constructor(loader: ZipLoaderLike);
-  init(): Promise<FoliateBook>;
+  init(): Promise<EPUB>;
+  sections: Array<{ load(): Promise<string | null>; unload(): void; linear?: string }>;
+  rendition?: { layout?: string };
+  destroy(): void;
 }

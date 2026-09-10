@@ -1,4 +1,5 @@
 type Point = { x: number; y: number };
+export type PageGestureState = { lastTouch: number };
 type Options = {
   enabled: () => boolean;
   bounds: () => DOMRect;
@@ -6,7 +7,7 @@ type Options = {
   left: () => void;
   right: () => void;
   swipe?: (direction: "left" | "right") => void;
-  excludeImages?: boolean;
+  state?: PageGestureState;
 };
 
 const controls = "a,button,input,select,textarea,video,audio,label,summary,[role=button],[role=link],[role=slider],[contenteditable]:not([contenteditable=false])";
@@ -16,11 +17,13 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
   const doc = surface.nodeType === 9 ? surface as Document : surface.ownerDocument!;
   let start: (Point & { at: number; maxX: number; maxY: number }) | null = null;
   let invalid = false;
-  let lastTouch = -Infinity;
+  // A touch can replace the iframe before the browser sends its compatibility
+  // click. Share this timestamp across chapter documents and outer margins.
+  const state = options.state ?? { lastTouch: -Infinity };
   const blocked = (target: EventTarget | null) => {
     // DOM elements in book iframes belong to a different JavaScript realm.
     const element = target as Element | null;
-    return !!element?.closest?.(controls + (options.excludeImages ? ",img" : ""))
+    return !!element?.closest?.(controls)
       || !!doc.getSelection()?.toString()
       || (window.visualViewport?.scale ?? 1) > 1;
   };
@@ -33,14 +36,14 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
     else if (relative >= 0.7) options.right();
   };
   const touchStart = (event: TouchEvent) => {
-    lastTouch = Date.now();
+    state.lastTouch = Date.now();
     if (start || event.touches.length !== 1 || event.changedTouches.length !== 1) {
       invalid = true;
       return;
     }
     const touch = event.changedTouches[0];
     invalid = blocked(event.target);
-    start = { x: touch.clientX, y: touch.clientY, at: lastTouch, maxX: 0, maxY: 0 };
+    start = { x: touch.clientX, y: touch.clientY, at: state.lastTouch, maxX: 0, maxY: 0 };
   };
   const touchMove = (event: TouchEvent) => {
     if (event.touches.length !== 1) invalid = true;
@@ -49,7 +52,7 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
     start.maxY = Math.max(start.maxY, Math.abs(event.touches[0].clientY - start.y));
   };
   const touchEnd = (event: TouchEvent) => {
-    lastTouch = Date.now();
+    state.lastTouch = Date.now();
     const origin = start;
     if (event.touches.length !== 0) { invalid = true; return; }
     start = null;
@@ -57,7 +60,7 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
     invalid = false;
     const touch = event.changedTouches[0];
     if (!origin || wasInvalid || !touch || event.changedTouches.length !== 1
-      || !options.enabled() || blocked(event.target) || lastTouch - origin.at > 500) return;
+      || !options.enabled() || blocked(event.target) || state.lastTouch - origin.at > 500) return;
     const dx = touch.clientX - origin.x;
     const dy = touch.clientY - origin.y;
     const maxY = Math.max(origin.maxY, Math.abs(dy));
@@ -67,9 +70,9 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
       tap({ x: touch.clientX, y: touch.clientY });
     }
   };
-  const cancel = () => { start = null; invalid = false; lastTouch = Date.now(); };
+  const cancel = () => { start = null; invalid = false; state.lastTouch = Date.now(); };
   const click = (event: MouseEvent) => {
-    if (Date.now() - lastTouch < 800 || event.button !== 0 || event.ctrlKey || event.metaKey
+    if (Date.now() - state.lastTouch < 800 || event.button !== 0 || event.ctrlKey || event.metaKey
       || event.altKey || event.shiftKey || !options.enabled() || blocked(event.target)) return;
     tap({ x: event.clientX, y: event.clientY });
   };
