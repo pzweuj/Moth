@@ -63,7 +63,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Compose 将 `./data` 挂载到 `/data`，将 `./books` 挂载到 `/books`。容器以 UID/GID `10001` 的非 root 用户运行。要固定版本，修改 `image`，例如 `ghcr.io/pzweuj/moth:v0.0.1`。
+Compose 将 `./data` 挂载到 `/data`，将 `${MOTH_BOOKS_PATH:-./books}` 以只读方式挂载到 `/books`。Compose 明确以 root 用户启动容器，避免宿主机 bind mount 的 UID/GID 不匹配导致 SQLite 无法创建数据库。要固定版本，修改 `image`，例如 `ghcr.io/pzweuj/moth:v0.0.1`。
 
 ## API 概览
 

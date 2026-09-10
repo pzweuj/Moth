@@ -1,7 +1,6 @@
 """Run the built moth:dev image against disposable, isolated Compose mounts."""
 import http.cookiejar
 import json
-import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -14,20 +13,18 @@ RUN = ROOT / ".local" / ("container-smoke-" + secrets.token_hex(4))
 RUN.mkdir(parents=True)
 for name in ("books", "data"):
     (RUN / name).mkdir()
-if os.name != "nt":
-    # Only the disposable test data directory is made writable for UID 10001.
-    (RUN / "data").chmod(0o777)
 (RUN / "books" / "Smoke.txt").write_text("Chapter 1\n\nA small container fixture.\n", encoding="utf-8")
 config = {
     "services": {"moth": {
         "image": "moth:dev",
+        "user": "0:0",
         "ports": ["127.0.0.1::8080"],
         "environment": {"MOTH_COOKIE_SECURE": "false"},
         "volumes": [
             {"type": "bind", "source": str(RUN / "data"), "target": "/data"},
             {"type": "bind", "source": str(RUN / "books"), "target": "/books", "read_only": True},
         ],
-    }}
+    }},
 }
 compose_file = RUN / "compose.json"
 compose_file.write_text(json.dumps(config), encoding="utf-8")
@@ -86,11 +83,12 @@ try:
     assert session.path == "/"
     request("/reader/1")
     assert request("/api/v1/not-found", status=404)["error"]["code"] == "not_found"
-    assert compose("exec", "-T", "moth", "id", "-u").stdout.strip() == "10001"
+    assert compose("exec", "-T", "moth", "id", "-u").stdout.strip() == "0"
     cid = compose("ps", "-q", "moth").stdout.strip()
     container = json.loads(subprocess.check_output(["docker", "inspect", cid], text=True))[0]
     mounts = {mount["Destination"]: mount for mount in container["Mounts"]}
-    assert mounts["/books"]["RW"] is False and mounts["/data"]["RW"] is True
+    assert mounts["/books"]["Type"] == "bind" and mounts["/books"]["RW"] is False
+    assert mounts["/data"]["Type"] == "bind" and mounts["/data"]["RW"] is True
     assert compose("exec", "-T", "moth", "touch", "/books/must-not-write", check=False).returncode != 0
     compose("exec", "-T", "moth", "touch", "/data/write-check")
     compose("restart", "moth")
@@ -112,7 +110,7 @@ try:
     logs = compose("logs", "--no-color").stdout
     assert "panic" not in logs.lower()
     assert credentials["password"] not in logs and session.value not in logs
-    (RUN / "result.txt").write_text("PASS: authentication, restart/recreate, mounts, non-root, SIGTERM\n")
+    (RUN / "result.txt").write_text("PASS: authentication, restart/recreate, mounts, root user, SIGTERM\n")
     print("PASS: container smoke", RUN)
 finally:
     logs = compose("logs", "--no-color", check=False)
