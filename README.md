@@ -5,6 +5,7 @@ Moth 是一个单用户、filesystem-first 自托管 PWA 阅读器。它只读�
 ## 产品边界
 
 - `MOTH_BOOKS_DIR` 是唯一书库根目录，子目录就是分类。
+- 要把一级书架收进首页的“更多书架”，在 `MOTH_BOOKS_DIR/<书架>/hide` 放置一个普通文件（空文件即可，内容不会读取）；只检查一级书架，根目录或系列目录中的同名文件不生效。刷新首页即可生效。隐藏书架仍可从“更多书架”进入，里面的书不会出现在“继续阅读”。
 - 首页显示继续阅读和按“分类/系列/作品”层级组织的目录预览；没有搜索、作者筛选、系列管理或文件整理。
 - EPUB 使用 HTTP Range 和 CFI；TXT 使用编码检测、中文章节索引和 UTF-16 字符定位；CBZ 按页解压；MOBI 首次打开时转成 EPUB 缓存。
 - PWA 只缓存应用外壳和构建资源。阅读资源和进度请求需要连接服务器。
@@ -71,9 +72,9 @@ Compose 将 `./data` 挂载到 `/data`，将 `${MOTH_BOOKS_PATH:-./books}` 以�
 
 | 端点 | 用途 |
 | --- | --- |
-| `GET /home` | 继续阅读和分类/系列目录预览 |
+| `GET /home` | 继续阅读、分类/系列目录预览和折叠的隐藏书架入口 |
 | `GET /browse?path=...` | 面包屑、子目录和当前目录的书 |
-| `POST /scan`、`GET /scan/status` | 启动扫描和读取全局扫描状态 |
+| `POST /scan`、`GET /scan/status` | 启动扫描和读取全局扫描状态（包括发现阶段） |
 | `GET /publications/{id}` | Publication 元数据、TXT 章节或 CBZ 页索引 |
 | `GET /publications/{id}/cover`、`/file`、`/chapters/{idx}`、`/pages/{idx}`、`/pages/{idx}/thumbnail` | 阅读资源 |
 | `GET/POST /publications/{id}/conversion` | 查询或启动 MOBI→EPUB 转换 |

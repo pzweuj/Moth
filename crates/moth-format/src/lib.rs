@@ -73,6 +73,8 @@ pub struct Metadata {
     pub title: String,
     pub author: Option<String>,
     pub cover: Option<Cover>,
+    /// A non-fatal cover problem. The book can still be indexed and opened.
+    pub cover_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,7 @@ pub struct Page {
 pub struct ComicIndex {
     pub pages: Vec<Page>,
     pub cover: Option<Cover>,
+    pub cover_error: Option<String>,
 }
 
 /// Resolve a possibly-relative reference against a base directory and

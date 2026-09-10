@@ -41,10 +41,11 @@ export type BrowseResponse = {
 };
 export type HomeSeriesPreview = { name: string; path: string; publication_count: number; representative: PublicationSummary | null };
 export type HomeDirectoryPreview = { name: string; path: string; series: HomeSeriesPreview[] };
-export type HomeResponse = { continue_reading: PublicationSummary[]; directories: HomeDirectoryPreview[] };
+export type HiddenDirectorySummary = { name: string; path: string };
+export type HomeResponse = { continue_reading: PublicationSummary[]; directories: HomeDirectoryPreview[]; hidden_directories: HiddenDirectorySummary[] };
 export type ChapterContent = { idx: number; title: string; content: string; text: string; encoding: string; content_version: string; character_count: number };
 export type ConversionResponse = { status: "pending" | "preparing" | "ready" | "failed" | "not_required"; file_url?: string; error?: string };
-export type ScanStatus = { scanning: boolean; processed: number; total: number; errors: number; message: string };
+export type ScanStatus = { scanning: boolean; discovery_complete: boolean; processed: number; total: number; errors: number; message: string };
 
 export class ApiError extends Error {
   status: number;

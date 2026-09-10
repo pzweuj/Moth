@@ -10,6 +10,7 @@ use crate::config::Config;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanStatus {
     pub scanning: bool,
+    pub discovery_complete: bool,
     pub processed: u64,
     pub total: u64,
     pub errors: u64,

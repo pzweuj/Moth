@@ -118,6 +118,13 @@ pub struct ProgressBody {
 pub struct HomeResponse {
     pub continue_reading: Vec<PublicationSummary>,
     pub directories: Vec<HomeDirectoryPreview>,
+    pub hidden_directories: Vec<HiddenDirectorySummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HiddenDirectorySummary {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,13 +174,17 @@ pub async fn home(
     State(state): State<AppState>,
     _user: Authenticated,
 ) -> Result<Json<HomeResponse>, AppError> {
-    let mut continue_reading = fetch_publications(&state.db, None, Some("progress")).await?;
-    continue_reading.retain(|book| book.progress > 0.0 && book.progress < 1.0);
-    continue_reading.truncate(12);
-    let directories = fetch_home_directories(&state.db).await?;
+    let (directories, hidden_directories) =
+        fetch_home_directories(&state.db, &state.config.books_dir).await?;
+    let hidden_paths = hidden_directories
+        .iter()
+        .map(|directory| directory.path.as_str())
+        .collect::<Vec<_>>();
+    let continue_reading = fetch_continue_reading(&state.db, &hidden_paths).await?;
     Ok(Json(HomeResponse {
         continue_reading,
         directories,
+        hidden_directories,
     }))
 }
 
@@ -182,13 +193,16 @@ struct SeriesCandidate {
     active_at: Option<i64>,
 }
 
-async fn fetch_home_directories(db: &SqlitePool) -> Result<Vec<HomeDirectoryPreview>, AppError> {
+async fn fetch_home_directories(
+    db: &SqlitePool,
+    books_root: &std::path::Path,
+) -> Result<(Vec<HomeDirectoryPreview>, Vec<HiddenDirectorySummary>), AppError> {
     let Some(root_id) =
         sqlx::query_scalar::<_, i64>("SELECT id FROM directories WHERE relative_path=''")
             .fetch_optional(db)
             .await?
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let categories = sqlx::query(
         "SELECT id,name,relative_path FROM directories WHERE parent_id=? ORDER BY name COLLATE NOCASE",
@@ -197,10 +211,33 @@ async fn fetch_home_directories(db: &SqlitePool) -> Result<Vec<HomeDirectoryPrev
     .fetch_all(db)
     .await?;
     let mut output = Vec::with_capacity(categories.len());
+    let mut hidden = Vec::new();
     for category in categories {
         let category_id: i64 = category.try_get("id")?;
+        let category_path: String = category.try_get("relative_path")?;
+        let category_name: String = category.try_get("name")?;
+        if books_root.join(&category_path).join("hide").is_file() {
+            hidden.push(HiddenDirectorySummary {
+                name: category_name,
+                path: category_path,
+            });
+            continue;
+        }
+        // Rank series in SQL so a large shelf never loads every series (or
+        // every book in every series) just to discard all but the four cards
+        // shown on the home page. `active_at` is NULL for series without an
+        // in-progress book; SQLite sorts those after real timestamps when
+        // ordering descending.
         let series_rows = sqlx::query(
-            "SELECT id,name,relative_path FROM directories WHERE parent_id=? ORDER BY name COLLATE NOCASE",
+            "SELECT d.id,d.name,d.relative_path,COUNT(p.id) AS publication_count,
+                    MAX(CASE WHEN r.progress>0 AND r.progress<1 THEN r.updated_at END) AS active_at
+             FROM directories d
+             LEFT JOIN publications p ON p.directory_id=d.id
+             LEFT JOIN reading_progress r ON r.publication_id=p.id
+             WHERE d.parent_id=?
+             GROUP BY d.id
+             ORDER BY active_at DESC, d.name COLLATE NOCASE
+             LIMIT 4",
         )
         .bind(category_id)
         .fetch_all(db)
@@ -208,38 +245,83 @@ async fn fetch_home_directories(db: &SqlitePool) -> Result<Vec<HomeDirectoryPrev
         let mut candidates = Vec::with_capacity(series_rows.len());
         for series in series_rows {
             let series_id: i64 = series.try_get("id")?;
-            let publications = fetch_publications(db, Some(series_id), Some("filename")).await?;
-            let active_at: Option<i64> = sqlx::query_scalar(
-                "SELECT MAX(r.updated_at) FROM publications p JOIN reading_progress r ON r.publication_id=p.id WHERE p.directory_id=? AND r.progress>0 AND r.progress<1",
-            )
-            .bind(series_id)
-            .fetch_one(db)
-            .await?;
+            let publication_count: i64 = series.try_get("publication_count")?;
+            let representative = fetch_series_representative(db, series_id).await?;
+            let active_at: Option<i64> = series.try_get("active_at")?;
             candidates.push(SeriesCandidate {
                 preview: HomeSeriesPreview {
                     name: series.try_get("name")?,
                     path: series.try_get("relative_path")?,
-                    publication_count: publications.len() as i64,
-                    representative: publications
-                        .iter()
-                        .find(|publication| publication.parse_status == "ok")
-                        .cloned()
-                        .or_else(|| publications.first().cloned()),
+                    publication_count,
+                    representative,
                 },
                 active_at,
             });
         }
         order_home_series(&mut candidates);
         output.push(HomeDirectoryPreview {
-            name: category.try_get("name")?,
-            path: category.try_get("relative_path")?,
+            name: category_name,
+            path: category_path,
             series: candidates
                 .into_iter()
                 .map(|candidate| candidate.preview)
                 .collect(),
         });
     }
-    Ok(output)
+    Ok((output, hidden))
+}
+
+async fn fetch_continue_reading(
+    db: &SqlitePool,
+    hidden_paths: &[&str],
+) -> Result<Vec<PublicationSummary>, AppError> {
+    let mut sql = String::from(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN directories d ON d.id=p.directory_id JOIN reading_progress r ON r.publication_id=p.id WHERE r.progress>0 AND r.progress<1",
+    );
+    for _ in hidden_paths {
+        // Match path segments exactly. Using `LIKE` here would make SQLite's
+        // default ASCII case folding hide a sibling such as `Books` when the
+        // marker is on `books`, and would require escaping user directory
+        // names as patterns.
+        sql.push_str(
+            " AND NOT (d.relative_path=? OR substr(d.relative_path,1,length(?) + 1)=? || '/')",
+        );
+    }
+    sql.push_str(" ORDER BY r.updated_at DESC, p.title COLLATE NOCASE LIMIT 12");
+    let mut query = sqlx::query(&sql);
+    for hidden in hidden_paths {
+        query = query.bind(*hidden).bind(*hidden).bind(*hidden);
+    }
+    let rows = query.fetch_all(db).await?;
+    rows.iter()
+        .map(summary_from_row)
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(AppError::from)
+}
+
+async fn fetch_series_representative(
+    db: &SqlitePool,
+    series_id: i64,
+) -> Result<Option<PublicationSummary>, AppError> {
+    let row = sqlx::query(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE p.directory_id=? ORDER BY CASE WHEN p.parse_status='ok' THEN 0 ELSE 1 END, p.filename COLLATE NOCASE, p.title COLLATE NOCASE LIMIT 1",
+    )
+    .bind(series_id)
+    .fetch_optional(db)
+    .await?;
+    row.map(|value| summary_from_row(&value))
+        .transpose()
+        .map_err(AppError::from)
+}
+
+#[cfg(test)]
+fn is_hidden_directory_path(path: &str, hidden_paths: &[&str]) -> bool {
+    hidden_paths.iter().any(|hidden| {
+        path == *hidden
+            || path
+                .strip_prefix(hidden)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 fn order_home_series(candidates: &mut Vec<SeriesCandidate>) {
@@ -2348,6 +2430,158 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["z-active", "alpha", "bravo", "charlie"]
         );
+    }
+
+    #[test]
+    fn hidden_directory_matching_is_segment_aware() {
+        let hidden = ["私人"].as_slice();
+        assert!(is_hidden_directory_path("私人", hidden));
+        assert!(is_hidden_directory_path("私人/系列", hidden));
+        assert!(!is_hidden_directory_path("私人备份/系列", hidden));
+        assert!(!is_hidden_directory_path("公开/私人", hidden));
+    }
+
+    #[tokio::test]
+    async fn continue_reading_filters_hidden_shelves_before_limit() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        sqlx::query(
+            "CREATE TABLE directories (id INTEGER PRIMARY KEY, relative_path TEXT NOT NULL)",
+        )
+        .execute(&db)
+        .await
+        .expect("directories");
+        sqlx::query("CREATE TABLE publications (id INTEGER PRIMARY KEY, directory_id INTEGER NOT NULL, title TEXT NOT NULL, author TEXT, format TEXT NOT NULL, sha256 TEXT NOT NULL, file_size INTEGER NOT NULL, filename TEXT NOT NULL, parse_status TEXT NOT NULL, has_cover INTEGER NOT NULL)")
+            .execute(&db)
+            .await
+            .expect("publications");
+        sqlx::query("CREATE TABLE reading_progress (publication_id INTEGER PRIMARY KEY, progress REAL NOT NULL, updated_at INTEGER NOT NULL)")
+            .execute(&db)
+            .await
+            .expect("progress");
+        sqlx::query("INSERT INTO directories (id,relative_path) VALUES (1,'隐藏'),(2,'隐藏备份'),(3,'公开')")
+            .execute(&db)
+            .await
+            .expect("directory rows");
+        for (id, directory_id, title, updated_at) in [
+            (1_i64, 1_i64, "hidden", 30_i64),
+            (2, 2, "similar", 20),
+            (3, 3, "visible", 10),
+        ] {
+            sqlx::query("INSERT INTO publications (id,directory_id,title,author,format,sha256,file_size,filename,parse_status,has_cover) VALUES (?,?,?,?,?,?,?,?,?,?)")
+                .bind(id)
+                .bind(directory_id)
+                .bind(title)
+                .bind(None::<String>)
+                .bind("txt")
+                .bind(format!("hash-{id}"))
+                .bind(1_i64)
+                .bind(format!("{title}.txt"))
+                .bind("ok")
+                .bind(false)
+                .execute(&db)
+                .await
+                .expect("publication row");
+            sqlx::query(
+                "INSERT INTO reading_progress (publication_id,progress,updated_at) VALUES (?,?,?)",
+            )
+            .bind(id)
+            .bind(0.5_f64)
+            .bind(updated_at)
+            .execute(&db)
+            .await
+            .expect("progress row");
+        }
+        let books = fetch_continue_reading(&db, &["隐藏"])
+            .await
+            .expect("home query");
+        assert_eq!(
+            books
+                .iter()
+                .map(|book| book.title.as_str())
+                .collect::<Vec<_>>(),
+            ["similar", "visible"]
+        );
+    }
+
+    #[tokio::test]
+    async fn home_directories_move_marked_shelves_to_hidden_entries() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let books_root = temp.path().join("books");
+        let data_root = temp.path().join("data");
+        std::fs::create_dir_all(books_root.join("隐藏")).expect("hidden shelf");
+        std::fs::create_dir_all(books_root.join("公开").join("系列")).expect("visible shelf");
+        let marker = books_root.join("隐藏").join("hide");
+        std::fs::File::create(&marker).expect("hide marker");
+        let mut config = crate::config::Config::for_test(data_root);
+        config.books_dir = books_root.clone();
+        let db = crate::db::connect(&config).await.expect("database");
+        sqlx::query(
+            "INSERT INTO directories (parent_id,name,relative_path,updated_at) VALUES (NULL,?,?,0)",
+        )
+        .bind("书库")
+        .bind("")
+        .execute(&db)
+        .await
+        .expect("root directory");
+        let root_id: i64 = sqlx::query_scalar("SELECT id FROM directories WHERE relative_path=''")
+            .fetch_one(&db)
+            .await
+            .expect("root id");
+        for (name, path) in [("隐藏", "隐藏"), ("公开", "公开")] {
+            sqlx::query("INSERT INTO directories (parent_id,name,relative_path,updated_at) VALUES (?,?,?,0)")
+                .bind(root_id)
+                .bind(name)
+                .bind(path)
+                .execute(&db)
+                .await
+                .expect("category");
+        }
+        let visible_id: i64 =
+            sqlx::query_scalar("SELECT id FROM directories WHERE relative_path='公开'")
+                .fetch_one(&db)
+                .await
+                .expect("visible id");
+        sqlx::query(
+            "INSERT INTO directories (parent_id,name,relative_path,updated_at) VALUES (?,?,?,0)",
+        )
+        .bind(visible_id)
+        .bind("系列")
+        .bind("公开/系列")
+        .execute(&db)
+        .await
+        .expect("series");
+
+        let (visible, hidden) = fetch_home_directories(&db, &books_root)
+            .await
+            .expect("home directories");
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["隐藏"]
+        );
+        assert_eq!(
+            visible
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["公开"]
+        );
+        assert_eq!(visible[0].series[0].name, "系列");
+
+        // The marker is filesystem state, so removing it takes effect on the
+        // next home request without a scan or a database update.
+        std::fs::remove_file(marker).expect("remove hide marker");
+        let (visible, hidden) = fetch_home_directories(&db, &books_root)
+            .await
+            .expect("home directories after marker removal");
+        assert!(hidden.is_empty());
+        assert!(visible.iter().any(|entry| entry.name == "隐藏"));
     }
 
     #[test]

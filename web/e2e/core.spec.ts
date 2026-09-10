@@ -1,4 +1,5 @@
 import { test, expect, login, waitForScan } from "./fixtures";
+import { unlink, writeFile } from "node:fs/promises";
 
 type HomePublication = { id: number; title: string; source_format: string; reader_format: string; content_version?: string };
 
@@ -58,6 +59,36 @@ test("TXT and CBZ readers use the online publication API", async ({ page, app })
   await expect(page.getByLabel("漫画模式", { exact: true })).toBeVisible();
   await page.getByLabel("漫画模式", { exact: true }).selectOption("double");
   await page.getByLabel("漫画模式", { exact: true }).selectOption("webtoon");
+});
+
+test("hidden bookshelf is available through the collapsed more-shelves entry", async ({ page, app }) => {
+  await login(page, app.url);
+  await waitForScan(page, app.url);
+  const marker = `${app.books}/英文/hide`;
+  await writeFile(marker, "");
+  try {
+    const home = await (await page.request.get(`${app.url}/api/v1/home`)).json() as {
+      directories: Array<{ name: string }>;
+      hidden_directories: Array<{ name: string; path: string }>;
+    };
+    expect(home.directories.some((directory) => directory.name === "英文")).toBe(false);
+    expect(home.hidden_directories).toContainEqual({ name: "英文", path: "英文" });
+    await page.reload();
+    const more = page.locator(".hidden-directories");
+    await expect(more).toBeVisible();
+    await expect(more).not.toHaveAttribute("open");
+    await expect(more.locator("summary")).toHaveText("更多书架");
+    await more.locator("summary").click();
+    const link = more.getByRole("link", { name: "英文", exact: true });
+    await expect(link).toBeVisible();
+    await link.click();
+    await expect(page.locator("h1")).toHaveText("英文");
+    await page.goBack();
+    await expect(page.locator(".hidden-directories")).toBeVisible();
+    await expect(page.locator(".hidden-directories")).not.toHaveAttribute("open");
+  } finally {
+    await unlink(marker);
+  }
 });
 
 test("classic MOBI exposes conversion and EPUB reader format", async ({ page, app }) => {

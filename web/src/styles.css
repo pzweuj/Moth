@@ -113,6 +113,11 @@ a { color: inherit; }
 .book-info p { font-size: 13px; }
 .book-info small { font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; margin-top: 7px; }
 .shelf-hint { color: var(--app-muted); margin: 18px 0; }
+.hidden-directories { margin: 38px auto 0; max-width: 1180px; }
+.hidden-directories summary { color: var(--app-accent-strong); cursor: pointer; font: 600 12px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .06em; }
+.hidden-directory-list { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 14px; }
+.hidden-directory-link { background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 8px; color: var(--app-heading); padding: 12px 14px; text-decoration: none; }
+.hidden-directory-link:hover { border-color: var(--app-accent); background: var(--app-surface-muted); }
 
 /* Reader */
 .reader-shell { background: var(--app-bg); color: var(--app-text); display: flex; flex-direction: column; height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }

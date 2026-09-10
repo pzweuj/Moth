@@ -7,6 +7,8 @@ use zip::ZipArchive;
 
 use crate::{ComicIndex, Cover, Page, ParseError};
 
+const COVER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Image extensions accepted as comic pages.
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp"];
 
@@ -116,23 +118,43 @@ pub fn parse(path: &Path) -> Result<ComicIndex, ParseError> {
     pages.sort_by(|a, b| natural_compare(&a.path, &b.path));
 
     // The first page doubles as the cover.
+    let mut cover_error = None;
     let cover = {
         let first = &pages[0];
-        let mut archive = ZipArchive::new(std::fs::File::open(path)?)
-            .map_err(|error| ParseError::Archive(error.to_string()))?;
-        let mut buffer = Vec::new();
-        archive
-            .by_name(&first.path)
-            .map_err(|error| ParseError::Archive(error.to_string()))?
-            .read_to_end(&mut buffer)
-            .map_err(|error| ParseError::Archive(error.to_string()))?;
-        Some(Cover {
-            data: buffer,
-            mime: first.mime.clone(),
-        })
+        match archive.by_name(&first.path) {
+            Err(error) => {
+                cover_error = Some(format!("could not read CBZ cover: {error}"));
+                None
+            }
+            Ok(entry) if entry.size() > COVER_MAX_BYTES => {
+                cover_error = Some("CBZ cover exceeds the 16 MiB scan limit".to_owned());
+                None
+            }
+            Ok(entry) => {
+                let mut buffer = Vec::with_capacity(entry.size() as usize);
+                match entry.take(COVER_MAX_BYTES + 1).read_to_end(&mut buffer) {
+                    Err(error) => {
+                        cover_error = Some(format!("could not read CBZ cover: {error}"));
+                        None
+                    }
+                    Ok(_) if buffer.len() as u64 > COVER_MAX_BYTES => {
+                        cover_error = Some("CBZ cover exceeds the 16 MiB scan limit".to_owned());
+                        None
+                    }
+                    Ok(_) => Some(Cover {
+                        data: buffer,
+                        mime: first.mime.clone(),
+                    }),
+                }
+            }
+        }
     };
 
-    Ok(ComicIndex { pages, cover })
+    Ok(ComicIndex {
+        pages,
+        cover,
+        cover_error,
+    })
 }
 
 #[cfg(test)]

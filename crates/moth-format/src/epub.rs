@@ -12,6 +12,10 @@ use zip::ZipArchive;
 
 use crate::{Cover, Metadata, ParseError, resolve_reference};
 
+const CONTAINER_MAX_BYTES: u64 = 1024 * 1024;
+const OPF_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const COVER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 struct ManifestItem {
     id: String,
     path: String,
@@ -26,23 +30,39 @@ struct Package {
     cover_id: Option<String>,
 }
 
-fn zip_bytes<R: Read + Seek>(
+fn zip_bytes_limited<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, ParseError> {
-    let mut entry = archive
+    let entry = archive
         .by_name(name)
         .map_err(|error| ParseError::Epub(format!("missing entry {name}: {error}")))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    if entry.size() > max_bytes {
+        return Err(ParseError::Epub(format!(
+            "{name} exceeds the {} MiB scan limit",
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    let capacity = usize::try_from(entry.size()).unwrap_or(usize::MAX);
+    let mut bytes =
+        Vec::with_capacity(capacity.min(usize::try_from(max_bytes).unwrap_or(usize::MAX)));
     entry
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| ParseError::Epub(format!("reading {name}: {error}")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(ParseError::Epub(format!(
+            "{name} exceeds the {} MiB scan limit",
+            max_bytes / (1024 * 1024)
+        )));
+    }
     Ok(bytes)
 }
 
 /// Locate the OPF package path from `META-INF/container.xml`.
 fn find_opf<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<String, ParseError> {
-    let bytes = zip_bytes(archive, "META-INF/container.xml")?;
+    let bytes = zip_bytes_limited(archive, "META-INF/container.xml", CONTAINER_MAX_BYTES)?;
     let mut reader = Reader::from_reader(bytes.as_slice());
     reader.config_mut().trim_text(true);
     let mut found = None;
@@ -99,7 +119,7 @@ fn read_package<R: Read + Seek>(
     opf_path: &str,
 ) -> Result<Package, ParseError> {
     let opf_dir = opf_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-    let bytes = zip_bytes(archive, opf_path)?;
+    let bytes = zip_bytes_limited(archive, opf_path, OPF_MAX_BYTES)?;
     let mut reader = Reader::from_reader(bytes.as_slice());
     reader.config_mut().trim_text(true);
 
@@ -219,21 +239,30 @@ pub fn parse_metadata(path: &Path) -> Result<Metadata, ParseError> {
                 })
                 .map(|item| item.path.clone())
         });
-    let cover = cover_path.and_then(|path| {
-        zip_bytes(&mut archive, &path).ok().map(|data| Cover {
-            mime: package
-                .manifest
-                .iter()
-                .find(|item| item.path == path)
-                .map(|item| item.mime.clone())
-                .unwrap_or_else(|| crate::detect_image_mime(&data).to_owned()),
-            data,
-        })
-    });
+    let mut cover_error = None;
+    let cover =
+        cover_path.and_then(
+            |path| match zip_bytes_limited(&mut archive, &path, COVER_MAX_BYTES) {
+                Ok(data) => Some(Cover {
+                    mime: package
+                        .manifest
+                        .iter()
+                        .find(|item| item.path == path)
+                        .map(|item| item.mime.clone())
+                        .unwrap_or_else(|| crate::detect_image_mime(&data).to_owned()),
+                    data,
+                }),
+                Err(error) => {
+                    cover_error = Some(error.to_string());
+                    None
+                }
+            },
+        );
     Ok(Metadata {
         title: package.title,
         author: package.author,
         cover,
+        cover_error,
     })
 }
 
@@ -279,5 +308,22 @@ mod tests {
         let metadata = parse_metadata(&path).unwrap();
         assert_eq!(metadata.title, "T");
         assert!(metadata.cover.is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_metadata_entries_before_allocating_them() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "META-INF/container.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&vec![b'x'; (CONTAINER_MAX_BYTES + 1) as usize])
+            .unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(
+            zip_bytes_limited(&mut archive, "META-INF/container.xml", CONTAINER_MAX_BYTES).is_err()
+        );
     }
 }

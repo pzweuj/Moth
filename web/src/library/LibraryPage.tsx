@@ -63,12 +63,14 @@ function HomeView({ value, loading }: { value: HomeResponse | null; loading: boo
   return <>
     <Section title="继续阅读" books={value?.continue_reading ?? []} loading={loading} />
     <section className="library-section directory-section"><div className="section-heading"><h2>目录</h2><Link className="section-link" to="/browse?view=browse&path=">浏览全部</Link></div>{loading ? <p className="shelf-hint">正在读取书库…</p> : value?.directories?.length ? <div className="directory-modules">{value.directories.map((directory) => <DirectoryModule directory={directory} key={directory.path} />)}</div> : <p className="shelf-hint">这里还没有目录。</p>}</section>
+    {!loading && value?.hidden_directories?.length ? <details className="hidden-directories"><summary>更多书架</summary><div className="hidden-directory-list">{value.hidden_directories.map((directory) => <Link className="hidden-directory-link" key={directory.path} to={`/browse?view=browse&path=${encodeURIComponent(directory.path)}`}>{directory.name}</Link>)}</div></details> : null}
   </>;
 }
 
 function ScanStatusView({ status }: { status: ScanStatus | null }) {
   if (!status || (!status.scanning && status.total === 0 && status.errors === 0 && !status.message)) return null;
-  return <div className="scan-status" role="status"><span>{status.scanning ? "扫描进度" : "最近扫描"}</span>：{status.processed} / {status.total}{status.errors ? `，${status.errors} 个错误` : ""}{status.message ? `，${status.message}` : ""}</div>;
+  const progress = status.discovery_complete ? `${status.processed} / ${status.total}` : `已处理 ${status.processed} 本`;
+  return <div className="scan-status" role="status"><span>{status.scanning ? "扫描进度" : "最近扫描"}</span>：{progress}{status.errors ? `，${status.errors} 个错误` : ""}{status.message ? `，${status.message}` : ""}</div>;
 }
 
 function DirectoryModule({ directory }: { directory: HomeDirectoryPreview }) {
