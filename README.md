@@ -72,15 +72,35 @@ books/漫画/hide
 
 只检查一级书架；根目录或系列目录中的同名文件不会生效。"更多书架"仍可从完整目录访问，也可以在搜索时选择“包含隐藏书架”。
 
-## 快速开始：Docker Compose
+## Docker Compose
 
 准备一个数据目录和一个书库目录：
 
 ~~~
 mkdir -p data books
-docker compose pull
-docker compose up -d
 ~~~
+
+推荐使用 docker compose 安装
+```yaml
+services:
+  moth:
+    image: ghcr.io/pzweuj/moth:latest
+    user: "0:0"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      - ./books}:/books:ro         # 或者绑定你已经结构化好的目录
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health || exit 1
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+```
 
 然后打开 <http://localhost:8080/setup> 创建单用户账户。Compose 默认使用 `ghcr.io/pzweuj/moth:latest`，并将：
 
