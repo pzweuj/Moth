@@ -6,7 +6,7 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
-      - ${MOTH_BOOKS_PATH:-./books}:/books:ro
+      - ./books}:/books:ro         # 或者绑定你已经结构化好的目录
     healthcheck:
       test:
         - CMD-SHELL
