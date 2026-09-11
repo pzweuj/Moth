@@ -19,7 +19,7 @@ export default defineConfig({
   projects: [
     { name: "chromium", testIgnore: /mobile\.spec\.ts/, use: { ...devices["Desktop Chrome"] } },
     { name: "webkit", testIgnore: /mobile\.spec\.ts/, use: { ...devices["Desktop Safari"] } },
-    { name: "mobile-chromium", testMatch: /mobile\.spec\.ts/, use: { ...devices["Pixel 7"] } },
-    { name: "mobile-webkit", testMatch: /mobile\.spec\.ts/, use: { ...devices["iPhone 13"] } },
+    { name: "mobile-chromium", testMatch: /(?:mobile|library)\.spec\.ts/, use: { ...devices["Pixel 7"] } },
+    { name: "mobile-webkit", testMatch: /(?:mobile|library)\.spec\.ts/, use: { ...devices["iPhone 13"] } },
   ],
 });

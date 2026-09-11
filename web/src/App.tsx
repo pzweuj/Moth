@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { api, type SessionState } from "./api";
 import { LibraryPage } from "./library/LibraryPage";
+import { LibraryPageCache } from "./library/useLibraryData";
 import { ReaderPage } from "./reader/ReaderPage";
 
 type Theme = "light" | "dark";
@@ -14,6 +15,7 @@ function ThemeToggle({ theme, onToggleTheme }: ThemeProps) {
 export default function App() {
   const [setup, setSetup] = useState<boolean | null>(null);
   const [session, setSession] = useState<SessionState | null>(null);
+  const [libraryCache] = useState(() => new LibraryPageCache());
   const [error, setError] = useState<string | null>(null);
   const [update, setUpdate] = useState<ServiceWorkerRegistration | null>(null);
   const [theme, setTheme] = useState<Theme>(() => localStorage.getItem("moth:theme") === "dark" ? "dark" : "light");
@@ -46,7 +48,7 @@ export default function App() {
     <Route path="/setup" element={setup ? <Navigate to="/login" replace /> : <SetupPage onDone={refresh} {...{ theme, onToggleTheme }} />} />
     <Route path="/login" element={!setup ? <Navigate to="/setup" replace /> : session.authenticated ? <Navigate to="/" replace /> : <LoginPage onDone={refresh} {...{ theme, onToggleTheme }} />} />
     <Route path="/reader/:id" element={<Protected session={session}><ReaderPage theme={theme} onToggleTheme={onToggleTheme} /></Protected>} />
-    <Route path="*" element={<Protected session={session}><LibraryPage onLogout={async () => { await api.logout(); await refresh(); }} {...{ theme, onToggleTheme }} /></Protected>} />
+    <Route path="*" element={<Protected session={session}><LibraryPage cache={libraryCache} onLogout={async () => { await api.logout(); libraryCache.clear(); await refresh(); }} {...{ theme, onToggleTheme }} /></Protected>} />
   </Routes></BrowserRouter>;
 }
 

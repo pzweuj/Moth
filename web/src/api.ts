@@ -103,8 +103,8 @@ export const api = {
   login: (username: string, password: string) => request<void>("/session", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/session", { method: "DELETE" }),
   session: () => request<SessionState>("/session"),
-  home: () => request<HomeResponse>("/home"),
-  browse: (path = "") => request<BrowseResponse>(`/browse?path=${encodeURIComponent(path)}`),
+  home: (signal?: AbortSignal) => request<HomeResponse>("/home", { signal }),
+  browse: (path = "", signal?: AbortSignal) => request<BrowseResponse>(`/browse?path=${encodeURIComponent(path)}`, { signal }),
   search: (query: string, includeHidden = false, kind: "all" | "shelves" | "series" | "books" = "all", offset = 0, limit = 20, signal?: AbortSignal) => request<SearchResponse>(`/search?q=${encodeURIComponent(query)}&include_hidden=${includeHidden ? "true" : "false"}&kind=${kind}&offset=${offset}&limit=${limit}`, { signal }),
   book: (id: number, encoding?: string, signal?: AbortSignal) => request<BookDetail>(`/publications/${id}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
   progress: (id: number, signal?: AbortSignal) => request<ProgressBody | null>(`/publications/${id}/progress`, { signal }),
@@ -113,7 +113,7 @@ export const api = {
   conversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { signal }),
   startConversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { method: "POST", signal }),
   scan: () => request<void>("/scan", { method: "POST" }),
-  scanStatus: () => request<ScanStatus>("/scan/status"),
+  scanStatus: (signal?: AbortSignal) => request<ScanStatus>("/scan/status", { signal }),
 };
 
 export const bookFileUrl = (id: number) => `/api/v1/publications/${id}/file`;

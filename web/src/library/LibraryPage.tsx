@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, type BrowseResponse, type HomeDirectoryPreview, type HomeResponse, type HomeSeriesPreview, type PublicationSummary, type ScanStatus, type SearchDirectoryItem, type SearchResponse } from "../api";
+import { useLibraryData, type LibraryPageCache } from "./useLibraryData";
 
 type Theme = "light" | "dark";
-type Props = { onLogout: () => Promise<void>; theme: Theme; onToggleTheme: () => void };
+type Props = { cache: LibraryPageCache; onLogout: () => Promise<void>; theme: Theme; onToggleTheme: () => void };
 
-export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
+export function LibraryPage({ cache, onLogout, theme, onToggleTheme }: Props) {
   const [params, setParams] = useSearchParams();
   const isBrowse = params.get("view") === "browse";
   const browsePath = params.get("path") ?? "";
   const searchQuery = (params.get("q") ?? "").trim();
   const includeHidden = params.get("include_hidden") === "1" || params.get("include_hidden") === "true" || params.get("hidden") === "1";
-  const [home, setHome] = useState<HomeResponse | null>(null);
-  const [browse, setBrowse] = useState<BrowseResponse | null>(null);
+  const { home, browse, loading, error: loadError, refresh: refreshLibrary } = useLibraryData(cache, isBrowse, browsePath);
   const [searchResults, setSearchResults] = useState<SearchResponse | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -22,28 +22,23 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
   const searchGenerationRef = useRef(0);
   const loadMoreControllerRef = useRef<AbortController | null>(null);
   const [scanStatus, setScanStatus] = useState<ScanStatus | null>(null);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [scanSubmitting, setScanSubmitting] = useState(false);
 
-  const refreshScan = useCallback(async () => {
+  const refreshScan = useCallback(async (signal?: AbortSignal) => {
     try {
-      const value = await api.scanStatus();
+      const value = await api.scanStatus(signal);
+      if (signal?.aborted) return null;
       setScanStatus(value);
-      return value.scanning;
-    } catch { return false; }
+      return value;
+    } catch { return null; }
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true); setError("");
-    try {
-      if (isBrowse) setBrowse(await api.browse(browsePath));
-      else setHome(await api.home());
-      await refreshScan();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "书库加载失败"); }
-    finally { setLoading(false); }
-  }, [browsePath, isBrowse, refreshScan]);
-
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshScan(controller.signal);
+    return () => controller.abort();
+  }, [refreshScan]);
 
   useEffect(() => {
     const generation = ++searchGenerationRef.current;
@@ -78,14 +73,36 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
 
   useEffect(() => {
     if (!scanStatus?.scanning) return;
-    const timer = window.setInterval(() => { void refreshScan().then((running) => { if (!running) void load(); }); }, 500);
-    return () => window.clearInterval(timer);
-  }, [load, refreshScan, scanStatus?.scanning]);
+    const controller = new AbortController();
+    let timer: number;
+    const poll = async () => {
+      const status = await refreshScan(controller.signal);
+      if (controller.signal.aborted) return;
+      if (status && !status.scanning) {
+        cache.clear();
+        refreshLibrary();
+        setSearchRequestVersion(value => value + 1);
+      } else timer = window.setTimeout(() => void poll(), 500);
+    };
+    timer = window.setTimeout(() => void poll(), 500);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [cache, refreshLibrary, refreshScan, scanStatus?.scanning]);
 
   const scan = async () => {
     setError("");
-    try { await api.scan(); await refreshScan(); }
+    setScanSubmitting(true);
+    try {
+      await api.scan();
+      const status = await refreshScan();
+      // A small library can finish scanning before the first status response.
+      if (status && !status.scanning) {
+        cache.clear();
+        refreshLibrary();
+        setSearchRequestVersion(value => value + 1);
+      }
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : "扫描失败"); }
+    finally { setScanSubmitting(false); }
   };
 
   const updateSearch = (value: string, hidden = includeHidden) => {
@@ -135,24 +152,28 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
       : <HomeView value={home} loading={loading} />;
 
   return <main className="home-shell">
-    <nav className="home-nav"><Link className="wordmark" to="/">MOTH <span>个人书库</span></Link><div className="home-actions">{!isBrowse && <button className="quiet-button" type="button" onClick={() => void scan()} disabled={scanStatus?.scanning}>{scanStatus?.scanning ? "扫描中…" : "重新扫描"}</button>}<ThemeToggle theme={theme} onToggleTheme={onToggleTheme} /><button className="quiet-button" type="button" onClick={() => void onLogout()}>退出</button></div></nav>
-    <LibrarySearch query={params.get("q") ?? ""} includeHidden={includeHidden} onQueryChange={(value) => updateSearch(value)} onIncludeHiddenChange={(value) => updateSearch(params.get("q") ?? "", value)} onSubmit={submitSearch} />
+    <header className="library-header">
+      <nav className="home-nav"><Link className="wordmark" to="/">MOTH <span>个人书库</span></Link><div className="home-actions">{!isBrowse && <button className="quiet-button" type="button" onClick={() => void scan()} disabled={scanSubmitting || scanStatus?.scanning}>{scanSubmitting || scanStatus?.scanning ? "扫描中…" : "重新扫描"}</button>}<ThemeToggle theme={theme} onToggleTheme={onToggleTheme} /><button className="quiet-button" type="button" onClick={() => void onLogout()}>退出</button></div></nav>
+      <LibrarySearch query={params.get("q") ?? ""} includeHidden={includeHidden} onQueryChange={(value) => updateSearch(value)} onIncludeHiddenChange={(value) => updateSearch(params.get("q") ?? "", value)} onSubmit={submitSearch} />
+    </header>
     {!isBrowse && <ScanStatusView status={scanStatus} />}
     {error && <div className="form-error state-inline">{error}</div>}
-    {body}
+    {loadError && <div className="form-error state-inline" role="alert">{loadError}<button className="quiet-button" type="button" onClick={refreshLibrary}>重试</button></div>}
+    <div className="library-body" aria-busy={searchQuery ? searchLoading : loading}>{body}</div>
   </main>;
 }
 
 function HomeView({ value, loading }: { value: HomeResponse | null; loading: boolean }) {
+  if (!value) return null;
   return <>
     <Section title="继续阅读" books={value?.continue_reading ?? []} loading={loading} />
-    <section className="library-section directory-section"><div className="section-heading"><h2>目录</h2><Link className="section-link" to="/browse?view=browse&path=">浏览全部</Link></div>{loading ? <p className="shelf-hint">正在读取书库…</p> : value?.directories?.length ? <div className="directory-modules">{value.directories.map((directory) => <DirectoryModule directory={directory} key={directory.path} />)}</div> : <p className="shelf-hint">这里还没有目录。</p>}</section>
+    <section className="library-section directory-section"><div className="section-heading"><h2>目录</h2><Link className="section-link" to="/browse?view=browse&path=">浏览全部</Link></div>{value.directories.length ? <div className="directory-modules">{value.directories.map((directory) => <DirectoryModule directory={directory} key={directory.path} />)}</div> : <p className="shelf-hint">这里还没有目录。</p>}</section>
     {!loading && value?.hidden_directories?.length ? <details className="hidden-directories"><summary>更多书架</summary><div className="hidden-directory-list">{value.hidden_directories.map((directory) => <Link className="hidden-directory-link" key={directory.path} to={`/browse?view=browse&path=${encodeURIComponent(directory.path)}`}>{directory.name}</Link>)}</div></details> : null}
   </>;
 }
 
 function ScanStatusView({ status }: { status: ScanStatus | null }) {
-  if (!status || (!status.scanning && status.total === 0 && status.errors === 0 && !status.message)) return null;
+  if (!status || (!status.scanning && status.errors === 0 && !status.message)) return null;
   const progress = status.discovery_complete ? `${status.processed} / ${status.total}` : `已处理 ${status.processed} 本`;
   return <div className="scan-status" role="status"><span>{status.scanning ? "扫描进度" : "最近扫描"}</span>：{progress}{status.errors ? `，${status.errors} 个错误` : ""}{status.message ? `，${status.message}` : ""}</div>;
 }
@@ -167,7 +188,7 @@ function SeriesCard({ series }: { series: HomeSeriesPreview }) {
 }
 
 function BrowseView({ value, loading }: { value: BrowseResponse | null; loading: boolean }) {
-  if (!value) return loading ? <p className="shelf-hint">正在读取书库…</p> : null;
+  if (!value) return null;
   return <>
     <header className="library-head"><p className="eyebrow">目录</p><h1>{value.breadcrumbs.at(-1)?.name ?? "目录"}</h1></header>
     <div className="breadcrumbs">{value.breadcrumbs.map((crumb) => <Link key={crumb.path} to={`/browse?view=browse&path=${encodeURIComponent(crumb.path)}`}>{crumb.name}</Link>)}</div>
@@ -182,7 +203,7 @@ function Section({ title, books, loading }: { title: string; books: PublicationS
 }
 
 function BookGrid({ books, loading, showEmpty = true }: { books: PublicationSummary[]; loading: boolean; showEmpty?: boolean }) {
-  if (loading) return <p className="shelf-hint">正在扫描书库…</p>;
+  if (loading) return null;
   if (books.length === 0) return showEmpty ? <p className="shelf-hint">这里还没有书。</p> : null;
   return <div className="book-grid">{books.map((book) => <Link className="book-card" to={`/reader/${book.id}`} key={book.id}><div className="book-cover">{book.cover_url ? <img src={book.cover_url} alt="" loading="lazy" /> : <span>{book.source_format.toUpperCase()}</span>}</div><div className="book-info"><h3>{book.title}</h3><p>{book.author || "未知作者"}</p><small>{Math.round(book.progress * 100)}% · {book.directory_path || "书库"}</small></div></Link>)}</div>;
 }
