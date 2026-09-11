@@ -7,6 +7,8 @@ import { readerCss } from "./readerCss";
 import { cacheSections } from "./sectionCache";
 import type { ReaderSettings } from "./settings";
 import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
+import type { ReaderReadingState } from "./readingState";
+import { installReaderKeyboard, type ReaderKeyboardAction } from "./keyboard";
 import type { FoliateBook, FoliateRenderer, FoliateViewElement } from "../../vendor/foliate-js/view.js";
 import { EPUB } from "../../vendor/foliate-js/epub.js";
 import "../../vendor/foliate-js/view.js";
@@ -20,6 +22,12 @@ type Props = {
   navigationRequest: ReaderNavigationRequest | null;
   onProgress: (position: ReadingPosition, contentVersion?: string) => void;
   onNavigationChange: (items: ReaderNavigationItem[], activeId: string) => void;
+  onReadingStateChange?: (state: ReaderReadingState) => void;
+  onAdvanceAtEnd?: () => void;
+  onCenterTap?: () => void;
+  onPageTurn?: () => void;
+  keyboardEnabled?: () => boolean;
+  onKeyboardAction?: (action: ReaderKeyboardAction) => boolean;
 };
 
 type TocItem = { label: string; href: string; depth: number };
@@ -33,6 +41,7 @@ type TextSection = {
 };
 
 type RelocateLocation = {
+  index?: unknown;
   fraction?: unknown;
   section?: { current?: unknown };
   range?: unknown;
@@ -53,6 +62,20 @@ function applyReaderLayout(renderer: FoliateRenderer, settings: ReaderSettings):
   renderer.setAttribute("gap", READER_PAGE_GAP);
   renderer.setAttribute("margin", READER_PAGE_MARGIN);
   renderer.setAttribute("flow", settings.flow);
+}
+
+function applyFixedDocumentTheme(doc: Document, theme: "light" | "dark"): void {
+  const root = doc.head ?? doc.documentElement;
+  if (!root) return;
+  const background = theme === "dark" ? "#101615" : "#f5f5ef";
+  const foreground = theme === "dark" ? "#e8eee5" : "#27312d";
+  let style = doc.getElementById("moth-reader-theme") as HTMLStyleElement | null;
+  if (!style) {
+    style = doc.createElement("style");
+    style.id = "moth-reader-theme";
+    root.append(style);
+  }
+  style.textContent = `html, body { background: ${background}; color: ${foreground}; }`;
 }
 
 function sectionCount(book: FoliateBook): number {
@@ -252,7 +275,17 @@ function clampProgress(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 }
 
-export function FoliateTextReader({ detail, progress, settings, theme, encoding, navigationRequest, onProgress, onNavigationChange }: Props) {
+function fixedVisiblePages(renderer: FoliateRenderer | undefined, total: number, fallback: number): number[] | undefined {
+  if (!renderer || total <= 0) return undefined;
+  const pages = (renderer as unknown as { visiblePages?: unknown }).visiblePages;
+  if (Array.isArray(pages)) {
+    const visible = pages.filter((page): page is number => typeof page === "number" && Number.isInteger(page) && page >= 0 && page < total);
+    if (visible.length) return visible.sort((left, right) => left - right);
+  }
+  return [Math.min(Math.max(0, fallback), total - 1)];
+}
+
+export function FoliateTextReader({ detail, progress, settings, theme, encoding, navigationRequest, onProgress, onNavigationChange, onReadingStateChange, onAdvanceAtEnd, onCenterTap, onPageTurn, keyboardEnabled, onKeyboardAction }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<FoliateViewElement | null>(null);
   const publicationRef = useRef<TextPublication | null>(null);
@@ -262,20 +295,42 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
   const onProgressRef = useRef(onProgress);
   const textVersionRef = useRef(detail.content_version);
   const onNavigationChangeRef = useRef(onNavigationChange);
+  const onReadingStateChangeRef = useRef(onReadingStateChange);
+  const onAdvanceAtEndRef = useRef(onAdvanceAtEnd);
+  const onCenterTapRef = useRef(onCenterTap);
+  const onPageTurnRef = useRef(onPageTurn);
+  const keyboardEnabledRef = useRef(keyboardEnabled);
+  const onKeyboardActionRef = useRef(onKeyboardAction);
+  const directionRef = useRef<"ltr" | "rtl">("ltr");
+  const moveViewRef = useRef<(direction: "prev" | "next") => void>(() => undefined);
   const [loading, setLoading] = useState(true);
   const [loadingStage, setLoadingStage] = useState("读取资源");
   const [error, setError] = useState("");
   const [retryToken, setRetryToken] = useState(0);
+  const [readerState, setReaderState] = useState<ReaderReadingState>({ progress: 0, atStart: true, atEnd: false, loading: true });
   const tocRef = useRef<TocItem[]>([]);
+  const movingRef = useRef(false);
 
   useEffect(() => { progressRef.current = progress; }, [progress]);
   useEffect(() => { onNavigationChangeRef.current = onNavigationChange; }, [onNavigationChange]);
   useEffect(() => { onProgressRef.current = onProgress; }, [onProgress]);
+  useEffect(() => { onReadingStateChangeRef.current = onReadingStateChange; }, [onReadingStateChange]);
+  useEffect(() => { onAdvanceAtEndRef.current = onAdvanceAtEnd; }, [onAdvanceAtEnd]);
+  useEffect(() => { onCenterTapRef.current = onCenterTap; }, [onCenterTap]);
+  useEffect(() => { onPageTurnRef.current = onPageTurn; }, [onPageTurn]);
+  useEffect(() => { keyboardEnabledRef.current = keyboardEnabled; }, [keyboardEnabled]);
+  useEffect(() => { onKeyboardActionRef.current = onKeyboardAction; }, [onKeyboardAction]);
   useEffect(() => {
     settingsRef.current = settings;
     themeRef.current = theme;
     const renderer = viewRef.current?.renderer;
-    if (!renderer || viewRef.current?.isFixedLayout) return;
+    if (!renderer) return;
+    if (viewRef.current?.isFixedLayout) {
+      for (const content of renderer.getContents()) {
+        if (content.doc) applyFixedDocumentTheme(content.doc, theme);
+      }
+      return;
+    }
     applyReaderLayout(renderer, settings);
     renderer.setStyles(readerCss(settings, theme));
   }, [settings, theme]);
@@ -301,9 +356,21 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
       const fraction = clampProgress(typeof location.fraction === "number" ? location.fraction : 0);
       const sectionIndex = typeof location.section?.current === "number" && Number.isInteger(location.section.current)
         ? location.section.current
-        : 0;
+        : typeof location.index === "number" && Number.isInteger(location.index)
+          ? location.index
+          : 0;
       const sectionHref = view ? sectionId(view.book, sectionIndex) : String(sectionIndex);
       const tocHref = activeTocHref(tocRef.current, location, sectionHref);
+      const renderer = view?.renderer;
+      const atStart = renderer ? Boolean(renderer.atStart) : sectionIndex <= 0 && fraction <= 0;
+      const atEnd = renderer ? Boolean(renderer.atEnd) : false;
+      const visiblePages = view?.isFixedLayout ? fixedVisiblePages(renderer, sectionCount(view.book), sectionIndex) : undefined;
+      const overallProgress = visiblePages?.length
+        ? clampProgress((Math.max(...visiblePages) + 1) / sectionCount(view!.book))
+        : fraction;
+      const nextState: ReaderReadingState = { progress: overallProgress, atStart, atEnd, loading: false, direction: directionRef.current, visiblePages, totalPages: visiblePages ? sectionCount(view!.book) : undefined };
+      setReaderState(nextState);
+      onReadingStateChangeRef.current?.(nextState);
       if (isTxt) {
         const range = location.range && typeof location.range === "object" ? location.range as Range : null;
         const offset = range ? rangeOffset(range) : 0;
@@ -313,7 +380,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
             chapter_index: sectionIndex,
             character_offset: offset,
             encoding,
-            progress: fraction,
+            progress: overallProgress,
           }, textVersionRef.current);
         }
         onNavigationChangeRef.current(toNavigationItems(tocRef.current), tocHref || `#${sectionIndex}`);
@@ -322,7 +389,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
 
       const cfi = typeof location.cfi === "string" ? location.cfi : "";
       if (persist && cfi) {
-        onProgressRef.current({ type: "epub", href: tocHref || sectionHref, cfi, progress: fraction });
+        onProgressRef.current({ type: "epub", href: tocHref || sectionHref, cfi, progress: overallProgress });
       }
       onNavigationChangeRef.current(toNavigationItems(tocRef.current), tocHref);
     };
@@ -330,11 +397,17 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     const handleRelocate = (event: Event) => {
       if (cancelled) return;
       const location = ((event as CustomEvent).detail ?? {}) as RelocateLocation;
-      if (typeof location.section?.current === "number") sectionCache?.relocate(location.section.current);
+      const sectionIndex = typeof location.section?.current === "number" && Number.isInteger(location.section.current)
+        ? location.section.current
+        : typeof location.index === "number" && Number.isInteger(location.index)
+          ? location.index
+          : null;
+      if (sectionIndex !== null) sectionCache?.relocate(sectionIndex);
       if (!suppressRelocate) publishLocation(location, true);
     };
 
     const open = async () => {
+      movingRef.current = false;
       setLoading(true);
       setLoadingStage("读取资源");
       setError("");
@@ -367,6 +440,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
       }
 
       if (cancelled) return;
+      directionRef.current = (book as { dir?: unknown }).dir === "rtl" ? "rtl" : "ltr";
       setLoadingStage("排版");
       view = document.createElement("foliate-view") as unknown as FoliateViewElement;
       view.addEventListener("relocate", handleRelocate);
@@ -380,6 +454,7 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
         const detail = (event as CustomEvent<{ doc?: Document; index?: number }>).detail;
         const doc = detail?.doc;
         if (doc && view) {
+          if (view.isFixedLayout) applyFixedDocumentTheme(doc, themeRef.current);
           // Release old chapter documents instead of retaining every loaded iframe.
           for (const [previous, cleanup] of cleanups) {
             if (previous === doc || !previous.defaultView?.frameElement?.isConnected) {
@@ -387,7 +462,24 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
               cleanups.delete(previous);
             }
           }
-          cleanups.set(doc, installMobileTapNavigation(doc, view, settingsRef, gestureState, () => setError("翻页失败，请重试")));
+          const cleanupGestures = installMobileTapNavigation(
+            doc,
+            view,
+            settingsRef,
+            gestureState,
+            () => setError("翻页失败，请重试"),
+            () => onCenterTapRef.current?.(),
+            () => moveViewRef.current(directionRef.current === "rtl" ? "next" : "prev"),
+            () => moveViewRef.current(directionRef.current === "rtl" ? "prev" : "next"),
+          );
+          const cleanupKeyboard = installReaderKeyboard(doc, {
+            direction: () => directionRef.current,
+            previous: () => moveViewRef.current("prev"),
+            next: () => moveViewRef.current("next"),
+            enabled: () => keyboardEnabledRef.current?.() ?? true,
+            onKey: (action) => onKeyboardActionRef.current?.(action) ?? false,
+          });
+          cleanups.set(doc, () => { cleanupGestures(); cleanupKeyboard(); });
         }
       }) as EventListener);
       host.append(view);
@@ -396,9 +488,11 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
       cleanupMargins = installPageGestures(content, {
         state: gestureState,
         enabled: () => (!!currentView.isFixedLayout || settingsRef.current.flow === "paginated") && !cancelled,
+        centerEnabled: () => !cancelled,
         bounds: () => content.getBoundingClientRect(),
-        left: () => { void currentView.goLeft().catch(() => setError("翻页失败，请重试")); },
-        right: () => { void currentView.goRight().catch(() => setError("翻页失败，请重试")); },
+        left: () => moveViewRef.current(directionRef.current === "rtl" ? "next" : "prev"),
+        right: () => moveViewRef.current(directionRef.current === "rtl" ? "prev" : "next"),
+        center: () => onCenterTapRef.current?.(),
       });
       viewRef.current = view;
       if (publication) publicationRef.current = publication;
@@ -467,7 +561,24 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
         const location = view.lastLocation;
         if (location) publishLocation(location as RelocateLocation, persistAfterRestore);
       }
-      if (!cancelled) setLoading(false);
+      if (!cancelled) {
+        setLoading(false);
+        const location = view.lastLocation;
+        const renderer = view.renderer;
+        const totalPages = view.isFixedLayout ? sectionCount(view.book) : 0;
+        const visiblePages = view.isFixedLayout ? fixedVisiblePages(renderer, totalPages, location?.section?.current ?? 0) : undefined;
+        const nextState: ReaderReadingState = {
+          progress: visiblePages?.length ? clampProgress((Math.max(...visiblePages) + 1) / totalPages) : clampProgress(typeof location?.fraction === "number" ? location.fraction : 0),
+          atStart: Boolean(renderer.atStart),
+          atEnd: Boolean(renderer.atEnd),
+          loading: false,
+          direction: directionRef.current,
+          visiblePages,
+          totalPages: visiblePages ? totalPages : undefined,
+        };
+        setReaderState(nextState);
+        onReadingStateChangeRef.current?.(nextState);
+      }
     };
 
     void open().catch((reason: unknown) => {
@@ -498,14 +609,20 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
     const view = viewRef.current;
     if (!navigationRequest || !view) return;
     let cancelled = false;
+    movingRef.current = true;
+    setReaderState((current) => ({ ...current, loading: true }));
     void view.goTo(navigationRequest.id).then((resolved) => {
       if (!cancelled && !validResolved(resolved, sectionCount(view.book))) {
+        setReaderState((current) => ({ ...current, loading: false }));
         setError("章节跳转失败，请重试");
       }
     }).catch(() => {
-      if (!cancelled) setError("章节跳转失败，请重试");
-    });
-    return () => { cancelled = true; };
+      if (!cancelled) {
+        setReaderState((current) => ({ ...current, loading: false }));
+        setError("章节跳转失败，请重试");
+      }
+    }).finally(() => { movingRef.current = false; });
+    return () => { cancelled = true; movingRef.current = false; };
   }, [navigationRequest]);
 
   const retry = () => {
@@ -514,30 +631,55 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
   };
   const move = (direction: "prev" | "next") => {
     const view = viewRef.current;
-    if (!view) return;
-    void (direction === "prev" ? view.prev() : view.next()).catch(() => setError("翻页失败，请重试"));
+    if (!view || movingRef.current) return;
+    if (direction === "next" && Boolean(view.renderer.atEnd)) {
+      onAdvanceAtEndRef.current?.();
+      return;
+    }
+    if (direction === "prev" && Boolean(view.renderer.atStart)) return;
+    movingRef.current = true;
+    onPageTurnRef.current?.();
+    setReaderState((current) => ({ ...current, loading: true }));
+    void (direction === "prev" ? view.prev() : view.next()).catch(() => {
+      setReaderState((current) => ({ ...current, loading: false }));
+      setError("翻页失败，请重试");
+    }).finally(() => { movingRef.current = false; });
   };
+  moveViewRef.current = move;
+
+  useEffect(() => installReaderKeyboard(window, {
+    direction: () => directionRef.current,
+    previous: () => moveViewRef.current("prev"),
+    next: () => moveViewRef.current("next"),
+    enabled: () => keyboardEnabledRef.current?.() ?? true,
+    onKey: (action) => onKeyboardActionRef.current?.(action) ?? false,
+  }), [detail, encoding, retryToken]);
 
   return <div className={`reader-stage text-reader theme-${theme}`}>
     <div className="reader-content">
       <div ref={hostRef} className="reader-host" />
       {loading && <div className="reader-loading" role="status" aria-live="polite"><span>{loadingStage}…</span></div>}
       {error && <div className="reader-error" role="alert"><p>{error}</p><button className="reader-control-button reader-control-button--danger" type="button" onClick={retry}>重试</button></div>}
+      {settings.flow === "scrolled" && readerState.atEnd && !loading && !readerState.loading && <button className="primary-button reader-end-next" type="button" onClick={() => move("next")}>下一页</button>}
     </div>
     <div className="reader-bottom-bar">
-      <button className="reader-control-button" type="button" onClick={() => move("prev")} disabled={loading}>上一页</button>
-      <button className="reader-control-button" type="button" onClick={() => move("next")} disabled={loading}>下一页</button>
+      <button className="reader-control-button" type="button" onClick={() => move("prev")} disabled={loading || readerState.loading || readerState.atStart}>上一页</button>
+      <span className="reader-progress-label">{readerState.loading ? "" : `已读 ${Math.round(readerState.progress * 1000) / 10}%${readerState.visiblePages?.length && readerState.totalPages ? ` · ${readerState.visiblePages.map((page) => page + 1).join("–")} / ${readerState.totalPages} 页` : ""}`}</span>
+      <button className="reader-control-button" type="button" onClick={() => move("next")} disabled={loading || readerState.loading || (readerState.atEnd && !onAdvanceAtEnd)}>下一页</button>
     </div>
   </div>;
 }
 
-function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>, state: PageGestureState, onError: () => void): () => void {
+function installMobileTapNavigation(doc: Document, view: FoliateViewElement, settingsRef: MutableRefObject<ReaderSettings>, state: PageGestureState, onError: () => void, onCenter: () => void, left: () => void, right: () => void): () => void {
   return installPageGestures(doc, {
     state,
     enabled: () => !!view.isFixedLayout || settingsRef.current.flow === "paginated",
+    centerEnabled: () => true,
     bounds: () => (view.closest(".reader-content") ?? view).getBoundingClientRect(),
     toViewport: (point) => framePointToViewport(doc, point),
-    left: () => { void view.goLeft().catch(onError); },
-    right: () => { void view.goRight().catch(onError); },
+    left: () => { try { left(); } catch { onError(); } },
+    right: () => { try { right(); } catch { onError(); } },
+    center: onCenter,
+    swipe: (direction) => direction === "left" ? right() : left(),
   });
 }

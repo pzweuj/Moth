@@ -1,16 +1,26 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, type BrowseResponse, type HomeDirectoryPreview, type HomeResponse, type HomeSeriesPreview, type PublicationSummary, type ScanStatus } from "../api";
+import { api, type BrowseResponse, type HomeDirectoryPreview, type HomeResponse, type HomeSeriesPreview, type PublicationSummary, type ScanStatus, type SearchDirectoryItem, type SearchResponse } from "../api";
 
 type Theme = "light" | "dark";
 type Props = { onLogout: () => Promise<void>; theme: Theme; onToggleTheme: () => void };
 
 export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const isBrowse = params.get("view") === "browse";
   const browsePath = params.get("path") ?? "";
+  const searchQuery = (params.get("q") ?? "").trim();
+  const includeHidden = params.get("include_hidden") === "1" || params.get("include_hidden") === "true" || params.get("hidden") === "1";
   const [home, setHome] = useState<HomeResponse | null>(null);
   const [browse, setBrowse] = useState<BrowseResponse | null>(null);
+  const [searchResults, setSearchResults] = useState<SearchResponse | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searchMore, setSearchMore] = useState<"shelves" | "series" | "books" | "">("");
+  const [searchRequestVersion, setSearchRequestVersion] = useState(0);
+  const searchImmediateRef = useRef(false);
+  const searchGenerationRef = useRef(0);
+  const loadMoreControllerRef = useRef<AbortController | null>(null);
   const [scanStatus, setScanStatus] = useState<ScanStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -36,6 +46,37 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
   useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
+    const generation = ++searchGenerationRef.current;
+    if (!searchQuery) {
+      searchImmediateRef.current = false;
+      setSearchResults(null);
+      setSearchError("");
+      setSearchLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setSearchResults(null);
+    setSearchLoading(true);
+    setSearchError("");
+    setSearchMore("");
+    const immediate = searchImmediateRef.current;
+    searchImmediateRef.current = false;
+    const timer = window.setTimeout(() => {
+      void api.search(searchQuery, includeHidden, "all", 0, 20, controller.signal)
+        .then((value) => { if (!controller.signal.aborted && generation === searchGenerationRef.current) setSearchResults(value); })
+        .catch((reason) => {
+          if (!controller.signal.aborted && generation === searchGenerationRef.current) setSearchError(reason instanceof Error ? reason.message : "搜索失败");
+        })
+        .finally(() => { if (!controller.signal.aborted && generation === searchGenerationRef.current) setSearchLoading(false); });
+    }, immediate ? 0 : 300);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+      loadMoreControllerRef.current?.abort();
+    };
+  }, [includeHidden, searchQuery, searchRequestVersion]);
+
+  useEffect(() => {
     if (!scanStatus?.scanning) return;
     const timer = window.setInterval(() => { void refreshScan().then((running) => { if (!running) void load(); }); }, 500);
     return () => window.clearInterval(timer);
@@ -47,12 +88,55 @@ export function LibraryPage({ onLogout, theme, onToggleTheme }: Props) {
     catch (reason) { setError(reason instanceof Error ? reason.message : "扫描失败"); }
   };
 
-  const body = isBrowse && browse
-    ? <BrowseView value={browse} loading={loading} />
-    : <HomeView value={home} loading={loading} />;
+  const updateSearch = (value: string, hidden = includeHidden) => {
+    const next = new URLSearchParams(params);
+    if (value.trim()) next.set("q", value);
+    else next.delete("q");
+    if (hidden) next.set("include_hidden", "1");
+    else next.delete("include_hidden");
+    next.delete("hidden");
+    setParams(next, { replace: true });
+  };
+
+  const loadMoreSearch = useCallback(async (kind: "shelves" | "series" | "books") => {
+    if (!searchResults || searchMore || !searchQuery) return;
+    const group = searchResults[kind];
+    if (!group.has_more) return;
+    setSearchMore(kind);
+    const generation = searchGenerationRef.current;
+    const controller = new AbortController();
+    loadMoreControllerRef.current?.abort();
+    loadMoreControllerRef.current = controller;
+    try {
+      const next = await api.search(searchQuery, includeHidden, kind, group.items.length, 20, controller.signal);
+      if (generation !== searchGenerationRef.current || controller.signal.aborted) return;
+      setSearchResults((current) => current ? {
+        shelves: kind === "shelves" ? { ...current.shelves, items: [...current.shelves.items, ...next.shelves.items], has_more: next.shelves.has_more } : current.shelves,
+        series: kind === "series" ? { ...current.series, items: [...current.series.items, ...next.series.items], has_more: next.series.has_more } : current.series,
+        books: kind === "books" ? { ...current.books, items: [...current.books.items, ...next.books.items], has_more: next.books.has_more } : current.books,
+      } : current);
+    } catch (reason) {
+      if (!controller.signal.aborted && generation === searchGenerationRef.current) setSearchError(reason instanceof Error ? reason.message : "搜索结果加载失败");
+    } finally {
+      if (loadMoreControllerRef.current === controller) loadMoreControllerRef.current = null;
+      if (generation === searchGenerationRef.current) setSearchMore("");
+    }
+  }, [includeHidden, searchMore, searchQuery, searchResults]);
+
+  const submitSearch = () => {
+    searchImmediateRef.current = true;
+    setSearchRequestVersion((value) => value + 1);
+  };
+
+  const body = searchQuery
+    ? <SearchView query={searchQuery} results={searchResults} loading={searchLoading} error={searchError} loadingKind={searchMore} onRetry={submitSearch} onLoadMore={(kind) => void loadMoreSearch(kind)} />
+    : isBrowse
+      ? <BrowseView value={browse} loading={loading} />
+      : <HomeView value={home} loading={loading} />;
 
   return <main className="home-shell">
     <nav className="home-nav"><Link className="wordmark" to="/">MOTH <span>个人书库</span></Link><div className="home-actions">{!isBrowse && <button className="quiet-button" type="button" onClick={() => void scan()} disabled={scanStatus?.scanning}>{scanStatus?.scanning ? "扫描中…" : "重新扫描"}</button>}<ThemeToggle theme={theme} onToggleTheme={onToggleTheme} /><button className="quiet-button" type="button" onClick={() => void onLogout()}>退出</button></div></nav>
+    <LibrarySearch query={params.get("q") ?? ""} includeHidden={includeHidden} onQueryChange={(value) => updateSearch(value)} onIncludeHiddenChange={(value) => updateSearch(params.get("q") ?? "", value)} onSubmit={submitSearch} />
     {!isBrowse && <ScanStatusView status={scanStatus} />}
     {error && <div className="form-error state-inline">{error}</div>}
     {body}
@@ -82,12 +166,13 @@ function SeriesCard({ series }: { series: HomeSeriesPreview }) {
   return <Link className="series-card" to={`/browse?view=browse&path=${encodeURIComponent(series.path)}`}><div className="series-cover">{book?.cover_url ? <img src={book.cover_url} alt="" loading="lazy" /> : <span>{book?.source_format.toUpperCase() ?? "系列"}</span>}</div><div className="series-info"><h4>{series.name}</h4><p>{series.publication_count} 本</p></div></Link>;
 }
 
-function BrowseView({ value, loading }: { value: BrowseResponse; loading: boolean }) {
+function BrowseView({ value, loading }: { value: BrowseResponse | null; loading: boolean }) {
+  if (!value) return loading ? <p className="shelf-hint">正在读取书库…</p> : null;
   return <>
     <header className="library-head"><p className="eyebrow">目录</p><h1>{value.breadcrumbs.at(-1)?.name ?? "目录"}</h1></header>
     <div className="breadcrumbs">{value.breadcrumbs.map((crumb) => <Link key={crumb.path} to={`/browse?view=browse&path=${encodeURIComponent(crumb.path)}`}>{crumb.name}</Link>)}</div>
-    <div className="directory-grid">{value.directories.map((directory) => <Link className="directory-card" key={directory.path} to={`/browse?view=browse&path=${encodeURIComponent(directory.path)}`}><strong>{directory.name}</strong><span>{directory.publication_count} 本</span></Link>)}</div>
-    <BookGrid books={value.publications} loading={loading} />
+    <div className="directory-grid">{value.directories.map((directory) => <Link className="directory-card" key={directory.path} to={`/browse?view=browse&path=${encodeURIComponent(directory.path)}`}><strong>{directory.name}</strong><span>{value.path === "" ? `${directory.child_directory_count} 个系列` : `${directory.publication_count} 本`}</span></Link>)}</div>
+    <BookGrid books={value.publications} loading={loading} showEmpty={false} />
   </>;
 }
 
@@ -96,10 +181,43 @@ function Section({ title, books, loading }: { title: string; books: PublicationS
   return <section className="library-section"><div className="section-heading"><h2>{title}</h2></div><BookGrid books={books} loading={loading} /></section>;
 }
 
-function BookGrid({ books, loading }: { books: PublicationSummary[]; loading: boolean }) {
+function BookGrid({ books, loading, showEmpty = true }: { books: PublicationSummary[]; loading: boolean; showEmpty?: boolean }) {
   if (loading) return <p className="shelf-hint">正在扫描书库…</p>;
-  if (books.length === 0) return <p className="shelf-hint">这里还没有书。</p>;
+  if (books.length === 0) return showEmpty ? <p className="shelf-hint">这里还没有书。</p> : null;
   return <div className="book-grid">{books.map((book) => <Link className="book-card" to={`/reader/${book.id}`} key={book.id}><div className="book-cover">{book.cover_url ? <img src={book.cover_url} alt="" loading="lazy" /> : <span>{book.source_format.toUpperCase()}</span>}</div><div className="book-info"><h3>{book.title}</h3><p>{book.author || "未知作者"}</p><small>{Math.round(book.progress * 100)}% · {book.directory_path || "书库"}</small></div></Link>)}</div>;
+}
+
+function LibrarySearch({ query, includeHidden, onQueryChange, onIncludeHiddenChange, onSubmit }: { query: string; includeHidden: boolean; onQueryChange: (value: string) => void; onIncludeHiddenChange: (value: boolean) => void; onSubmit: () => void }) {
+  const [composing, setComposing] = useState(false);
+  return <form className="library-search" role="search" onSubmit={(event) => { event.preventDefault(); const native = event.nativeEvent as Event & { isComposing?: boolean }; if (!composing && !native.isComposing) onSubmit(); }}>
+    <input type="search" aria-label="搜索书架、系列或书籍名称" placeholder="搜索书架、系列或书籍名称" value={query} onCompositionStart={() => setComposing(true)} onCompositionEnd={(event) => { setComposing(false); onQueryChange(event.currentTarget.value); }} onChange={(event) => { if (!composing && !(event.nativeEvent as InputEvent).isComposing) onQueryChange(event.target.value); }} />
+    <label><input type="checkbox" checked={includeHidden} onChange={(event) => onIncludeHiddenChange(event.target.checked)} />包含隐藏书架</label>
+  </form>;
+}
+
+function SearchView({ query, results, loading, error, loadingKind, onRetry, onLoadMore }: { query: string; results: SearchResponse | null; loading: boolean; error: string; loadingKind: "shelves" | "series" | "books" | ""; onRetry: () => void; onLoadMore: (kind: "shelves" | "series" | "books") => void }) {
+  const hasResults = !!results && (results.shelves.items.length > 0 || results.series.items.length > 0 || results.books.items.length > 0);
+  return <section className="search-results">
+    <header className="library-head"><p className="eyebrow">搜索</p><h1>“{query}”</h1></header>
+    {loading && <p className="shelf-hint">正在搜索…</p>}
+    {!loading && error && <div className="search-error"><p>{error}</p><button className="quiet-button" type="button" onClick={onRetry}>重试</button></div>}
+    {!loading && !error && results && !hasResults && <p className="shelf-hint">未找到匹配的书架、系列或书籍</p>}
+    {!loading && !error && results && <>
+      <SearchDirectoryGroup title="书架" kind="shelves" group={results.shelves} loadingKind={loadingKind} onLoadMore={onLoadMore} />
+      <SearchDirectoryGroup title="系列" kind="series" group={results.series} loadingKind={loadingKind} onLoadMore={onLoadMore} />
+      <SearchBookGroup group={results.books} loadingKind={loadingKind} onLoadMore={onLoadMore} />
+    </>}
+  </section>;
+}
+
+function SearchDirectoryGroup({ title, kind, group, loadingKind, onLoadMore }: { title: string; kind: "shelves" | "series"; group: { items: SearchDirectoryItem[]; total: number; has_more: boolean }; loadingKind: "shelves" | "series" | "books" | ""; onLoadMore: (kind: "shelves" | "series" | "books") => void }) {
+  if (group.items.length === 0) return null;
+  return <section className="search-group"><div className="section-heading"><h2>{title}</h2><span className="search-count">{group.total}</span></div><div className="search-directory-list">{group.items.map((item) => <Link className="search-directory-item" to={`/browse?view=browse&path=${encodeURIComponent(item.path)}`} key={item.path}><strong>{item.name}</strong><small>{item.path || "书库"} · {kind === "shelves" ? `${item.child_directory_count} 个系列` : `${item.publication_count} 本`}</small></Link>)}</div>{group.has_more && <button className="quiet-button search-more" type="button" disabled={loadingKind !== ""} onClick={() => onLoadMore(kind)}>{loadingKind === kind ? "加载中…" : "加载更多"}</button>}</section>;
+}
+
+function SearchBookGroup({ group, loadingKind, onLoadMore }: { group: { items: PublicationSummary[]; total: number; has_more: boolean }; loadingKind: "shelves" | "series" | "books" | ""; onLoadMore: (kind: "shelves" | "series" | "books") => void }) {
+  if (group.items.length === 0) return null;
+  return <section className="search-group"><div className="section-heading"><h2>书籍</h2><span className="search-count">{group.total}</span></div><BookGrid books={group.items} loading={false} showEmpty={false} />{group.has_more && <button className="quiet-button search-more" type="button" disabled={loadingKind !== ""} onClick={() => onLoadMore("books")}>{loadingKind === "books" ? "加载中…" : "加载更多"}</button>}</section>;
 }
 
 function ThemeToggle({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {

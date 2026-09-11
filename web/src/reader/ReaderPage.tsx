@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, pageThumbnailUrl, type BookDetail, type ProgressBody, type ReadingPosition } from "../api";
+import { api, pageThumbnailUrl, type BookDetail, type ProgressBody, type PublicationSummary, type ReadingPosition } from "../api";
 import { ComicReader } from "./ComicReader";
 import { FoliateTextReader } from "./FoliateTextReader";
 import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
 import { loadComicSettings, loadSettings, saveComicSettings, saveSettings, type ComicSettings, type ReaderSettings } from "./settings";
 import { useProgressSaver } from "./useProgressSaver";
+import type { ReaderReadingState } from "./readingState";
+import type { ReaderKeyboardAction } from "./keyboard";
 
 type Theme = "light" | "dark";
 type Props = { theme: Theme; onToggleTheme: () => void };
@@ -13,6 +15,62 @@ type LoadRequest = { id: number; encoding: string; progress: ProgressBody | null
 
 const MOBI_POLL_ATTEMPTS = 120;
 const MOBI_POLL_DELAY_MS = 250;
+const MOBILE_MEDIA_QUERY = "(max-width: 760px), (pointer: coarse) and (max-height: 600px)";
+
+type CompletionState = {
+  loading: boolean;
+  nextBook: PublicationSummary | null;
+  error: string;
+  advancing: boolean;
+};
+
+function isMobileViewport(): boolean {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(MOBILE_MEDIA_QUERY).matches;
+}
+
+function naturalFilenameCompare(left: string, right: string): number {
+  const leftChars = [...left];
+  const rightChars = [...right];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < leftChars.length && rightIndex < rightChars.length) {
+    const leftChar = leftChars[leftIndex];
+    const rightChar = rightChars[rightIndex];
+    if (/\d/.test(leftChar) && /\d/.test(rightChar)) {
+      let leftEnd = leftIndex;
+      let rightEnd = rightIndex;
+      while (leftEnd < leftChars.length && /\d/.test(leftChars[leftEnd])) leftEnd += 1;
+      while (rightEnd < rightChars.length && /\d/.test(rightChars[rightEnd])) rightEnd += 1;
+      const leftDigits = leftChars.slice(leftIndex, leftEnd).join("").replace(/^0+/, "") || "0";
+      const rightDigits = rightChars.slice(rightIndex, rightEnd).join("").replace(/^0+/, "") || "0";
+      if (leftDigits.length !== rightDigits.length) return leftDigits.length - rightDigits.length;
+      if (leftDigits < rightDigits) return -1;
+      if (leftDigits > rightDigits) return 1;
+      leftIndex = leftEnd;
+      rightIndex = rightEnd;
+      continue;
+    }
+    const leftLower = leftChar.toLowerCase();
+    const rightLower = rightChar.toLowerCase();
+    if (leftLower < rightLower) return -1;
+    if (leftLower > rightLower) return 1;
+    leftIndex += 1;
+    rightIndex += 1;
+  }
+  return (leftChars.length - leftIndex) - (rightChars.length - rightIndex);
+}
+
+function nextBookInSeries(publications: PublicationSummary[], currentId: number): PublicationSummary | null {
+  const sorted = [...publications].sort((left, right) => {
+    const natural = naturalFilenameCompare(left.filename, right.filename);
+    if (natural !== 0) return natural;
+    const leftFilename = left.filename.toLowerCase();
+    const rightFilename = right.filename.toLowerCase();
+    return leftFilename < rightFilename ? -1 : leftFilename > rightFilename ? 1 : left.id - right.id;
+  });
+  const currentIndex = sorted.findIndex((book) => book.id === currentId);
+  return currentIndex >= 0 ? sorted[currentIndex + 1] ?? null : null;
+}
 
 export function ReaderPage({ theme, onToggleTheme }: Props) {
   const { id: rawId } = useParams();
@@ -32,11 +90,28 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   const [textNavigation, setTextNavigation] = useState<ReaderNavigationItem[]>([]);
   const [activeNavigationId, setActiveNavigationId] = useState("");
   const [navigationRequest, setNavigationRequest] = useState<ReaderNavigationRequest | null>(null);
+  const [toolbarVisible, setToolbarVisible] = useState(() => !isMobileViewport());
+  const [completion, setCompletion] = useState<CompletionState | null>(null);
+  const [readingState, setReadingState] = useState<ReaderReadingState>({ progress: 0, atStart: true, atEnd: false, loading: true, direction: "ltr" });
   const navigationToken = useRef(0);
-  const { save: saveProgress, error: progressError, retry: retrySave } = useProgressSaver({
+  const activePublicationIdRef = useRef(id);
+  const latestPositionRef = useRef<ReadingPosition | null>(null);
+  const completionBusyRef = useRef(false);
+  const advancingRef = useRef(false);
+  activePublicationIdRef.current = id;
+  const { save: saveProgress, flush, error: progressError, retry: retrySave } = useProgressSaver({
     publicationId: id,
     contentVersion: detail?.content_version ?? "",
   });
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(MOBILE_MEDIA_QUERY);
+    const sync = () => setToolbarVisible(media.matches ? false : true);
+    sync();
+    media.addEventListener?.("change", sync);
+    return () => media.removeEventListener?.("change", sync);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -50,6 +125,12 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
         setLoadingStage("读取进度");
         setLoadRequest(null);
         setNavigationRequest(null);
+        setCompletion(null);
+        setToolbarVisible(!isMobileViewport());
+        setReadingState({ progress: 0, atStart: true, atEnd: false, loading: true, direction: "ltr" });
+        completionBusyRef.current = false;
+        advancingRef.current = false;
+        latestPositionRef.current = null;
         const saved = await api.progress(id, controller.signal);
         if (cancelled) return;
         const requestedEncoding = saved?.position.type === "txt"
@@ -131,7 +212,9 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   }, [navigationOpen, settingsOpen]);
 
   const save = useCallback((position: ReadingPosition, contentVersion?: string) => {
-    if (!detail) return;
+    if (!detail || detail.id !== activePublicationIdRef.current) return;
+    if (completionBusyRef.current && position.progress < 1) return;
+    latestPositionRef.current = position;
     const value: ProgressBody = {
       content_version: contentVersion ?? detail.content_version,
       position,
@@ -139,6 +222,107 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
     setProgress(value);
     saveProgress(position, contentVersion ?? detail.content_version);
   }, [detail, saveProgress]);
+
+  const loadNextBook = useCallback(async () => {
+    if (!detail) return;
+    try {
+      const series = await api.browse(detail.directory_path);
+      if (!series.publications.some((book) => book.id === detail.id)) throw new Error("无法定位当前书籍在系列中的位置，请重试");
+      const nextBook = nextBookInSeries(series.publications, detail.id);
+      setCompletion((current) => current ? { ...current, loading: false, nextBook, error: "" } : current);
+    } catch (reason) {
+      setCompletion((current) => current ? { ...current, loading: false, nextBook: null, error: reason instanceof Error ? reason.message : "系列读取失败，请重试" } : current);
+    }
+  }, [detail]);
+
+  const finishReading = useCallback(() => {
+    if (!detail || completionBusyRef.current) return;
+    completionBusyRef.current = true;
+    const base = latestPositionRef.current ?? (progress?.content_version === detail.content_version ? progress.position : null);
+    if (base) {
+      const finalPosition = { ...base, progress: 1 } as ReadingPosition;
+      latestPositionRef.current = finalPosition;
+      setProgress({ content_version: detail.content_version, position: finalPosition });
+      saveProgress(finalPosition, detail.content_version);
+    }
+    setSettingsOpen(false);
+    setNavigationOpen(false);
+    setToolbarVisible(true);
+    advancingRef.current = false;
+    setReadingState((current) => ({ ...current, progress: 1, atEnd: true, loading: false }));
+    setCompletion({ loading: true, nextBook: null, error: "", advancing: false });
+    void loadNextBook();
+  }, [detail, loadNextBook, progress, saveProgress]);
+
+  const advanceToNextBook = useCallback(async () => {
+    const nextBook = completion?.nextBook;
+    if (!nextBook || completion?.advancing || advancingRef.current) return;
+    advancingRef.current = true;
+    setCompletion((current) => current ? { ...current, advancing: true, error: "" } : current);
+    try {
+      await flush();
+      navigate(`/reader/${nextBook.id}`);
+    } catch (reason) {
+      advancingRef.current = false;
+      setCompletion((current) => current ? { ...current, advancing: false, error: reason instanceof Error ? reason.message : "进度保存失败，请重试" } : current);
+    }
+  }, [completion, flush, navigate]);
+
+  const retryCompletion = useCallback(() => {
+    if (completion?.nextBook && completion.error) {
+      void advanceToNextBook();
+      return;
+    }
+    setCompletion((current) => current ? { ...current, loading: true, error: "" } : current);
+    void loadNextBook();
+  }, [advanceToNextBook, completion, loadNextBook]);
+
+  const returnToLastPage = useCallback(() => {
+    if (advancingRef.current) return;
+    completionBusyRef.current = false;
+    advancingRef.current = false;
+    setCompletion(null);
+  }, []);
+
+  const onKeyboardAction = useCallback((action: ReaderKeyboardAction) => {
+    if (!completion) return false;
+    if (action === "previous") returnToLastPage();
+    else if (completion.nextBook && !completion.advancing) void advanceToNextBook();
+    return true;
+  }, [advanceToNextBook, completion, returnToLastPage]);
+
+  useEffect(() => {
+    if (!completion) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      const target = event.target as Element | null;
+      if (target?.closest?.("input,textarea,select,button,a,label,[role=button],[role=link],[role=slider],[contenteditable]:not([contenteditable=false])")) return;
+      const previous = readingState.direction === "rtl" ? "ArrowRight" : "ArrowLeft";
+      const next = readingState.direction === "rtl" ? "ArrowLeft" : "ArrowRight";
+      if (event.key !== previous && event.key !== next && event.key !== " " && event.code !== "Space") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (event.key === previous) returnToLastPage();
+      else void advanceToNextBook();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [advanceToNextBook, completion, readingState.direction, returnToLastPage]);
+
+  const toggleToolbar = () => {
+    if (!isMobileViewport()) return;
+    if (settingsOpen || navigationOpen) {
+      setToolbarVisible(true);
+      return;
+    }
+    setToolbarVisible((value) => !value);
+  };
+  const hideToolbar = (force = false) => {
+    if (!isMobileViewport() || (!force && (settingsOpen || navigationOpen))) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (active?.closest(".reader-titlebar")) active.blur();
+    setToolbarVisible(false);
+  };
 
   const text = detail?.reader_format !== "cbz";
   const pageNavigation = useMemo<ReaderNavigationItem[]>(() => detail?.pages.map((page) => ({
@@ -149,10 +333,12 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   const navigationItems = text ? textNavigation : pageNavigation;
 
   const openSettings = () => {
+    setToolbarVisible(true);
     setNavigationOpen(false);
     setSettingsOpen((value) => !value);
   };
   const openNavigation = () => {
+    setToolbarVisible(true);
     setSettingsOpen(false);
     setNavigationOpen((value) => !value);
   };
@@ -162,6 +348,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
     setActiveNavigationId(item.id);
     setSettingsOpen(false);
     setNavigationOpen(false);
+    hideToolbar(true);
   };
 
   const onEncodingChange = (value: string) => {
@@ -185,13 +372,13 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   if (error) return <main className="state-screen"><h1>打开失败</h1><p>{error}</p><div><button className="primary-button" type="button" onClick={retryOpen}>重试</button><button className="quiet-button" type="button" onClick={() => navigate(-1)}>返回书库</button></div></main>;
   if (!detail) return <main className="state-screen"><p>{loadingStage}…</p></main>;
 
-  return <main className="reader-shell">
-    <header className="reader-titlebar">
+  return <main className={`reader-shell ${toolbarVisible ? "toolbar-visible" : "toolbar-hidden"}`}>
+    <MobileClock />
+    <header className="reader-titlebar" aria-hidden={!toolbarVisible}>
       <button className="quiet-button reader-control-button reader-back-button" type="button" onClick={() => navigate(-1)}>← 返回</button>
       <button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={openNavigation} aria-label={text ? "打开章节" : "打开页码"} aria-expanded={navigationOpen}>☰</button>
       <strong>{detail.title}</strong>
       <span className="reader-format">{detail.source_format.toUpperCase()}</span>
-      <MobileClock />
       <button className="quiet-button reader-control-button reader-theme-button" type="button" onClick={onToggleTheme} aria-label="切换主题">{theme === "dark" ? "日间" : "夜间"}</button>
       <button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={openSettings} aria-label="阅读设置" aria-expanded={settingsOpen}>Aa</button>
     </header>
@@ -199,8 +386,9 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
     {navigationOpen && <ReaderNavigationDrawer items={navigationItems} activeId={activeNavigationId} kind={text ? "chapters" : "pages"} onSelect={selectNavigation} onClose={() => setNavigationOpen(false)} />}
     {progressError && <div className="reader-save-status" role="status">{progressError}<button className="reader-control-button" type="button" onClick={() => void retrySave()}>重试保存</button></div>}
     {text
-      ? <FoliateTextReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={settings} theme={theme} encoding={encoding} navigationRequest={navigationRequest} onProgress={save} onNavigationChange={(items, activeId) => { setTextNavigation(items); if (activeId) setActiveNavigationId(activeId); }} />
-      : <ComicReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={comicSettings} navigationRequest={navigationRequest} onCurrentPageChange={(page) => setActiveNavigationId(String(page))} onProgress={save} />}
+      ? <FoliateTextReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={settings} theme={theme} encoding={encoding} navigationRequest={navigationRequest} onProgress={save} onNavigationChange={(items, activeId) => { setTextNavigation(items); if (activeId) setActiveNavigationId(activeId); }} onReadingStateChange={setReadingState} onAdvanceAtEnd={finishReading} onCenterTap={toggleToolbar} onPageTurn={hideToolbar} keyboardEnabled={() => !settingsOpen && !navigationOpen} onKeyboardAction={onKeyboardAction} />
+      : <ComicReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={comicSettings} navigationRequest={navigationRequest} onCurrentPageChange={(page) => setActiveNavigationId(String(page))} onProgress={save} onReadingStateChange={setReadingState} onAdvanceAtEnd={finishReading} onCenterTap={toggleToolbar} onPageTurn={hideToolbar} keyboardEnabled={() => !settingsOpen && !navigationOpen} onKeyboardAction={onKeyboardAction} />}
+    {completion && <CompletionOverlay detail={detail} value={completion} readingState={readingState} direction={readingState.direction ?? "ltr"} onPrevious={returnToLastPage} onNext={() => void advanceToNextBook()} onRetry={retryCompletion} onBackToSeries={() => navigate(`/browse?view=browse&path=${encodeURIComponent(detail.directory_path)}`)} />}
   </main>;
 }
 
@@ -213,12 +401,61 @@ function MobileClock() {
       update();
       intervalRef.current = window.setInterval(update, 60_000);
     }, 60_000 - (Date.now() % 60_000));
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") update(); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.clearTimeout(timeout);
       if (intervalRef.current !== null) window.clearInterval(intervalRef.current);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
   return <time className="reader-clock" dateTime={now.toISOString()}>{`${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`}</time>;
+}
+
+function CompletionOverlay({ detail, value, readingState, direction, onPrevious, onNext, onRetry, onBackToSeries }: {
+  detail: BookDetail;
+  value: CompletionState;
+  readingState: ReaderReadingState;
+  direction: "ltr" | "rtl";
+  onPrevious: () => void;
+  onNext: () => void;
+  onRetry: () => void;
+  onBackToSeries: () => void;
+}) {
+  const sameTitle = value.nextBook && value.nextBook.title === detail.title;
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  return <section className="reader-completion" role="status" aria-live="polite" onTouchStart={(event) => {
+    if (event.touches.length === 1) touchStart.current = { x: event.touches[0].clientX, y: event.touches[0].clientY };
+  }} onTouchEnd={(event) => {
+    const start = touchStart.current;
+    touchStart.current = null;
+    const touch = event.changedTouches[0];
+    if (!start || !touch || Math.abs(touch.clientX - start.x) < 48 || Math.abs(touch.clientX - start.x) <= Math.abs(touch.clientY - start.y)) return;
+    const forward = direction === "rtl" ? touch.clientX - start.x > 0 : touch.clientX - start.x < 0;
+    if (value.advancing) return;
+    if (forward) onNext(); else onPrevious();
+  }}>
+    <div className="reader-completion-card">
+      <p className="reader-completion-title">此部书籍已读完</p>
+      {value.loading && <p className="reader-completion-detail">正在读取下一本书…</p>}
+      {!value.loading && value.error && <><p className="reader-completion-detail">{value.error}</p><button className="quiet-button" type="button" onClick={onRetry}>重试</button></>}
+      {!value.loading && !value.error && value.nextBook && <p className="reader-completion-detail">点击下一页进入到《{value.nextBook.title}》{sameTitle ? `（${value.nextBook.filename}）` : ""}</p>}
+      {!value.loading && !value.error && !value.nextBook && <p className="reader-completion-detail">本系列已读完</p>}
+      <div className="reader-completion-actions">
+        <button className="quiet-button reader-control-button" type="button" disabled={value.advancing} onClick={onPrevious}>上一页</button>
+        {!value.loading && !value.error && value.nextBook
+          ? <button className="primary-button reader-control-button" type="button" disabled={value.advancing} onClick={onNext}>{value.advancing ? "正在打开…" : "下一页"}</button>
+          : !value.loading && !value.error
+            ? <button className="primary-button reader-control-button" type="button" onClick={onBackToSeries}>返回系列</button>
+            : null}
+      </div>
+    </div>
+    <p className="reader-completion-progress">已读 100%{readingStatePageLabel(readingState) ? ` · ${readingStatePageLabel(readingState)}` : ""}</p>
+  </section>;
+}
+
+function readingStatePageLabel(value: ReaderReadingState): string {
+  return value.visiblePages?.length && value.totalPages ? `${value.visiblePages.map((page) => page + 1).join("–")} / ${value.totalPages} 页` : "";
 }
 
 function ReaderSettingsPanel({ detail, settings, setSettings, comicSettings, setComicSettings, encoding, onEncodingChange, text }: {

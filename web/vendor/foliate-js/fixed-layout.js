@@ -3,12 +3,30 @@ const parseViewport = str => str
     ?.filter(x => x)
     ?.map(x => x.split('=').map(x => x.trim()))
 
+const getGraphicDimensions = doc => {
+    const image = doc?.querySelector('img')
+    if (image?.naturalWidth > 0 && image?.naturalHeight > 0)
+        return { width: image.naturalWidth, height: image.naturalHeight }
+    const svg = doc?.querySelector('svg')
+    const values = svg?.getAttribute('viewBox')?.trim().split(/[\s,]+/) ?? []
+    const width = values[2] ?? svg?.getAttribute('width')
+    const height = values[3] ?? svg?.getAttribute('height')
+    const parsedWidth = parseFloat(width)
+    const parsedHeight = parseFloat(height)
+    return Number.isFinite(parsedWidth) && parsedWidth > 0
+        && Number.isFinite(parsedHeight) && parsedHeight > 0
+        ? { width: parsedWidth, height: parsedHeight }
+        : null
+}
+
 const getViewport = (doc, viewport) => {
     // use `viewBox` for SVG
     if (doc.documentElement.localName === 'svg') {
-        const [, , width, height] = doc.documentElement
-            .getAttribute('viewBox')?.split(/\s/) ?? []
-        return { width, height }
+        const viewBox = doc.documentElement.getAttribute('viewBox')
+            ?.trim().split(/[\s,]+/) ?? []
+        const width = viewBox[2] ?? doc.documentElement.getAttribute('width')
+        const height = viewBox[3] ?? doc.documentElement.getAttribute('height')
+        if (width && height) return { width, height }
     }
 
     // get `viewport` `meta` element
@@ -16,14 +34,19 @@ const getViewport = (doc, viewport) => {
         ?.getAttribute('content'))
     if (meta) return Object.fromEntries(meta)
 
+    // Image wrapper pages often omit a viewport entirely. Their intrinsic
+    // dimensions are more faithful than a book-level fallback resolution.
+    const graphic = getGraphicDimensions(doc)
+    if (graphic) return graphic
+
     // fallback to book's viewport
-    if (typeof viewport === 'string') return parseViewport(viewport)
+    if (typeof viewport === 'string') {
+        const parsed = parseViewport(viewport)
+        if (parsed) return Object.fromEntries(parsed)
+    }
     if (viewport?.width && viewport.height) return viewport
 
     // if no viewport (possibly with image directly in spine), get image size
-    const img = doc.querySelector('img')
-    if (img) return { width: img.naturalWidth, height: img.naturalHeight }
-
     // just show *something*, i guess...
     console.warn(new Error('Missing viewport properties'))
     return { width: 1000, height: 2000 }
@@ -32,7 +55,10 @@ const getViewport = (doc, viewport) => {
 export class FixedLayout extends HTMLElement {
     static observedAttributes = ['zoom']
     #root = this.attachShadow({ mode: 'closed' })
-    #observer = new ResizeObserver(() => this.#render())
+    #observer = new ResizeObserver(() => {
+        this.#render()
+        if (this.#index >= 0) this.#reportLocation('resize')
+    })
     #spreads
     #index = -1
     defaultViewport
@@ -43,6 +69,7 @@ export class FixedLayout extends HTMLElement {
     #center
     #side
     #zoom
+    #autoSpread = false
     constructor() {
         super()
 
@@ -75,7 +102,7 @@ export class FixedLayout extends HTMLElement {
                 break
         }
     }
-    async #createFrame({ index, src: srcOption }) {
+    async #createFrame({ index, src: srcOption } = {}) {
         const srcOptionIsString = typeof srcOption === 'string'
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const onZoom = srcOptionIsString ? null : srcOption?.onZoom
@@ -95,16 +122,25 @@ export class FixedLayout extends HTMLElement {
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)
-        if (!src) return { blank: true, element, iframe }
+        if (!src) return { blank: true, element, iframe, index }
         return new Promise(resolve => {
-            iframe.addEventListener('load', () => {
+            iframe.addEventListener('load', async () => {
                 const doc = iframe.contentDocument
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+                await Promise.all(Array.from(doc?.images ?? [], image =>
+                    image.decode ? image.decode().catch(() => undefined) : Promise.resolve()))
                 const { width, height } = getViewport(doc, this.defaultViewport)
+                const graphic = getGraphicDimensions(doc)
+                const parsedWidth = parseFloat(width)
+                const parsedHeight = parseFloat(height)
                 resolve({
-                    element, iframe,
-                    width: parseFloat(width),
-                    height: parseFloat(height),
+                    element, iframe, index,
+                    width: Number.isFinite(parsedWidth) && parsedWidth > 0
+                        ? parsedWidth : graphic?.width || 1000,
+                    height: Number.isFinite(parsedHeight) && parsedHeight > 0
+                        ? parsedHeight : graphic?.height || 2000,
+                    contentWidth: graphic?.width,
+                    contentHeight: graphic?.height,
                     onZoom,
                 })
             }, { once: true })
@@ -117,8 +153,26 @@ export class FixedLayout extends HTMLElement {
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
         const { width, height } = this.getBoundingClientRect()
-        const portrait = this.spread !== 'both' && this.spread !== 'portrait'
-            && height > width
+        const pageWidth = (left.width ?? right.width ?? 0) + (right.width ?? left.width ?? 0)
+        const pageHeight = Math.max(left.height ?? 0, right.height ?? 0)
+        const heightScale = pageHeight > 0 ? height / pageHeight : 0
+        // A native landscape/cross-page artwork is authored as one page. Keep
+        // it by itself even when the surrounding container has room for two
+        // ordinary portrait pages.
+        const widePage = this.#autoSpread && !this.#center
+            && [left, right].some(frame => {
+                const frameWidth = frame.contentWidth ?? frame.width
+                const frameHeight = frame.contentHeight ?? frame.height
+                return frameWidth > 0 && frameHeight > 0
+                    && frameWidth / frameHeight >= 1.5
+            })
+        const canSpread = this.#autoSpread && !!this.#left && !!this.#right
+            && !this.#left.blank && !this.#right.blank
+            && !widePage
+            && width >= pageWidth * heightScale + 8
+        const portrait = this.#autoSpread
+            ? !canSpread
+            : this.spread !== 'both' && this.spread !== 'portrait' && height > width
         this.#portrait = portrait
         const blankWidth = left.width ?? right.width ?? 0
         const blankHeight = left.height ?? right.height ?? 0
@@ -159,6 +213,7 @@ export class FixedLayout extends HTMLElement {
                 display: 'block',
                 flexShrink: '0',
                 marginBlock: 'auto',
+                marginInlineEnd: !portrait && frame === this.#left ? '8px' : '0',
             })
             if (portrait && frame !== target) {
                 element.style.display = 'none'
@@ -184,7 +239,7 @@ export class FixedLayout extends HTMLElement {
             this.#left = await this.#createFrame(left)
             this.#right = await this.#createFrame(right)
             this.#side = this.#left.blank ? 'right'
-                : this.#right.blank ? 'left' : side
+                : this.#right.blank ? 'left' : side ?? (this.rtl ? 'right' : 'left')
             this.#render()
         }
     }
@@ -209,15 +264,38 @@ export class FixedLayout extends HTMLElement {
     open(book) {
         this.book = book
         const { rendition } = book
-        this.spread = rendition?.spread
+        this.#autoSpread = rendition?.autoSpread === true
+        this.spread = this.#autoSpread ? 'both' : rendition?.spread
         this.defaultViewport = rendition?.viewport
 
         const rtl = book.dir === 'rtl'
         const ltr = !rtl
         this.rtl = rtl
 
-        if (rendition?.spread === 'none')
+        if (rendition?.spread === 'none' && !this.#autoSpread)
             this.#spreads = book.sections.map(section => ({ center: section }))
+        else if (this.#autoSpread) this.#spreads = book.sections.reduce((arr, section, i) => {
+            const last = arr[arr.length - 1]
+            if (section.pageSpread === 'center' || (i === 0 && /cover/i.test(section.id ?? ''))) {
+                if (last.center || last.left || last.right) arr.push({ center: section })
+                else last.center = section
+            } else if (section.pageSpread === 'left') {
+                if (last.center || last.left || last.right) arr.push({ left: section })
+                else last.left = section
+            } else if (section.pageSpread === 'right') {
+                if (last.center || last.right) arr.push({ right: section })
+                else last.right = section
+            } else if (book.dir === 'rtl') {
+                if (last.center || last.left || last.right) {
+                    if (last.right && !last.left) last.left = section
+                    else arr.push({ right: section })
+                } else last.right = section
+            } else if (last.center || last.left || last.right) {
+                if (last.left && !last.right) last.right = section
+                else arr.push({ left: section })
+            } else last.left = section
+            return arr
+        }, [{}])
         else this.#spreads = book.sections.reduce((arr, section, i) => {
             const last = arr[arr.length - 1]
             const { pageSpread } = section
@@ -257,6 +335,33 @@ export class FixedLayout extends HTMLElement {
             ? spread.left ?? spread.right : spread.right ?? spread.left)
         return this.book.sections.indexOf(section)
     }
+    get atStart() {
+        if (this.#index > 0) return false
+        const spread = this.#spreads[this.#index]
+        if (this.#portrait && spread && !spread.center && spread.left && spread.right)
+            return this.rtl ? this.#side === 'right' : this.#side === 'left'
+        return true
+    }
+    get atEnd() {
+        if (this.#index < this.#spreads.length - 1) return false
+        const spread = this.#spreads[this.#index]
+        if (this.#portrait && spread && !spread.center && spread.left && spread.right)
+            return this.rtl ? this.#side === 'left' : this.#side === 'right'
+        return true
+    }
+    get visiblePages() {
+        const spread = this.#spreads[this.#index]
+        if (!spread) return []
+        const sections = spread.center
+            ? [spread.center]
+            : this.#portrait
+                ? [this.#side === 'right' ? spread.right : spread.left]
+                : [spread.left, spread.right]
+        return sections
+            .filter(Boolean)
+            .map(section => this.book.sections.indexOf(section))
+            .filter(index => index >= 0)
+    }
     #reportLocation(reason) {
         this.dispatchEvent(new CustomEvent('relocate', { detail:
             { reason, range: null, index: this.index, fraction: 0, size: 1 } }))
@@ -273,7 +378,10 @@ export class FixedLayout extends HTMLElement {
     async goToSpread(index, side, reason) {
         if (index < 0 || index > this.#spreads.length - 1) return
         if (index === this.#index) {
+            const changed = !!side && side !== this.#side
+            if (side) this.#side = side
             this.#render(side)
+            if (changed) this.#reportLocation(reason ?? 'page')
             return
         }
         this.#index = index
@@ -314,10 +422,9 @@ export class FixedLayout extends HTMLElement {
         if (!s) return this.goToSpread(this.#index - 1, this.rtl ? 'left' : 'right', 'page')
     }
     getContents() {
-        return Array.from(this.#root.querySelectorAll('iframe'), frame => ({
-            doc: frame.contentDocument,
-            // TODO: index, overlayer
-        }))
+        return [this.#left, this.#center, this.#right]
+            .filter(Boolean)
+            .map(frame => ({ doc: frame.iframe.contentDocument, index: frame.index }))
     }
     destroy() {
         this.#observer.unobserve(this)

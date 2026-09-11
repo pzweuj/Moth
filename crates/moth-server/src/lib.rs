@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/home", get(books::home))
         .route("/browse", get(library::browse))
+        .route("/search", get(library::search))
         .route("/scan", axum::routing::post(library::start_scan))
         .route("/scan/status", get(library::scan_status))
         .route("/publications/{id}", get(books::get_book))

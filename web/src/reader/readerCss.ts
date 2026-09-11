@@ -10,9 +10,9 @@ export function readerCss({
   lineHeight,
 }: ReaderSettings, theme: "light" | "dark"): string {
   const dark = theme === "dark";
-  const foreground = dark ? "#d8d3cc" : "#1f2328";
-  const background = dark ? "#14161a" : "#fbfaf7";
-  const link = dark ? "lightblue" : "#3b5bdb";
+  const foreground = dark ? "#e8eee5" : "#27312d";
+  const background = dark ? "#101615" : "#f5f5ef";
+  const link = dark ? "#b8d59e" : "#315c42";
   return `
 :root {
   color-scheme: ${dark ? "dark" : "light"};

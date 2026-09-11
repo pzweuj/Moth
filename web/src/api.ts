@@ -30,7 +30,7 @@ export type BookDetail = PublicationSummary & {
   pages: Array<{ idx: number; path: string; mime: string; width?: number; height?: number }>;
 };
 
-export type DirectorySummary = { name: string; path: string; publication_count: number };
+export type DirectorySummary = { name: string; path: string; child_directory_count: number; publication_count: number };
 export type BrowseResponse = {
   path: string;
   breadcrumbs: Array<{ name: string; path: string }>;
@@ -43,6 +43,19 @@ export type HomeSeriesPreview = { name: string; path: string; publication_count:
 export type HomeDirectoryPreview = { name: string; path: string; series: HomeSeriesPreview[] };
 export type HiddenDirectorySummary = { name: string; path: string };
 export type HomeResponse = { continue_reading: PublicationSummary[]; directories: HomeDirectoryPreview[]; hidden_directories: HiddenDirectorySummary[] };
+export type SearchDirectoryItem = {
+  name: string;
+  path: string;
+  parent_path: string | null;
+  child_directory_count: number;
+  publication_count: number;
+};
+export type SearchGroup<T> = { items: T[]; total: number; has_more: boolean };
+export type SearchResponse = {
+  shelves: SearchGroup<SearchDirectoryItem>;
+  series: SearchGroup<SearchDirectoryItem>;
+  books: SearchGroup<PublicationSummary>;
+};
 export type ChapterContent = { idx: number; title: string; content: string; text: string; encoding: string; content_version: string; character_count: number };
 export type ConversionResponse = { status: "pending" | "preparing" | "ready" | "failed" | "not_required"; file_url?: string; error?: string };
 export type ScanStatus = { scanning: boolean; discovery_complete: boolean; processed: number; total: number; errors: number; message: string };
@@ -92,6 +105,7 @@ export const api = {
   session: () => request<SessionState>("/session"),
   home: () => request<HomeResponse>("/home"),
   browse: (path = "") => request<BrowseResponse>(`/browse?path=${encodeURIComponent(path)}`),
+  search: (query: string, includeHidden = false, kind: "all" | "shelves" | "series" | "books" = "all", offset = 0, limit = 20, signal?: AbortSignal) => request<SearchResponse>(`/search?q=${encodeURIComponent(query)}&include_hidden=${includeHidden ? "true" : "false"}&kind=${kind}&offset=${offset}&limit=${limit}`, { signal }),
   book: (id: number, encoding?: string, signal?: AbortSignal) => request<BookDetail>(`/publications/${id}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
   progress: (id: number, signal?: AbortSignal) => request<ProgressBody | null>(`/publications/${id}/progress`, { signal }),
   saveProgress: (id: number, value: ProgressBody, options: { keepalive?: boolean } = {}) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value), keepalive: options.keepalive }),

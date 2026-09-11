@@ -115,6 +115,7 @@ fn parse_index(
 pub struct DirectorySummary {
     pub name: String,
     pub path: String,
+    pub child_directory_count: i64,
     pub publication_count: i64,
 }
 
@@ -139,6 +140,38 @@ pub struct BrowseQuery {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SearchQuery {
+    pub q: Option<String>,
+    pub include_hidden: Option<bool>,
+    pub kind: Option<String>,
+    pub offset: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchDirectoryItem {
+    pub name: String,
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub child_directory_count: i64,
+    pub publication_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchGroup<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub shelves: SearchGroup<SearchDirectoryItem>,
+    pub series: SearchGroup<SearchDirectoryItem>,
+    pub books: SearchGroup<crate::books::PublicationSummary>,
+}
+
 pub async fn browse(
     State(state): State<AppState>,
     _user: Authenticated,
@@ -153,7 +186,9 @@ pub async fn browse(
             .await?
             .ok_or(AppError::NotFound)?;
     let directories = sqlx::query(
-        "SELECT d.name, d.relative_path AS path, COUNT(p.id) AS publication_count
+        "SELECT d.name, d.relative_path AS path,
+                (SELECT COUNT(*) FROM directories child WHERE child.parent_id=d.id) AS child_directory_count,
+                COUNT(p.id) AS publication_count
          FROM directories d LEFT JOIN publications p ON p.directory_id = d.id
          WHERE d.parent_id = ? GROUP BY d.id ORDER BY d.name COLLATE NOCASE",
     )
@@ -165,12 +200,13 @@ pub async fn browse(
         Ok(DirectorySummary {
             name: row.try_get("name")?,
             path: row.try_get("path")?,
+            child_directory_count: row.try_get("child_directory_count")?,
             publication_count: row.try_get("publication_count")?,
         })
     })
     .collect::<Result<Vec<_>, sqlx::Error>>()?;
     let publications =
-        crate::books::fetch_publications(&state.db, Some(directory_id), None).await?;
+        crate::books::fetch_publications(&state.db, Some(directory_id), Some("filename")).await?;
     let publication_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM publications")
         .fetch_one(&state.db)
         .await?;
@@ -186,6 +222,232 @@ pub async fn browse(
         publication_count,
         directory_count,
     }))
+}
+
+pub async fn search(
+    State(state): State<AppState>,
+    _user: Authenticated,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResponse>, AppError> {
+    let query_text = query.q.unwrap_or_default().trim().to_owned();
+    let offset = query.offset.unwrap_or(0).max(0);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let include_hidden = query.include_hidden.unwrap_or(false);
+    let kind = match query.kind.as_deref().unwrap_or("all") {
+        "shelf" => "shelves",
+        "book" => "books",
+        value => value,
+    };
+    if !matches!(kind, "all" | "shelves" | "series" | "books") {
+        return Err(AppError::Validation(
+            "kind must be all, shelves, series, books, shelf, or book".to_owned(),
+        ));
+    }
+    if query_text.is_empty() {
+        return Ok(Json(SearchResponse {
+            shelves: SearchGroup {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+            },
+            series: SearchGroup {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+            },
+            books: SearchGroup {
+                items: Vec::new(),
+                total: 0,
+                has_more: false,
+            },
+        }));
+    }
+
+    let hidden_paths = if include_hidden {
+        Vec::new()
+    } else {
+        hidden_shelf_paths(&state.db, &state.config.books_dir).await?
+    };
+    let (shelves, series, books) = tokio::join!(
+        async {
+            if matches!(kind, "all" | "shelves") {
+                search_directories(&state.db, &query_text, &hidden_paths, true, offset, limit).await
+            } else {
+                Ok(SearchGroup {
+                    items: Vec::new(),
+                    total: 0,
+                    has_more: false,
+                })
+            }
+        },
+        async {
+            if matches!(kind, "all" | "series") {
+                search_directories(&state.db, &query_text, &hidden_paths, false, offset, limit)
+                    .await
+            } else {
+                Ok(SearchGroup {
+                    items: Vec::new(),
+                    total: 0,
+                    has_more: false,
+                })
+            }
+        },
+        async {
+            if matches!(kind, "all" | "books") {
+                search_books(&state.db, &query_text, &hidden_paths, offset, limit).await
+            } else {
+                Ok(SearchGroup {
+                    items: Vec::new(),
+                    total: 0,
+                    has_more: false,
+                })
+            }
+        },
+    );
+    Ok(Json(SearchResponse {
+        shelves: shelves?,
+        series: series?,
+        books: books?,
+    }))
+}
+
+async fn hidden_shelf_paths(db: &SqlitePool, books_root: &Path) -> Result<Vec<String>, AppError> {
+    let paths = sqlx::query("SELECT relative_path FROM directories WHERE parent_id=(SELECT id FROM directories WHERE relative_path='')")
+        .fetch_all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            let path: String = row.try_get("relative_path").ok()?;
+            is_hidden_shelf(books_root, &path).then_some(path)
+        })
+        .collect();
+    Ok(paths)
+}
+
+pub(crate) fn is_hidden_shelf(books_root: &Path, path: &str) -> bool {
+    books_root.join(path).join("hide").is_file()
+}
+
+fn hidden_sql(path_column: &str, hidden_paths: &[String]) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    for hidden in hidden_paths {
+        sql.push_str(&format!(
+            " AND NOT ({path_column}=? OR substr({path_column},1,length(?) + 1)=? || '/')"
+        ));
+        binds.extend([hidden.clone(), hidden.clone(), hidden.clone()]);
+    }
+    (sql, binds)
+}
+
+async fn search_directories(
+    db: &SqlitePool,
+    query_text: &str,
+    hidden_paths: &[String],
+    shelves: bool,
+    offset: i64,
+    limit: i64,
+) -> Result<SearchGroup<SearchDirectoryItem>, AppError> {
+    let parent_clause = if shelves {
+        "d.parent_id=(SELECT id FROM directories WHERE relative_path='')"
+    } else {
+        "d.parent_id IN (SELECT id FROM directories WHERE parent_id=(SELECT id FROM directories WHERE relative_path=''))"
+    };
+    let (hidden_clause, hidden_binds) = hidden_sql("d.relative_path", hidden_paths);
+    let match_clause = "instr(lower(d.name), lower(?)) > 0";
+    let from = "FROM directories d LEFT JOIN directories parent ON parent.id=d.parent_id";
+    let where_clause = format!("WHERE {parent_clause} AND {match_clause}{hidden_clause}");
+    let total_sql = format!("SELECT COUNT(*) {from} {where_clause}");
+    let mut total_query = sqlx::query_scalar::<_, i64>(&total_sql).bind(query_text);
+    for bind in &hidden_binds {
+        total_query = total_query.bind(bind);
+    }
+    let total = total_query.fetch_one(db).await?;
+    let data_sql = format!(
+        "SELECT d.name,d.relative_path AS path,parent.relative_path AS parent_path,
+                (SELECT COUNT(*) FROM directories child WHERE child.parent_id=d.id) AS child_directory_count,
+                (SELECT COUNT(*) FROM publications p WHERE p.directory_id=d.id) AS publication_count
+         {from} {where_clause}
+         ORDER BY CASE WHEN lower(d.name)=lower(?) THEN 0 WHEN substr(lower(d.name),1,length(lower(?)))=lower(?) THEN 1 ELSE 2 END,
+                  d.name COLLATE NOCASE,d.relative_path COLLATE NOCASE,d.id LIMIT ? OFFSET ?"
+    );
+    let mut data_query = sqlx::query(&data_sql).bind(query_text);
+    for bind in &hidden_binds {
+        data_query = data_query.bind(bind);
+    }
+    data_query = data_query
+        .bind(query_text)
+        .bind(query_text)
+        .bind(query_text);
+    let rows = data_query.bind(limit).bind(offset).fetch_all(db).await?;
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(SearchDirectoryItem {
+                name: row.try_get("name")?,
+                path: row.try_get("path")?,
+                parent_path: row.try_get("parent_path")?,
+                child_directory_count: row.try_get("child_directory_count")?,
+                publication_count: row.try_get("publication_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok(SearchGroup {
+        has_more: offset.saturating_add(items.len() as i64) < total,
+        items,
+        total,
+    })
+}
+
+async fn search_books(
+    db: &SqlitePool,
+    query_text: &str,
+    hidden_paths: &[String],
+    offset: i64,
+    limit: i64,
+) -> Result<SearchGroup<crate::books::PublicationSummary>, AppError> {
+    let (hidden_clause, hidden_binds) = hidden_sql("d.relative_path", hidden_paths);
+    let from = "FROM publications p JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id";
+    let where_clause = format!(
+        "WHERE (instr(lower(p.title), lower(?)) > 0 OR instr(lower(p.filename), lower(?)) > 0){hidden_clause}"
+    );
+    let total_sql = format!("SELECT COUNT(*) {from} {where_clause}");
+    let mut total_query = sqlx::query_scalar::<_, i64>(&total_sql)
+        .bind(query_text)
+        .bind(query_text);
+    for bind in &hidden_binds {
+        total_query = total_query.bind(bind);
+    }
+    let total = total_query.fetch_one(db).await?;
+    let data_sql = format!(
+        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress
+         {from} {where_clause}
+         ORDER BY CASE WHEN lower(p.title)=lower(?) OR lower(p.filename)=lower(?) THEN 0
+                       WHEN substr(lower(p.title),1,length(lower(?)))=lower(?)
+                         OR substr(lower(p.filename),1,length(lower(?)))=lower(?) THEN 1 ELSE 2 END,
+                  p.title COLLATE NOCASE,p.filename COLLATE NOCASE,d.relative_path COLLATE NOCASE,p.id LIMIT ? OFFSET ?"
+    );
+    let mut data_query = sqlx::query(&data_sql).bind(query_text).bind(query_text);
+    for bind in &hidden_binds {
+        data_query = data_query.bind(bind);
+    }
+    data_query = data_query
+        .bind(query_text)
+        .bind(query_text)
+        .bind(query_text)
+        .bind(query_text)
+        .bind(query_text)
+        .bind(query_text);
+    let rows = data_query.bind(limit).bind(offset).fetch_all(db).await?;
+    let items = rows
+        .iter()
+        .map(crate::books::summary_from_row)
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok(SearchGroup {
+        has_more: offset.saturating_add(items.len() as i64) < total,
+        items,
+        total,
+    })
 }
 
 pub async fn start_scan(
@@ -1113,5 +1375,62 @@ mod tests {
         std::fs::remove_dir_all(&state.config.books_dir).expect("temporarily unavailable root");
         scan(&state).await;
         assert_eq!(publication_rows(&state).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_groups_directories_and_books_and_filters_hidden_subtrees() {
+        let (_temp, state) = test_state().await;
+        let visible_shelf = ensure_directory(&state.db, Path::new("中文书架/系列"))
+            .await
+            .expect("visible series");
+        let hidden_series = ensure_directory(&state.db, Path::new("隐藏书架/系列"))
+            .await
+            .expect("hidden series");
+        std::fs::create_dir_all(state.config.books_dir.join("隐藏书架")).expect("hidden shelf");
+        std::fs::write(state.config.books_dir.join("隐藏书架").join("hide"), "")
+            .expect("hide marker");
+        for (directory_id, title, filename) in [
+            (visible_shelf, "中文小说 10", "卷10.txt"),
+            (hidden_series, "中文小说 20", "卷20.txt"),
+        ] {
+            sqlx::query("INSERT INTO publications (directory_id,relative_path,filename,format,title,file_size,mtime_ns,sha256,parse_status,added_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(directory_id)
+                .bind(format!("{title}.txt"))
+                .bind(filename)
+                .bind("txt")
+                .bind(title)
+                .bind(1_i64)
+                .bind(1_i64)
+                .bind(filename)
+                .bind("ok")
+                .bind(1_i64)
+                .bind(1_i64)
+                .execute(&state.db)
+                .await
+                .expect("publication");
+        }
+
+        let hidden = hidden_shelf_paths(&state.db, &state.config.books_dir)
+            .await
+            .expect("hidden paths");
+        let shelves = search_directories(&state.db, "中文", &hidden, true, 0, 20)
+            .await
+            .expect("shelf search");
+        assert_eq!(shelves.total, 1);
+        assert_eq!(shelves.items[0].name, "中文书架");
+        let series = search_directories(&state.db, "系列", &hidden, false, 0, 20)
+            .await
+            .expect("series search");
+        assert_eq!(series.total, 1);
+        assert_eq!(series.items[0].path, "中文书架/系列");
+        let books = search_books(&state.db, "小说", &hidden, 0, 20)
+            .await
+            .expect("book search");
+        assert_eq!(books.total, 1);
+        assert_eq!(books.items[0].filename, "卷10.txt");
+        let special = search_books(&state.db, "%", &[], 0, 20)
+            .await
+            .expect("special search");
+        assert_eq!(special.total, 0);
     }
 }

@@ -215,7 +215,7 @@ const getMetadata = opf => {
         .map(([name, els]) => [name, els.map(parse)]))
     const properties = getProperties() ?? {}
     const legacyMeta = Object.fromEntries(els.legacyMeta?.map(el =>
-        [el.getAttribute('name'), el.getAttribute('content')]) ?? [])
+        [el.getAttribute('name')?.toLowerCase(), el.getAttribute('content')]) ?? [])
 
     // second pass: map to webpub
     const one = x => x?.[0]?.value
@@ -316,6 +316,21 @@ const getMetadata = opf => {
         else if (key.startsWith(PREFIX.media))
             media[camel(key.replace(PREFIX.media, ''))] = one(val)
     }
+    // A number of comic EPUBs in the wild use the old Apple/Calibre metadata
+    // instead of the EPUB 3 rendition vocabulary. Mark those publications so
+    // the fixed-layout renderer can choose a spread from its actual viewport.
+    const originalResolution = legacyMeta?.['original-resolution']?.match(/(\d+)\s*(?:x|×|,|\s)\s*(\d+)/i)
+    if (!rendition.viewport && originalResolution)
+        rendition.viewport = { width: originalResolution[1], height: originalResolution[2] }
+    const legacyFixed = legacyMeta?.['fixed-layout']?.trim().toLowerCase() === 'true'
+    const legacyComic = legacyMeta?.['book-type']?.trim().toLowerCase() === 'comic'
+    if ((legacyFixed || legacyComic || originalResolution) && !rendition.layout)
+        rendition.layout = 'pre-paginated'
+    const standardFixed = rendition.layout === 'pre-paginated'
+    const standardSpread = rendition.spread
+    if ((legacyComic || legacyFixed || originalResolution || standardFixed)
+        && (!standardSpread || standardSpread === 'none' || standardSpread === 'auto'))
+        rendition.autoSpread = true
     if (media.duration) media.duration = parseClock(media.duration)
     return { metadata, rendition, media }
 }
@@ -1052,6 +1067,9 @@ ${doc.querySelector('parsererror').innerText}`)
                 .find(section => section.linear !== 'no').pageSpread ??=
                     this.dir === 'rtl' ? 'left' : 'right'
         }
+        if (this.rendition.layout === 'pre-paginated'
+            && (!this.rendition.spread || this.rendition.spread === 'none' || this.rendition.spread === 'auto'))
+            this.rendition.autoSpread = true
         return this
     }
     async loadDocument(item) {

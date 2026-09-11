@@ -54,6 +54,22 @@ describe("reader gestures", () => {
     expect(scrolled.swipe).not.toHaveBeenCalled();
   });
 
+  it("keeps the center tap available while page turning is disabled", () => {
+    const surface = document.createElement("div");
+    document.body.append(surface);
+    const center = vi.fn();
+    cleanups.push(installPageGestures(surface, {
+      enabled: () => false,
+      centerEnabled: () => true,
+      bounds: () => rect,
+      left: vi.fn(),
+      right: vi.fn(),
+      center,
+    }));
+    fireEvent.click(surface, { clientX: 500, clientY: 200 });
+    expect(center).toHaveBeenCalledOnce();
+  });
+
   it("excludes long presses, selection, controls and multi-touch", () => {
     const { surface, left, right, swipe } = fixture();
     vi.spyOn(Date, "now").mockReturnValue(1000);

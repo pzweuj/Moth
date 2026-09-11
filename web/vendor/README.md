@@ -5,6 +5,11 @@
 fixed-layout support and their small browser dependencies. The application
 uses the published `@zip.js/zip.js` package for HTTP Range loading.
 
+Moth's local fixed-layout patch recognizes legacy comic metadata, uses the
+declared viewport or image dimensions, and chooses a two-page spread only
+when the current container can fit both pages. It also exposes the visible
+page indexes for reading progress.
+
 The vendored code is MIT licensed; retain the upstream `LICENSE` and commit
 pin when updating it. It is not a MOBI, PDF, FB2 or CBZ reader: MOBI is
 converted by Rust to EPUB before reaching the browser, and CBZ pages are read

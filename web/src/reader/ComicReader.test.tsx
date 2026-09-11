@@ -71,7 +71,7 @@ describe("ComicReader page navigation", () => {
     };
     const { rerender } = render(<ComicReader {...props} />);
     expect(screen.getByAltText("第 2 页")).toBeInTheDocument();
-    expect(onProgress).toHaveBeenLastCalledWith(props.progress!.position);
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ page_index: 1, progress: 2 / 3 }));
     props = { ...props, settings: { ...settings, mode: "double" } };
     rerender(<ComicReader {...props} />);
     expect(screen.getByAltText("第 3 页")).toBeInTheDocument();

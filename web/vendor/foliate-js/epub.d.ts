@@ -13,6 +13,6 @@ export class EPUB {
   constructor(loader: ZipLoaderLike);
   init(): Promise<EPUB>;
   sections: Array<{ load(): Promise<string | null>; unload(): void; linear?: string }>;
-  rendition?: { layout?: string };
+  rendition?: { layout?: string; spread?: string; autoSpread?: boolean; viewport?: unknown };
   destroy(): void;
 }

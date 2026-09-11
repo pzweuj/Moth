@@ -6,6 +6,8 @@ type Options = {
   toViewport?: (point: Point) => Point;
   left: () => void;
   right: () => void;
+  center?: () => void;
+  centerEnabled?: () => boolean;
   swipe?: (direction: "left" | "right") => void;
   state?: PageGestureState;
 };
@@ -32,8 +34,11 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
     const rect = options.bounds();
     if (rect.width <= 0 || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return;
     const relative = (x - rect.left) / rect.width;
-    if (relative <= 0.3) options.left();
-    else if (relative >= 0.7) options.right();
+    if (relative <= 0.3) {
+      if (options.enabled()) options.left();
+    } else if (relative >= 0.7) {
+      if (options.enabled()) options.right();
+    } else if (options.center && (options.centerEnabled?.() ?? options.enabled())) options.center();
   };
   const touchStart = (event: TouchEvent) => {
     state.lastTouch = Date.now();
@@ -60,11 +65,12 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
     invalid = false;
     const touch = event.changedTouches[0];
     if (!origin || wasInvalid || !touch || event.changedTouches.length !== 1
-      || !options.enabled() || blocked(event.target) || state.lastTouch - origin.at > 500) return;
+      || (!(options.enabled() || (options.center && (options.centerEnabled?.() ?? false))))
+      || blocked(event.target) || state.lastTouch - origin.at > 500) return;
     const dx = touch.clientX - origin.x;
     const dy = touch.clientY - origin.y;
     const maxY = Math.max(origin.maxY, Math.abs(dy));
-    if (options.swipe && Math.abs(dx) >= 48 && Math.abs(dx) > maxY) {
+    if (options.enabled() && options.swipe && Math.abs(dx) >= 48 && Math.abs(dx) > maxY) {
       options.swipe(dx < 0 ? "left" : "right");
     } else if (Math.max(origin.maxX, Math.abs(dx), maxY) <= 12) {
       tap({ x: touch.clientX, y: touch.clientY });
@@ -73,7 +79,9 @@ export function installPageGestures(surface: Document | HTMLElement, options: Op
   const cancel = () => { start = null; invalid = false; state.lastTouch = Date.now(); };
   const click = (event: MouseEvent) => {
     if (Date.now() - state.lastTouch < 800 || event.button !== 0 || event.ctrlKey || event.metaKey
-      || event.altKey || event.shiftKey || !options.enabled() || blocked(event.target)) return;
+      || event.altKey || event.shiftKey
+      || (!(options.enabled() || (options.center && (options.centerEnabled?.() ?? false))))
+      || blocked(event.target)) return;
     tap({ x: event.clientX, y: event.clientY });
   };
   const handlers = { touchstart: touchStart, touchmove: touchMove, touchend: touchEnd, touchcancel: cancel, click };

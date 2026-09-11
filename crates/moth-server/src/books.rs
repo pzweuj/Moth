@@ -26,7 +26,7 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::{
     auth::Authenticated,
     error::AppError,
-    library::now_unix,
+    library::{is_hidden_shelf, now_unix},
     state::{AppState, ConversionState},
 };
 
@@ -227,7 +227,7 @@ async fn fetch_home_directories(
         let category_id: i64 = category.try_get("id")?;
         let category_path: String = category.try_get("relative_path")?;
         let category_name: String = category.try_get("name")?;
-        if books_root.join(&category_path).join("hide").is_file() {
+        if is_hidden_shelf(books_root, &category_path) {
             hidden.push(HiddenDirectorySummary {
                 name: category_name,
                 path: category_path,
@@ -359,10 +359,11 @@ pub(crate) async fn fetch_publications(
     directory_id: Option<i64>,
     sort: Option<&str>,
 ) -> Result<Vec<PublicationSummary>, AppError> {
+    let filename_sort = sort == Some("filename");
     let order = match sort {
         Some("added") => "p.added_at DESC, p.title COLLATE NOCASE",
         Some("progress") => "COALESCE(r.updated_at, 0) DESC, p.title COLLATE NOCASE",
-        Some("filename") => "p.filename COLLATE NOCASE, p.title COLLATE NOCASE",
+        Some("filename") => "p.filename COLLATE NOCASE, p.title COLLATE NOCASE, p.id",
         _ => "p.title COLLATE NOCASE",
     };
     let query = format!(
@@ -377,7 +378,74 @@ pub(crate) async fn fetch_publications(
     for row in rows {
         out.push(summary_from_row(&row)?);
     }
+    if filename_sort {
+        out.sort_by(|left, right| {
+            natural_filename_compare(&left.filename, &right.filename)
+                .then_with(|| {
+                    left.filename
+                        .to_lowercase()
+                        .cmp(&right.filename.to_lowercase())
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
     Ok(out)
+}
+
+fn natural_filename_compare(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    let (mut i, mut j) = (0, 0);
+    while i < left_chars.len() && j < right_chars.len() {
+        let left_char = left_chars[i];
+        let right_char = right_chars[j];
+        if left_char.is_ascii_digit() && right_char.is_ascii_digit() {
+            let (mut left_end, mut right_end) = (i, j);
+            while left_end < left_chars.len() && left_chars[left_end].is_ascii_digit() {
+                left_end += 1;
+            }
+            while right_end < right_chars.len() && right_chars[right_end].is_ascii_digit() {
+                right_end += 1;
+            }
+            let left_digits = left_chars[i..left_end].iter().collect::<String>();
+            let right_digits = right_chars[j..right_end].iter().collect::<String>();
+            let left_normalized = left_digits.trim_start_matches('0');
+            let right_normalized = right_digits.trim_start_matches('0');
+            let left_normalized = if left_normalized.is_empty() {
+                "0"
+            } else {
+                left_normalized
+            };
+            let right_normalized = if right_normalized.is_empty() {
+                "0"
+            } else {
+                right_normalized
+            };
+            match left_normalized
+                .len()
+                .cmp(&right_normalized.len())
+                .then_with(|| left_normalized.cmp(right_normalized))
+            {
+                std::cmp::Ordering::Equal => {
+                    i = left_end;
+                    j = right_end;
+                }
+                other => return other,
+            }
+        } else {
+            match left_char
+                .to_ascii_lowercase()
+                .cmp(&right_char.to_ascii_lowercase())
+            {
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+    (left_chars.len() - i).cmp(&(right_chars.len() - j))
 }
 
 async fn fetch_publication(db: &SqlitePool, id: i64) -> Result<PublicationSummary, AppError> {
@@ -395,7 +463,9 @@ async fn fetch_publication(db: &SqlitePool, id: i64) -> Result<PublicationSummar
     Ok(summary_from_row(&row)?)
 }
 
-fn summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PublicationSummary, sqlx::Error> {
+pub(crate) fn summary_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PublicationSummary, sqlx::Error> {
     let source: String = row.try_get("format")?;
     let hash: String = row.try_get("sha256")?;
     let has_cover: bool = row.try_get("has_cover")?;
@@ -2624,6 +2694,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["z-active", "alpha", "bravo", "charlie"]
         );
+    }
+
+    #[test]
+    fn natural_filename_order_handles_volume_numbers() {
+        let mut names = vec!["卷10.epub", "卷2.epub", "卷1.epub"];
+        names.sort_by(|left, right| {
+            natural_filename_compare(left, right)
+                .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+        });
+        assert_eq!(names, vec!["卷1.epub", "卷2.epub", "卷10.epub"]);
     }
 
     #[test]

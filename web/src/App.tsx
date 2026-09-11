@@ -25,6 +25,7 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("moth:theme", theme);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#101615" : "#f5f5ef");
   }, [theme]);
   useEffect(() => {
     const onUpdate = (event: Event) => {

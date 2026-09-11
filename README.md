@@ -6,7 +6,7 @@ Moth 是一个单用户、filesystem-first 自托管 PWA 阅读器。它只读�
 
 - `MOTH_BOOKS_DIR` 是唯一书库根目录，子目录就是分类。
 - 要把一级书架收进首页的“更多书架”，在 `MOTH_BOOKS_DIR/<书架>/hide` 放置一个普通文件（空文件即可，内容不会读取）；只检查一级书架，根目录或系列目录中的同名文件不生效。刷新首页即可生效。隐藏书架仍可从“更多书架”进入，里面的书不会出现在“继续阅读”。
-- 首页显示继续阅读和按“分类/系列/作品”层级组织的目录预览；没有搜索、作者筛选、系列管理或文件整理。
+- 首页显示继续阅读和按“分类/系列/作品”层级组织的目录预览；已登录的主页、目录、书架和系列页支持搜索书架、系列和书籍名称，不提供作者筛选、系列管理或文件整理。
 - EPUB 使用 HTTP Range 和 CFI；TXT 使用编码检测、中文章节索引和 UTF-16 字符定位；CBZ 按页解压；MOBI 首次打开时转成 EPUB 缓存。
 - PWA 从安卓桌面启动时请求全屏显示，并通过 `viewport-fit=cover` 适配刘海、挖孔屏和底部手势区域；系统手势或不支持全屏的浏览器仍可能临时显示系统栏。更新后的 manifest 可能要等 Service Worker 更新，已安装应用仍可重新安装后生效。阅读资源和进度请求需要连接服务器。
 - 设置保存在浏览器 `localStorage`；登录会话使用 HttpOnly cookie。
@@ -74,7 +74,8 @@ Compose 将 `./data` 挂载到 `/data`，将 `${MOTH_BOOKS_PATH:-./books}` 以�
 | 端点 | 用途 |
 | --- | --- |
 | `GET /home` | 继续阅读、分类/系列目录预览和折叠的隐藏书架入口 |
-| `GET /browse?path=...` | 面包屑、子目录和当前目录的书 |
+| `GET /browse?path=...` | 面包屑、子目录（含直属系列/书籍统计）和当前目录的书 |
+| `GET /search?q=...&include_hidden=false&kind=all&offset=0&limit=20` | 全书库搜索书架、系列和书籍名称；每组返回分页结果和总数 |
 | `POST /scan`、`GET /scan/status` | 启动扫描和读取全局扫描状态（包括发现阶段） |
 | `GET /publications/{id}` | Publication 元数据、TXT 章节或 CBZ 页索引 |
 | `GET /publications/{id}/cover`、`/file`、`/chapters/{idx}`、`/pages/{idx}`、`/pages/{idx}/thumbnail` | 阅读资源 |
