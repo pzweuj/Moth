@@ -7,12 +7,17 @@ export interface ZipLoaderLike {
   getSize(filename: string): number;
 }
 
+export type EpubResourceLoadOptions = { speculative?: boolean };
+export type EpubOptions = { resourceBudget?: number };
+
 export type FoliateBook = Record<string, unknown>;
 
 export class EPUB {
-  constructor(loader: ZipLoaderLike);
+  constructor(loader: ZipLoaderLike, options?: EpubOptions);
   init(): Promise<EPUB>;
-  sections: Array<{ load(): Promise<string | null>; unload(): void; linear?: string }>;
+  readonly resourceBytes: number;
+  readonly resourceBudget: number;
+  sections: Array<{ load(options?: EpubResourceLoadOptions): Promise<string | null>; unload(): void; linear?: string }>;
   rendition?: { layout?: string; spread?: string; autoSpread?: boolean; viewport?: unknown };
   destroy(): void;
 }

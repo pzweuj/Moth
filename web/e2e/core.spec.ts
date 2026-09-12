@@ -175,6 +175,9 @@ test("TXT uses one heading, encoding-specific chapters, and keepalive recovery",
   const explicit = await (await page.request.get(`${app.url}/api/v1/publications/${txt!.id}?encoding=utf-8`)).json() as { content_version: string; chapters: Array<{ title: string }> };
   expect(explicit.content_version).not.toBe(auto.content_version);
   expect(explicit.chapters.map((chapter) => chapter.title)).toEqual(auto.chapters.map((chapter) => chapter.title));
+  const chapter = await (await page.request.get(`${app.url}/api/v1/publications/${txt!.id}/chapters/0?encoding=utf-8`)).json() as Record<string, unknown>;
+  expect(chapter).not.toHaveProperty("content");
+  expect(typeof chapter.text).toBe("string");
   const legacyBook = await (await page.request.get(`${app.url}/api/v1/publications/${legacy!.id}?encoding=gbk`)).json() as { chapters: Array<{ title: string }> };
   expect(legacyBook.chapters[0]?.title).toContain("Legacy GBK");
 

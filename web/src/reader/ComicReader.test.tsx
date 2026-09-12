@@ -101,4 +101,28 @@ describe("ComicReader page navigation", () => {
     expect(screen.getByAltText("第 3 页")).toBeInTheDocument();
     expect(screen.queryByAltText("第 1 页")).not.toBeInTheDocument();
   });
+
+  it("keeps webtoon placeholders while unloading distant images", async () => {
+    const pages = Array.from({ length: 30 }, (_, idx) => ({ idx, path: `${idx}.jpg`, mime: "image/jpeg", width: 100, height: 100 }));
+    const webtoonDetail = { ...detail, pages } as BookDetail;
+    render(<ComicReader detail={webtoonDetail} settings={{ ...settings, mode: "webtoon" }} navigationRequest={null} onProgress={vi.fn()} onCurrentPageChange={vi.fn()} />);
+    const content = document.querySelector<HTMLDivElement>(".reader-content")!;
+    Object.defineProperty(content, "clientHeight", { configurable: true, value: 500 });
+    content.getBoundingClientRect = () => ({ left: 0, right: 500, top: 0, bottom: 500, width: 500, height: 500, x: 0, y: 0, toJSON: () => ({}) });
+    const pageNodes = Array.from(document.querySelectorAll<HTMLElement>(".comic-page"));
+    pageNodes.forEach((node, page) => {
+      node.getBoundingClientRect = () => {
+        const top = page * 100 - content.scrollTop;
+        return { left: 0, right: 500, top, bottom: top + 100, width: 500, height: 100, x: 0, y: top, toJSON: () => ({}) };
+      };
+    });
+    content.dispatchEvent(new Event("scroll"));
+    await waitFor(() => expect(document.querySelector('.comic-page[data-page="10"] img')).toBeInTheDocument());
+    content.scrollTop = 2500;
+    content.dispatchEvent(new Event("scroll"));
+    await waitFor(() => expect(document.querySelector('.comic-page[data-page="0"] img')).not.toBeInTheDocument());
+    expect(document.querySelectorAll(".comic-page")).toHaveLength(30);
+    expect(document.querySelector('.comic-page[data-page="20"] img')).toBeInTheDocument();
+    expect(document.querySelector('.comic-page[data-page="0"] .comic-page-placeholder')).toBeInTheDocument();
+  });
 });

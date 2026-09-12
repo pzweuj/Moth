@@ -24,6 +24,10 @@ import { installPageGestures } from "./pageGestures";
 
 type PagePosition = { page: number; progress: number };
 
+const WEBTOON_WINDOW_BUFFER_PX = 900;
+const FALLBACK_PAGE_WIDTH = 2;
+const FALLBACK_PAGE_HEIGHT = 3;
+
 function clampPage(page: number, count: number): number {
   return Math.min(Math.max(0, page), Math.max(0, count - 1));
 }
@@ -43,7 +47,8 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     progress: saved?.page_index === initialPage ? clampProgress(saved.page_progress) : 0,
   };
   const [index, setIndex] = useState(initialPage);
-  const [eligible, setEligible] = useState<Set<number>>(() => new Set());
+  const [windowPages, setWindowPages] = useState<Set<number>>(() => new Set(pageCount ? [initialPage] : []));
+  const [measuredSizes, setMeasuredSizes] = useState<Map<number, { width: number; height: number }>>(() => new Map());
   const [failed, setFailed] = useState<Set<number>>(() => new Set());
   const [retryNonce, setRetryNonce] = useState<Map<number, number>>(() => new Map());
   const [imageLoading, setImageLoading] = useState(true);
@@ -53,6 +58,8 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   const [webtoonVisiblePages, setWebtoonVisiblePages] = useState<number[]>(() => pageCount ? [initialPage] : []);
   const contentRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef(new Map<number, HTMLDivElement>());
+  const windowPagesRef = useRef(new Set<number>(pageCount ? [initialPage] : []));
+  const measuredSizesRef = useRef(new Map<number, { width: number; height: number }>());
   const indexRef = useRef(initialPage);
   const positionRef = useRef<PagePosition>(initialPosition);
   const initialSavedRef = useRef(saved);
@@ -77,55 +84,83 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   useEffect(() => { indexRef.current = index; }, [index]);
   useEffect(() => { onCurrentPageChangeRef.current(index); }, [index]);
 
-  const markEligible = useCallback((page: number) => {
+  const setWebtoonWindow = useCallback((next: Set<number>) => {
+    const previous = windowPagesRef.current;
+    if (previous.size === next.size && Array.from(next).every((page) => previous.has(page))) return;
+    windowPagesRef.current = next;
+    setWindowPages(next);
+  }, []);
+
+  const retainWebtoonPage = useCallback((page: number) => {
     if (page < 0 || page >= pageCount) return;
-    setEligible((current) => current.has(page) ? current : new Set(current).add(page));
-  }, [pageCount]);
+    const next = new Set(windowPagesRef.current);
+    next.add(page);
+    setWebtoonWindow(next);
+  }, [pageCount, setWebtoonWindow]);
+
+  const updateWebtoonWindow = useCallback(() => {
+    if (settings.mode !== "webtoon") return;
+    const container = contentRef.current;
+    if (!container) return;
+    const containerRect = container.getBoundingClientRect();
+    const viewportTop = containerRect.top;
+    const viewportBottom = viewportTop + container.clientHeight;
+    const next = new Set<number>();
+    for (const [page, node] of pageRefs.current) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom >= viewportTop - WEBTOON_WINDOW_BUFFER_PX
+        && rect.top <= viewportBottom + WEBTOON_WINDOW_BUFFER_PX) {
+        next.add(page);
+      }
+    }
+    // Keep the active and explicitly requested pages available while their
+    // positions are being restored, even before all placeholders are laid out.
+    if (indexRef.current >= 0 && indexRef.current < pageCount) next.add(indexRef.current);
+    const pending = pendingScrollRef.current;
+    if (pending && pending.page >= 0 && pending.page < pageCount) next.add(pending.page);
+    setWebtoonWindow(next);
+  }, [pageCount, setWebtoonWindow, settings.mode]);
 
   const scheduleWebtoonRestore = useCallback((target: PagePosition) => {
     if (settings.mode !== "webtoon") return;
-    pendingScrollRef.current = {
+    const intent = {
       page: clampPage(target.page, pageCount),
       progress: clampProgress(target.progress),
     };
+    pendingScrollRef.current = intent;
+    retainWebtoonPage(intent.page);
     if (restoreFrameRef.current !== null) window.cancelAnimationFrame(restoreFrameRef.current);
     restoreFrameRef.current = window.requestAnimationFrame(() => {
       restoreFrameRef.current = null;
       const container = contentRef.current;
-      const intent = pendingScrollRef.current;
-      if (!container || !intent) return;
-      const node = pageRefs.current.get(intent.page);
-      if (!node || node.offsetHeight <= 0) return;
+      const pendingIntent = pendingScrollRef.current;
+      if (!container || !pendingIntent) return;
+      const node = pageRefs.current.get(pendingIntent.page);
+      if (!node) return;
       const containerRect = container.getBoundingClientRect();
-      const nodeTop = node.getBoundingClientRect().top - containerRect.top + container.scrollTop;
-      const desired = nodeTop + node.offsetHeight * intent.progress - container.clientHeight / 2;
+      const nodeRect = node.getBoundingClientRect();
+      const nodeHeight = nodeRect.height > 0 ? nodeRect.height : node.offsetHeight;
+      if (nodeHeight <= 0) return;
+      const nodeTop = nodeRect.top - containerRect.top + container.scrollTop;
+      const desired = nodeTop + nodeHeight * pendingIntent.progress - container.clientHeight / 2;
       const maximum = Math.max(0, container.scrollHeight - container.clientHeight);
       container.scrollTop = Math.max(0, Math.min(maximum, desired));
       pendingScrollRef.current = null;
+      updateWebtoonWindow();
     });
-  }, [pageCount, settings.mode]);
+  }, [pageCount, retainWebtoonPage, settings.mode, updateWebtoonWindow]);
 
   useEffect(() => {
     if (settings.mode !== "webtoon") return;
-    const root = contentRef.current;
-    if (!root) return;
-    if (typeof IntersectionObserver === "undefined") {
-      markEligible(indexRef.current);
-      markEligible(indexRef.current + 1);
-      return;
-    }
-    const observer = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) markEligible(Number((entry.target as HTMLElement).dataset.page));
-      }
-    }, { root, rootMargin: "900px 0px" });
-    for (const node of pageRefs.current.values()) observer.observe(node);
-    return () => observer.disconnect();
-  }, [markEligible, pageCount, settings.mode]);
+    const frame = window.requestAnimationFrame(updateWebtoonWindow);
+    return () => window.cancelAnimationFrame(frame);
+  }, [pageCount, settings.mode, updateWebtoonWindow]);
 
   const updateWebtoonProgress = useCallback(() => {
     const container = contentRef.current;
-    if (!container || !pageCount || pendingScrollRef.current) return;
+    if (!container || !pageCount) return;
+    updateWebtoonWindow();
+    if (pendingScrollRef.current) return;
     const containerRect = container.getBoundingClientRect();
     const atStart = container.scrollTop <= 2;
     const atEnd = container.scrollTop + container.clientHeight >= container.scrollHeight - 2;
@@ -155,10 +190,17 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     positionRef.current = nextPosition;
     indexRef.current = closest.page;
     setIndex((current) => current === closest.page ? current : closest.page);
+    updateWebtoonWindow();
+    const activeFailed = failed.has(closest.page);
+    const activeImage = pageRefs.current.get(closest.page)?.querySelector("img");
+    const activeReady = activeFailed || Boolean(activeImage?.complete && activeImage.naturalWidth > 0);
+    setImageLoading((current) => current === !activeReady ? current : !activeReady);
     const lastVisible = visiblePages.at(-1) ?? closest.page;
     const lastNode = pageRefs.current.get(lastVisible);
+    const lastRect = lastNode?.getBoundingClientRect();
+    const lastHeight = lastRect && lastRect.height > 0 ? lastRect.height : lastNode?.offsetHeight ?? 0;
     const lastProgress = lastNode
-      ? clampProgress((viewportBottom - lastNode.getBoundingClientRect().top) / lastNode.offsetHeight)
+      ? clampProgress((viewportBottom - (lastRect?.top ?? 0)) / lastHeight)
       : closest.progress;
     const overall = clampProgress((lastVisible + lastProgress) / pageCount);
     const visibleForState = visiblePages.length ? visiblePages : [closest.page];
@@ -179,7 +221,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       visiblePages: visibleForState,
       totalPages: pageCount,
     });
-  }, [imageLoading, onReadingStateChange, pageCount, settings.direction]);
+  }, [failed, imageLoading, onReadingStateChange, pageCount, settings.direction, updateWebtoonWindow]);
 
   useEffect(() => {
     if (settings.mode !== "webtoon") return;
@@ -317,7 +359,10 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       next.set(page, (next.get(page) ?? 0) + 1);
       return next;
     });
-    markEligible(page);
+    if (settings.mode === "webtoon") {
+      retainWebtoonPage(page);
+      updateWebtoonWindow();
+    }
   };
 
   const visible = useMemo(() => settings.mode === "webtoon"
@@ -384,19 +429,57 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       <div className="comic-pages">
         {visible.map((page) => {
           const info = detail.pages[page];
-          const aspectRatio = info?.width && info.height ? `${info.width} / ${info.height}` : undefined;
+          const measured = measuredSizes.get(page);
+          const width = measured && measured.width > 0
+            ? measured.width
+            : info?.width && info.width > 0 ? info.width : FALLBACK_PAGE_WIDTH;
+          const height = measured && measured.height > 0
+            ? measured.height
+            : info?.height && info.height > 0 ? info.height : FALLBACK_PAGE_HEIGHT;
+          const aspectRatio = `${width} / ${height}`;
+          const hasInfoDimensions = Boolean(info?.width && info.width > 0 && info.height && info.height > 0);
+          const pageStyle = settings.mode === "webtoon" || hasInfoDimensions
+            ? { aspectRatio }
+            : undefined;
           const attempt = retryNonce.get(page) ?? 0;
           return <div className="comic-page" data-page={page} key={page} ref={(node) => {
             if (node) pageRefs.current.set(page, node);
             else pageRefs.current.delete(page);
-          }} style={aspectRatio ? { aspectRatio } : undefined}>
-            {failed.has(page)
+          }} style={pageStyle}>
+            {failed.has(page) && (settings.mode !== "webtoon" || windowPages.has(page))
               ? <div className="reader-error"><p>第 {page + 1} 页加载失败</p><button className="reader-control-button reader-control-button--danger" type="button" onClick={() => retryPage(page)}>重试</button></div>
-              : settings.mode !== "webtoon" || eligible.has(page)
-                ? <img key={`${page}-${attempt}`} src={`/api/v1/publications/${detail.id}/pages/${page}${attempt ? `?retry=${attempt}` : ""}`} draggable={false} alt={`第 ${page + 1} 页`} loading={settings.mode === "webtoon" ? "lazy" : "eager"} decoding="async" onLoad={() => { setImageLoading(false);
-                  if (settings.mode === "webtoon" && pendingScrollRef.current?.page === page) scheduleWebtoonRestore(pendingScrollRef.current);
-                }} onError={() => { setImageLoading(false); setFailed((current) => new Set(current).add(page)); }} />
-                : <div className="reader-loading">正在加载第 {page + 1} 页…</div>}
+              : settings.mode !== "webtoon" || windowPages.has(page)
+                ? <img key={`${page}-${attempt}`} src={`/api/v1/publications/${detail.id}/pages/${page}${attempt ? `?retry=${attempt}` : ""}`} draggable={false} alt={`第 ${page + 1} 页`} loading="eager" decoding="async" onLoad={(event) => {
+                  if (settings.mode !== "webtoon" || page === indexRef.current) setImageLoading(false);
+                  const image = event.currentTarget;
+                  if (!hasInfoDimensions && image.naturalWidth > 0 && image.naturalHeight > 0) {
+                    const container = contentRef.current;
+                    const anchor = pageRefs.current.get(indexRef.current);
+                    const before = container && anchor
+                      ? anchor.getBoundingClientRect().top - container.getBoundingClientRect().top
+                      : null;
+                    const size = { width: image.naturalWidth, height: image.naturalHeight };
+                    measuredSizesRef.current.set(page, size);
+                    setMeasuredSizes(new Map(measuredSizesRef.current));
+                    window.requestAnimationFrame(() => {
+                      if (container && anchor && before !== null) {
+                        const after = anchor.getBoundingClientRect().top - container.getBoundingClientRect().top;
+                        container.scrollTop += after - before;
+                      }
+                      updateWebtoonWindow();
+                      const restore = pendingScrollRef.current?.page === page
+                        ? pendingScrollRef.current
+                        : page === indexRef.current ? positionRef.current : null;
+                      if (settings.mode === "webtoon" && restore) scheduleWebtoonRestore(restore);
+                    });
+                  } else if (settings.mode === "webtoon" && pendingScrollRef.current?.page === page) {
+                    scheduleWebtoonRestore(pendingScrollRef.current);
+                  }
+                }} onError={() => {
+                  if (settings.mode !== "webtoon" || page === indexRef.current) setImageLoading(false);
+                  setFailed((current) => new Set(current).add(page));
+                }} />
+                : <div className="comic-page-placeholder" aria-hidden="true" />}
           </div>;
         })}
       </div>

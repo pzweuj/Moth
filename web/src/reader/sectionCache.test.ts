@@ -60,6 +60,37 @@ describe("EPUB section cache", () => {
     await cache.destroy();
   });
 
+  it("retries a speculative rejection as an unrestricted foreground load", async () => {
+    const { originals, sections, cache } = fixture();
+    originals[1].load.mockImplementation(async (options?: { speculative?: boolean }) => {
+      if (options?.speculative) throw new Error("resource budget exceeded");
+      return "blob:foreground";
+    });
+    await sections[0].load();
+    cache.relocate(0);
+    await vi.waitFor(() => expect(originals[1].load).toHaveBeenCalledTimes(1));
+    expect(await sections[1].load()).toBe("blob:foreground");
+    expect(originals[1].load).toHaveBeenCalledTimes(2);
+    await cache.destroy();
+  });
+
+  it("evicts the farthest inactive section before a budgeted prefetch", async () => {
+    let bytes = 0;
+    const originals = Array.from({ length: 4 }, (_, index) => ({
+      load: vi.fn(async () => { bytes += 10; return `blob:section-${index}`; }),
+      unload: vi.fn(() => { bytes -= 10; }),
+    }));
+    const sections = originals.map((section) => ({ ...section, size: 10 }));
+    const cache = cacheSections(sections, false, { getResourceBytes: () => bytes, resourceBudget: 20 });
+    await sections[0].load();
+    await sections[1].load();
+    cache.relocate(1);
+    await vi.waitFor(() => expect(originals[2].load).toHaveBeenCalledTimes(1));
+    expect(originals[0].unload).toHaveBeenCalledTimes(1);
+    expect(bytes).toBe(20);
+    await cache.destroy();
+  });
+
   it("retains both fixed-layout pages and prepares the next spread without loading the book", async () => {
     const { originals, sections, cache } = fixture(20, true);
     await sections[2].load(); await sections[3].load();

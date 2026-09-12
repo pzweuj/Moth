@@ -221,9 +221,9 @@ a { color: inherit; }
 .comic-height .comic-pages img { height: var(--comic-page-height); max-height: 100%; max-width: 100%; width: auto; }
 .comic-webtoon .reader-content { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
 .comic-webtoon .comic-pages { align-items: stretch; flex-direction: column; margin: 0 auto; max-width: 900px; min-height: 0; }
-.comic-webtoon .comic-page { flex: 0 0 auto; min-height: 80px; width: 100%; }
+.comic-webtoon .comic-page { flex: 0 0 auto; min-height: 0; width: 100%; }
 .comic-webtoon .comic-pages img { height: auto; max-height: none; max-width: 100%; width: 100%; }
-.comic-webtoon .comic-page .reader-loading { min-height: 160px; width: 100%; }
+.comic-webtoon .comic-page-placeholder { min-height: 0; width: 100%; }
 .comic-end-next { align-self: center; margin: 20px auto 8px; min-height: 38px; padding-inline: 18px; }
 .reader-end-next { align-self: center; margin: 16px auto 8px; min-height: 38px; padding-inline: 18px; }
 .reader-completion { align-items: center; background: color-mix(in srgb, var(--app-bg) 94%, transparent); display: flex; inset: 0; justify-content: center; padding: max(28px, env(safe-area-inset-top)) max(22px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(22px, env(safe-area-inset-left)); position: absolute; z-index: 48; }

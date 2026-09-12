@@ -171,10 +171,9 @@ pub struct BookQuery {
 }
 
 #[derive(Debug, Serialize)]
-struct ChapterResponse {
+pub struct ChapterResponse {
     idx: i64,
     title: String,
-    content: String,
     text: String,
     encoding: String,
     content_version: String,
@@ -747,7 +746,7 @@ pub async fn get_chapter(
     _user: Authenticated,
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
     Query(query): Query<ChapterQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ChapterResponse>, AppError> {
     let row = publication_row(&state.db, &state.config.books_dir, id).await?;
     if row.format != "txt" {
         return Err(AppError::Validation(
@@ -784,16 +783,14 @@ pub async fn get_chapter(
     let text = read_cached_range(&cache_path, start, end).await?;
     let title: String = chapter.try_get("title")?;
     let character_count: i64 = chapter.try_get("character_count")?;
-    let content = render_txt_html(&text);
-    Ok(Json(serde_json::json!(ChapterResponse {
+    Ok(Json(ChapterResponse {
         idx,
         title,
-        content,
         text,
         encoding: encoding.clone(),
         content_version: current_content_version(&row, Some(&encoding)),
-        character_count
-    })))
+        character_count,
+    }))
 }
 
 pub async fn get_page(
@@ -1245,10 +1242,6 @@ async fn read_cached_range(path: &Path, start: u64, end: u64) -> Result<String, 
     ];
     tokio::io::AsyncReadExt::read_exact(&mut file, &mut bytes).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn render_txt_html(text: &str) -> String {
-    moth_format::txt::render_plain_html(text)
 }
 
 pub async fn conversion_status(

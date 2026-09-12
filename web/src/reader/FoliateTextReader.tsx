@@ -431,7 +431,10 @@ export function FoliateTextReader({ detail, progress, settings, theme, encoding,
         setLoadingStage("解析书籍");
         epub = await withTimeout(new EPUB(loader).init(), "解析 EPUB 失败或超时，请重试");
         if (cancelled) { epub.destroy(); return; }
-        sectionCache = cacheSections(epub.sections, epub.rendition?.layout === "pre-paginated");
+        sectionCache = cacheSections(epub.sections, epub.rendition?.layout === "pre-paginated", {
+          getResourceBytes: () => epub?.resourceBytes ?? 0,
+          resourceBudget: epub.resourceBudget,
+        });
         book = epub as unknown as FoliateBook;
         const parsedToc = flattenToc((epub as { toc?: unknown }).toc);
         const items = parsedToc.length > 0 ? parsedToc : spineNavigation(book);

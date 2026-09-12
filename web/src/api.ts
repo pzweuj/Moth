@@ -56,7 +56,7 @@ export type SearchResponse = {
   series: SearchGroup<SearchDirectoryItem>;
   books: SearchGroup<PublicationSummary>;
 };
-export type ChapterContent = { idx: number; title: string; content: string; text: string; encoding: string; content_version: string; character_count: number };
+export type ChapterContent = { idx: number; title: string; text: string; encoding: string; content_version: string; character_count: number };
 export type ConversionResponse = { status: "pending" | "preparing" | "ready" | "failed" | "not_required"; file_url?: string; error?: string };
 export type ScanStatus = { scanning: boolean; discovery_complete: boolean; processed: number; total: number; errors: number; message: string };
 

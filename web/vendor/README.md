@@ -10,6 +10,11 @@ declared viewport or image dimensions, and chooses a two-page spread only
 when the current container can fit both pages. It also exposes the visible
 page indexes for reading progress.
 
+Moth also keeps a 32 MiB soft budget for speculative EPUB section resources.
+The loader counts unique rewritten Blob URLs and rejects only speculative
+loads that would exceed the budget; the foreground section can still load a
+large resource and release it through the normal section window.
+
 The vendored code is MIT licensed; retain the upstream `LICENSE` and commit
 pin when updating it. It is not a MOBI, PDF, FB2 or CBZ reader: MOBI is
 converted by Rust to EPUB before reaching the browser, and CBZ pages are read

@@ -726,20 +726,53 @@ class Resources {
     }
 }
 
+const DEFAULT_RESOURCE_BUDGET = 32 * 1024 * 1024
+
+class ResourceBudgetExceeded extends Error {
+    constructor(href) {
+        super(`Speculative EPUB resource budget exceeded: ${href}`)
+        this.name = 'ResourceBudgetExceeded'
+    }
+}
+
 class Loader {
     #cache = new Map()
+    #cacheBytes = new Map()
+    #bytes = 0
     #children = new Map()
     #refCount = new Map()
+    #getSize
+    #resourceBudget
     eventTarget = new EventTarget()
-    constructor({ loadText, loadBlob, resources }) {
+    constructor({ loadText, loadBlob, getSize, resources, resourceBudget }) {
         this.loadText = loadText
         this.loadBlob = loadBlob
+        this.#getSize = getSize
+        this.#resourceBudget = Number.isFinite(resourceBudget)
+            ? Math.max(0, resourceBudget) : DEFAULT_RESOURCE_BUDGET
         this.manifest = resources.manifest
         this.assets = resources.manifest
         // needed only when replacing in (X)HTML w/o parsing (see below)
         //.filter(({ mediaType }) => ![MIME.XHTML, MIME.HTML].includes(mediaType))
     }
-    async createURL(href, data, type, parent) {
+    get bytes() {
+        return this.#bytes
+    }
+    get budget() {
+        return this.#resourceBudget
+    }
+    #checkBudget(href, speculative) {
+        if (!speculative) return
+        const expected = Number(this.#getSize?.(href) ?? 0)
+        if (expected > 0 && this.#bytes + expected > this.#resourceBudget)
+            throw new ResourceBudgetExceeded(href)
+    }
+    #rollbackChildren(href) {
+        const childList = this.#children.get(href)
+        if (childList) while (childList.length) this.unref(childList.pop())
+        this.#children.delete(href)
+    }
+    async createURL(href, data, type, parent, { speculative = false } = {}) {
         if (!data) return ''
         const detail = { data, type }
         Object.defineProperty(detail, 'name', { value: href }) // readonly
@@ -747,8 +780,15 @@ class Loader {
         this.eventTarget.dispatchEvent(event)
         const newData = await event.detail.data
         const newType = await event.detail.type
-        const url = URL.createObjectURL(new Blob([newData], { type: newType }))
+        const blob = new Blob([newData], { type: newType })
+        if (speculative && this.#bytes + blob.size > this.#resourceBudget) {
+            this.#rollbackChildren(href)
+            throw new ResourceBudgetExceeded(href)
+        }
+        const url = URL.createObjectURL(blob)
         this.#cache.set(href, url)
+        this.#cacheBytes.set(href, blob.size)
+        this.#bytes += blob.size
         this.#refCount.set(href, 1)
         if (parent) {
             const childList = this.#children.get(parent)
@@ -775,15 +815,14 @@ class Loader {
             //console.log(`unloading ${href}`)
             URL.revokeObjectURL(this.#cache.get(href))
             this.#cache.delete(href)
+            this.#bytes -= this.#cacheBytes.get(href) ?? 0
+            this.#cacheBytes.delete(href)
             this.#refCount.delete(href)
-            // unref children
-            const childList = this.#children.get(href)
-            if (childList) while (childList.length) this.unref(childList.pop())
-            this.#children.delete(href)
+            this.#rollbackChildren(href)
         } else this.#refCount.set(href, count)
     }
     // load manifest item, recursively loading all resources as needed
-    async loadItem(item, parents = []) {
+    async loadItem(item, parents = [], options = {}) {
         if (!item) return null
         const { href, mediaType } = item
 
@@ -797,30 +836,36 @@ class Loader {
         const parent = parents.at(-1)
         if (this.#cache.has(href)) return this.ref(href, parent)
 
-        const shouldReplace =
-            (isScript || [MIME.XHTML, MIME.HTML, MIME.CSS, MIME.SVG].includes(mediaType))
-            // prevent circular references
-            && parents.every(p => p !== href)
-        if (shouldReplace) return this.loadReplaced(item, parents)
-        // NOTE: this can be replaced with `Promise.try()`
-        const tryLoadBlob = Promise.resolve().then(() => this.loadBlob(href))
-        return this.createURL(href, tryLoadBlob, mediaType, parent)
+        try {
+            this.#checkBudget(href, options.speculative)
+            const shouldReplace =
+                (isScript || [MIME.XHTML, MIME.HTML, MIME.CSS, MIME.SVG].includes(mediaType))
+                // prevent circular references
+                && parents.every(p => p !== href)
+            if (shouldReplace) return await this.loadReplaced(item, parents, options)
+            // NOTE: this can be replaced with `Promise.try()`
+            const tryLoadBlob = Promise.resolve().then(() => this.loadBlob(href))
+            return await this.createURL(href, tryLoadBlob, mediaType, parent, options)
+        } catch (error) {
+            this.#rollbackChildren(href)
+            throw error
+        }
     }
-    async loadHref(href, base, parents = []) {
+    async loadHref(href, base, parents = [], options = {}) {
         if (isExternal(href)) return href
         const path = resolveURL(href, base)
         const item = this.manifest.find(item => item.href === path)
         if (!item) return href
-        return this.loadItem(item, parents.concat(base))
+        return this.loadItem(item, parents.concat(base), options)
     }
-    async loadReplaced(item, parents = []) {
+    async loadReplaced(item, parents = [], options = {}) {
         const { href, mediaType } = item
         const parent = parents.at(-1)
         let str = ''
         try {
             str = await this.loadText(href)
         } catch (e) {
-            return this.createURL(href, Promise.reject(e), mediaType, parent)
+            return this.createURL(href, Promise.reject(e), mediaType, parent, options)
         }
         if (!str) return null
 
@@ -851,7 +896,7 @@ class Loader {
                     if (child.data) {
                         const replacedData = await replaceSeries(child.data,
                             /(?:^|\s*)(href\s*=\s*['"])([^'"]*)(['"])/i,
-                            (_, p1, p2, p3) => this.loadHref(p2, href, parents)
+                            (_, p1, p2, p3) => this.loadHref(p2, href, parents, options)
                                 .then(p2 => `${p1}${p2}${p3}`))
                         child.replaceWith(doc.createProcessingInstruction(
                             child.target, replacedData))
@@ -861,26 +906,26 @@ class Loader {
             }
             // replace hrefs (excluding anchors)
             const replace = async (el, attr) => el.setAttribute(attr,
-                await this.loadHref(el.getAttribute(attr), href, parents))
+                await this.loadHref(el.getAttribute(attr), href, parents, options))
             for (const el of doc.querySelectorAll('link[href]')) await replace(el, 'href')
             for (const el of doc.querySelectorAll('[src]')) await replace(el, 'src')
             for (const el of doc.querySelectorAll('[poster]')) await replace(el, 'poster')
             for (const el of doc.querySelectorAll('object[data]')) await replace(el, 'data')
             for (const el of doc.querySelectorAll('[*|href]:not([href])'))
                 el.setAttributeNS(NS.XLINK, 'href', await this.loadHref(
-                    el.getAttributeNS(NS.XLINK, 'href'), href, parents))
+                    el.getAttributeNS(NS.XLINK, 'href'), href, parents, options))
             for (const el of doc.querySelectorAll('[srcset]'))
                 el.setAttribute('srcset', await replaceSeries(el.getAttribute('srcset'),
                     /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g,
-                    (_, p1, p2, p3) => this.loadHref(p2, href, parents)
+                    (_, p1, p2, p3) => this.loadHref(p2, href, parents, options)
                         .then(p2 => `${p1}${p2}${p3}`)))
             // replace inline styles
             for (const el of doc.querySelectorAll('style'))
                 if (el.textContent) el.textContent =
-                    await this.replaceCSS(el.textContent, href, parents)
+                    await this.replaceCSS(el.textContent, href, parents, options)
             for (const el of doc.querySelectorAll('[style]'))
                 el.setAttribute('style',
-                    await this.replaceCSS(el.getAttribute('style'), href, parents))
+                    await this.replaceCSS(el.getAttribute('style'), href, parents, options))
             // The parent application must allow host-installed event handlers
             // in WebKit, but book scripts and network access remain disabled.
             // All referenced assets have already been rewritten to blob/data
@@ -894,27 +939,27 @@ class Loader {
             }
             // TODO: replace inline scripts? probably not worth the trouble
             const result = new XMLSerializer().serializeToString(doc)
-            return this.createURL(href, result, item.mediaType, parent)
+            return this.createURL(href, result, item.mediaType, parent, options)
         }
 
         const result = mediaType === MIME.CSS
-            ? await this.replaceCSS(str, href, parents)
-            : await this.replaceString(str, href, parents)
-        return this.createURL(href, result, mediaType, parent)
+            ? await this.replaceCSS(str, href, parents, options)
+            : await this.replaceString(str, href, parents, options)
+        return this.createURL(href, result, mediaType, parent, options)
     }
-    async replaceCSS(str, href, parents = []) {
+    async replaceCSS(str, href, parents = [], options = {}) {
         const replacedUrls = await replaceSeries(str,
             /url\(\s*["']?([^'"\n]*?)\s*["']?\s*\)/gi,
-            (_, url) => this.loadHref(url, href, parents)
+            (_, url) => this.loadHref(url, href, parents, options)
                 .then(url => `url("${url}")`))
         // apart from `url()`, strings can be used for `@import` (but why?!)
         return replaceSeries(replacedUrls,
             /@import\s*["']([^"'\n]*?)["']/gi,
-            (_, url) => this.loadHref(url, href, parents)
+            (_, url) => this.loadHref(url, href, parents, options)
                 .then(url => `@import "${url}"`))
     }
     // find & replace all possible relative paths for all assets without parsing
-    replaceString(str, href, parents = []) {
+    replaceString(str, href, parents = [], options = {}) {
         const assetMap = new Map()
         const urls = this.assets.map(asset => {
             // do not replace references to the file itself
@@ -932,13 +977,18 @@ class Loader {
         const regex = new RegExp(urls.map(regexEscape).join('|'), 'g')
         return replaceSeries(str, regex, async match =>
             this.loadItem(assetMap.get(match.replace(/^\//, '')),
-                parents.concat(href)))
+                parents.concat(href), options))
     }
     unloadItem(item) {
         this.unref(item?.href)
     }
     destroy() {
         for (const url of this.#cache.values()) URL.revokeObjectURL(url)
+        this.#cache.clear()
+        this.#cacheBytes.clear()
+        this.#children.clear()
+        this.#refCount.clear()
+        this.#bytes = 0
     }
 }
 
@@ -967,11 +1017,20 @@ export class EPUB {
     parser = new DOMParser()
     #loader
     #encryption
-    constructor({ loadText, loadBlob, getSize, sha1 }) {
+    #resourceBudget
+    constructor({ loadText, loadBlob, getSize, sha1 }, { resourceBudget = DEFAULT_RESOURCE_BUDGET } = {}) {
         this.loadText = loadText
         this.loadBlob = loadBlob
         this.getSize = getSize
+        this.#resourceBudget = Number.isFinite(resourceBudget)
+            ? Math.max(0, resourceBudget) : DEFAULT_RESOURCE_BUDGET
         this.#encryption = new Encryption(deobfuscators(sha1))
+    }
+    get resourceBytes() {
+        return this.#loader?.bytes ?? 0
+    }
+    get resourceBudget() {
+        return this.#loader?.budget ?? this.#resourceBudget
     }
     async #loadXML(uri) {
         const str = await this.loadText(uri)
@@ -1007,7 +1066,9 @@ ${doc.querySelector('parsererror').innerText}`)
             loadText: this.loadText,
             loadBlob: uri => Promise.resolve(this.loadBlob(uri))
                 .then(this.#encryption.getDecoder(uri)),
+            getSize: this.getSize,
             resources: this.resources,
+            resourceBudget: this.#resourceBudget,
         })
         this.transformTarget = this.#loader.eventTarget
         this.sections = this.resources.spine.map((spineItem, index) => {
@@ -1019,7 +1080,7 @@ ${doc.querySelector('parsererror').innerText}`)
             }
             return {
                 id: item.href,
-                load: () => this.#loader.loadItem(item),
+                load: options => this.#loader.loadItem(item, [], options),
                 unload: () => this.#loader.unloadItem(item),
                 createDocument: () => this.loadDocument(item),
                 size: this.getSize(item.href),
