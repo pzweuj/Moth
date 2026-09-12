@@ -256,7 +256,9 @@ a { color: inherit; }
   .book-grid, .series-grid { gap: 18px 12px; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
   .series-info h4 { font-size: 14px; }
   .book-info h3 { font-size: 14px; }
-  .reader-titlebar { background: var(--app-bg); border-bottom: 0; gap: 3px; inset-inline: 0; min-height: 40px; padding: max(4px, env(safe-area-inset-top)) max(58px, calc(env(safe-area-inset-right) + 52px)) 4px max(6px, env(safe-area-inset-left)); position: absolute; top: 0; transition: opacity 160ms ease, transform 160ms ease, visibility 160ms ease; }
+  /* Keep the settings overlay below the 32px controls and safe-area padding. */
+  .reader-shell { --reader-titlebar-height: calc(36px + max(4px, env(safe-area-inset-top))); }
+  .reader-titlebar { background: var(--app-bg); border-bottom: 0; gap: 3px; height: var(--reader-titlebar-height); inset-inline: 0; min-height: var(--reader-titlebar-height); padding: max(4px, env(safe-area-inset-top)) max(58px, calc(env(safe-area-inset-right) + 52px)) 4px max(6px, env(safe-area-inset-left)); position: absolute; top: 0; transition: opacity 160ms ease, transform 160ms ease, visibility 160ms ease; }
   .toolbar-hidden .reader-titlebar { opacity: 0; pointer-events: none; transform: translateY(-8px); visibility: hidden; }
   .reader-titlebar strong { font-size: 14px; }
   .reader-titlebar .reader-control-button { height: 32px; min-height: 32px; padding-block: 0; }
@@ -271,11 +273,10 @@ a { color: inherit; }
   .reader-bottom-bar { background: transparent; border-top: 0; bottom: 0; left: 0; padding: 3px max(10px, env(safe-area-inset-right)) max(3px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); pointer-events: none; position: absolute; right: 0; z-index: 12; }
   .reader-bottom-bar .reader-control-button { display: none; }
   .reader-bottom-bar > span { min-width: 0; }
-  .reader-tools { gap: 8px; padding: 7px max(8px, env(safe-area-inset-right)) 7px max(8px, env(safe-area-inset-left)); }
+  .reader-tools { gap: 8px; inset-inline: 0; max-height: calc(100% - var(--reader-titlebar-height) - env(safe-area-inset-bottom)); overflow-y: auto; padding: 7px max(8px, env(safe-area-inset-right)) 7px max(8px, env(safe-area-inset-left)); position: absolute; top: var(--reader-titlebar-height); z-index: 34; }
   .reader-tools input[type="range"] { width: 82px; }
   .reader-drawer { max-width: 92vw; width: 340px; }
   .reader-page-drawer { width: min(520px, 92vw); }
-  .reader-tools { gap: 8px; }
 }
 
 @media (max-width: 420px) {
