@@ -49,6 +49,8 @@ pub struct AppState {
     /// Conversion jobs are keyed by content version rather than publication
     /// id so duplicate files share one generated EPUB and one in-flight task.
     pub conversion_jobs: Arc<Mutex<HashMap<String, ConversionState>>>,
+    /// Limit concurrent MOBI conversion tasks to bound CPU and memory usage.
+    pub conversion_tasks: Arc<Semaphore>,
     /// Bounds concurrent image decoding and encoding across cover and CBZ
     /// thumbnail requests. One permit covers source reads through cache writes.
     pub image_tasks: Arc<Semaphore>,
@@ -68,6 +70,7 @@ impl AppState {
             db,
             scan_status: Arc::new(Mutex::new(ScanStatus::default())),
             conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
+            conversion_tasks: Arc::new(Semaphore::new(1)),
             image_tasks: Arc::new(Semaphore::new(1)),
             dimension_tasks: Arc::new(Semaphore::new(1)),
             page_streams: Arc::new(Semaphore::new(2)),

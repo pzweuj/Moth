@@ -41,6 +41,8 @@ fn separator() -> &'static Regex {
 
 /// A paragraph break is one or more blank lines.
 const MAX_CHAPTER_CHARS: usize = 8_000;
+/// Safety threshold for an oversized heading chapter to prevent UI freeze.
+const MAX_HEADING_CHAPTER_CHARS: usize = 50_000;
 
 /// A chapter index generated while scanning a TXT file. The chapter body is
 /// written to the UTF-8 cache and is deliberately not retained here.
@@ -350,7 +352,33 @@ fn split_chapters(text: &str) -> Vec<(String, String)> {
         if body.trim().is_empty() && title.is_empty() {
             continue;
         }
-        chapters.push((title, body));
+        if use_headings && body.chars().count() > MAX_HEADING_CHAPTER_CHARS {
+            let sub_lines: Vec<&str> = body.lines().collect();
+            let mut sub_start = 0;
+            let mut sub_len = 0;
+            let mut part = 1;
+            for (line_idx, line) in sub_lines.iter().enumerate() {
+                if sub_len >= MAX_HEADING_CHAPTER_CHARS && line_idx > sub_start && !line.trim().is_empty() {
+                    let sub_title = if part == 1 { title.clone() } else { format!("{title} ({part})") };
+                    let sub_body = sub_lines[sub_start..line_idx].join("\n").trim_matches('\n').to_owned();
+                    chapters.push((sub_title, sub_body));
+                    sub_start = line_idx;
+                    sub_len = 0;
+                    part += 1;
+                }
+                if sub_len > 0 {
+                    sub_len += 1;
+                }
+                sub_len += line.encode_utf16().count();
+            }
+            if sub_start < sub_lines.len() {
+                let sub_title = if part == 1 { title.clone() } else { format!("{title} ({part})") };
+                let sub_body = sub_lines[sub_start..].join("\n").trim_matches('\n').to_owned();
+                chapters.push((sub_title, sub_body));
+            }
+        } else {
+            chapters.push((title, body));
+        }
     }
 
     if chapters.is_empty() {
@@ -683,6 +711,8 @@ fn build_indexed_cache(normalized: &Path, target: &Path) -> Result<TextIndex, Pa
     let mut line_index = 0usize;
     let mut chunk_start = 0usize;
     let mut chunk_length = 0usize;
+    let mut heading_base_title = String::new();
+    let mut heading_sub_index = 1usize;
 
     for_each_normalized_line(normalized, |line, _, _| {
         if has_heading {
@@ -691,10 +721,28 @@ fn build_indexed_cache(normalized: &Path, target: &Path) -> Result<TextIndex, Pa
                 if let Some(chapter) = open.take() {
                     chapter.finish(&mut cache, &mut chapters)?;
                 }
+                heading_base_title = trimmed.to_owned();
+                heading_sub_index = 1;
                 open = Some(OpenChapter::start(&mut cache, trimmed.to_owned(), true)?);
             } else if !separator().is_match(line) {
                 if open.is_none() {
+                    heading_base_title = String::new();
+                    heading_sub_index = 1;
                     open = Some(OpenChapter::start(&mut cache, String::new(), false)?);
+                }
+                if let Some(chapter) = open.as_mut()
+                    && chapter.character_count >= MAX_HEADING_CHAPTER_CHARS as i64
+                    && !line.trim().is_empty()
+                {
+                    let prev = open.take().unwrap();
+                    prev.finish(&mut cache, &mut chapters)?;
+                    heading_sub_index += 1;
+                    let sub_title = if heading_base_title.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{heading_base_title} ({heading_sub_index})")
+                    };
+                    open = Some(OpenChapter::start(&mut cache, sub_title, true)?);
                 }
                 if let Some(chapter) = open.as_mut() {
                     chapter.push_line(&mut cache, line)?;
@@ -1082,5 +1130,25 @@ mod tests {
         let text = format!("{}界", "a".repeat(64 * 1024 - 1));
         std::fs::write(&source, text).expect("UTF-8 fixture");
         assert_streaming_matches_legacy(&source, Some("utf-8"));
+    }
+
+    #[test]
+    fn subchunks_oversized_heading_chapters() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let source = dir.path().join("oversized.txt");
+        let line = "字".repeat(100);
+        let count = (MAX_HEADING_CHAPTER_CHARS / 100) + 10;
+        let mut text = String::from("第一章 开端\n\n");
+        for _ in 0..count {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(&source, &text).expect("oversized fixture");
+        assert_streaming_matches_legacy(&source, None);
+        let target = dir.path().join("target.utf8");
+        let index = write_indexed_cache(&source, None, &target).expect("index");
+        assert!(index.chapters.len() >= 2);
+        assert_eq!(index.chapters[0].title, "第一章 开端");
+        assert_eq!(index.chapters[1].title, "第一章 开端 (2)");
     }
 }

@@ -1326,13 +1326,26 @@ pub async fn start_conversion(
         jobs.insert(version.clone(), ConversionState::Preparing);
     }
     let jobs = Arc::clone(&state.conversion_jobs);
+    let conversion_tasks = Arc::clone(&state.conversion_tasks);
     let source = row.root.join(&row.relative_path);
     let dir = state.mobi_dir(&version);
     tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || convert_mobi(&source, &dir))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|value| value.map_err(|error| error.to_string()));
+        let permit = match conversion_tasks.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                let mut jobs = jobs.lock().await;
+                *jobs.entry(version).or_insert(ConversionState::Preparing) =
+                    ConversionState::Failed(error.to_string());
+                return;
+            }
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            convert_mobi(&source, &dir)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|value| value.map_err(|error| error.to_string()));
         let mut jobs = jobs.lock().await;
         *jobs.entry(version).or_insert(ConversionState::Preparing) = match result {
             Ok(()) => ConversionState::Ready,

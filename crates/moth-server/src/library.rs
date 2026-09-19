@@ -177,7 +177,13 @@ pub async fn browse(
     _user: Authenticated,
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, AppError> {
-    ensure_directory(&state.db, Path::new("")).await?;
+    let root_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM directories WHERE relative_path='')")
+            .fetch_one(&state.db)
+            .await?;
+    if !root_exists {
+        ensure_directory(&state.db, Path::new("")).await?;
+    }
     let path = normalize_relative(query.path.as_deref().unwrap_or(""))?;
     let directory_id: i64 =
         sqlx::query_scalar("SELECT id FROM directories WHERE relative_path = ?")
@@ -807,15 +813,19 @@ async fn store_publication(
             .await?;
         id
     };
-    if format == BookFormat::Cbz {
-        for (idx, page) in pages.iter().enumerate() {
-            sqlx::query("INSERT INTO cbz_pages (publication_id,idx,path,mime) VALUES (?,?,?,?)")
-                .bind(publication_id)
-                .bind(idx as i64)
-                .bind(&page.path)
-                .bind(&page.mime)
-                .execute(&mut *tx)
-                .await?;
+    if format == BookFormat::Cbz && !pages.is_empty() {
+        for (chunk_idx, chunk) in pages.chunks(100).enumerate() {
+            let base_idx = chunk_idx * 100;
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO cbz_pages (publication_id, idx, path, mime) ",
+            );
+            builder.push_values(chunk.iter().enumerate(), |mut b, (offset, page)| {
+                b.push_bind(publication_id)
+                    .push_bind((base_idx + offset) as i64)
+                    .push_bind(&page.path)
+                    .push_bind(&page.mime);
+            });
+            builder.build().execute(&mut *tx).await?;
         }
     }
     if format == BookFormat::Txt
@@ -917,17 +927,25 @@ async fn insert_text_index(
     encoding: &str,
     index: moth_format::txt::TextIndex,
 ) -> Result<(), AppError> {
-    for (idx, chapter) in index.chapters.into_iter().enumerate() {
-        sqlx::query("INSERT INTO text_chapters (publication_id,encoding,idx,title,byte_start,byte_end,character_count) VALUES (?,?,?,?,?,?,?) ON CONFLICT(publication_id,encoding,idx) DO UPDATE SET title=excluded.title,byte_start=excluded.byte_start,byte_end=excluded.byte_end,character_count=excluded.character_count")
-            .bind(id)
-            .bind(encoding)
-            .bind(idx as i64)
-            .bind(chapter.title)
-            .bind(chapter.byte_start)
-            .bind(chapter.byte_end)
-            .bind(chapter.character_count)
-            .execute(&mut **tx)
-            .await?;
+    if index.chapters.is_empty() {
+        return Ok(());
+    }
+    for (chunk_idx, chunk) in index.chapters.chunks(50).enumerate() {
+        let base_idx = chunk_idx * 50;
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO text_chapters (publication_id,encoding,idx,title,byte_start,byte_end,character_count) ",
+        );
+        builder.push_values(chunk.iter().enumerate(), |mut b, (offset, chapter)| {
+            b.push_bind(id)
+                .push_bind(encoding)
+                .push_bind((base_idx + offset) as i64)
+                .push_bind(&chapter.title)
+                .push_bind(chapter.byte_start)
+                .push_bind(chapter.byte_end)
+                .push_bind(chapter.character_count);
+        });
+        builder.push(" ON CONFLICT(publication_id,encoding,idx) DO UPDATE SET title=excluded.title,byte_start=excluded.byte_start,byte_end=excluded.byte_end,character_count=excluded.character_count");
+        builder.build().execute(&mut **tx).await?;
     }
     Ok(())
 }

@@ -926,18 +926,32 @@ class Loader {
             for (const el of doc.querySelectorAll('[style]'))
                 el.setAttribute('style',
                     await this.replaceCSS(el.getAttribute('style'), href, parents, options))
+            // Strip any script elements and inline on* event handlers from untrusted EPUB XHTML
+            for (const el of doc.querySelectorAll('script')) el.remove()
+            for (const el of doc.querySelectorAll('*')) {
+                for (const attr of Array.from(el.attributes)) {
+                    if (attr.name.toLowerCase().startsWith('on')) {
+                        el.removeAttribute(attr.name)
+                    }
+                }
+            }
             // The parent application must allow host-installed event handlers
             // in WebKit, but book scripts and network access remain disabled.
             // All referenced assets have already been rewritten to blob/data
             // URLs above, so this policy preserves layout without executing
             // untrusted EPUB code.
-            if (doc.head) {
+            // Ensure head element exists for CSP injection even if the XHTML document omits <head>.
+            let head = doc.head
+            if (!head && doc.documentElement) {
+                head = doc.createElement('head')
+                doc.documentElement.prepend(head)
+            }
+            if (head) {
                 const policy = doc.createElement('meta')
                 policy.setAttribute('http-equiv', 'Content-Security-Policy')
                 policy.setAttribute('content', "default-src 'none'; script-src 'none'; connect-src 'none'; img-src blob: data:; style-src blob: data: 'unsafe-inline'; font-src blob: data:; media-src blob: data:; frame-src 'none'; object-src 'none'; base-uri 'none'")
-                doc.head.prepend(policy)
+                head.prepend(policy)
             }
-            // TODO: replace inline scripts? probably not worth the trouble
             const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent, options)
         }
