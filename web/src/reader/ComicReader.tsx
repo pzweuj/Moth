@@ -20,7 +20,7 @@ type Props = {
   onKeyboardAction?: (action: ReaderKeyboardAction) => boolean;
 };
 
-import { installPageGestures } from "./pageGestures";
+import { installPageGestures, type PageGestureState } from "./pageGestures";
 
 type PagePosition = { page: number; progress: number };
 
@@ -76,11 +76,19 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   const keyboardEnabledRef = useRef(keyboardEnabled);
   const onKeyboardActionRef = useRef(onKeyboardAction);
   const keyboardTurnRef = useRef(false);
+  const onCenterTapRef = useRef(onCenterTap);
+  const moveRef = useRef<(delta: number) => void>(() => undefined);
+  const settingsRef = useRef(settings);
+  // The browser's compatibility click is delayed and arrives after a tap has
+  // already rerendered the reader. This timestamp has to survive that reinstall.
+  const gestureStateRef = useRef<PageGestureState>({ lastTouch: -Infinity });
 
   useEffect(() => { onProgressRef.current = onProgress; }, [onProgress]);
   useEffect(() => { onCurrentPageChangeRef.current = onCurrentPageChange; }, [onCurrentPageChange]);
   useEffect(() => { keyboardEnabledRef.current = keyboardEnabled; }, [keyboardEnabled]);
   useEffect(() => { onKeyboardActionRef.current = onKeyboardAction; }, [onKeyboardAction]);
+  useEffect(() => { onCenterTapRef.current = onCenterTap; }, [onCenterTap]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { indexRef.current = index; }, [index]);
   useEffect(() => { onCurrentPageChangeRef.current(index); }, [index]);
 
@@ -346,6 +354,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     setImageLoading(true);
     setIndex(page);
   }, [onAdvanceAtEnd, onPageTurn, pageCount, settings.mode]);
+  moveRef.current = move;
 
   const retryPage = (page: number) => {
     setFailed((current) => {
@@ -411,17 +420,19 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   useEffect(() => {
     const content = contentRef.current;
     if (!content) return;
-    const left = () => move(settings.direction === "rtl" ? step : -step);
-    const right = () => move(settings.direction === "rtl" ? -step : step);
+    const stepOf = () => settingsRef.current.mode === "double" ? 2 : 1;
+    const left = () => moveRef.current(settingsRef.current.direction === "rtl" ? stepOf() : -stepOf());
+    const right = () => moveRef.current(settingsRef.current.direction === "rtl" ? -stepOf() : stepOf());
     return installPageGestures(content, {
-      enabled: () => settings.mode !== "webtoon",
+      state: gestureStateRef.current,
+      enabled: () => settingsRef.current.mode !== "webtoon",
       centerEnabled: () => true,
       bounds: () => content.getBoundingClientRect(),
       left, right,
-      center: onCenterTap,
+      center: () => onCenterTapRef.current?.(),
       swipe: (direction) => direction === "left" ? right() : left(),
     });
-  }, [move, onCenterTap, settings.direction, settings.mode, step]);
+  }, []);
 
   return <div className={`reader-stage comic-reader comic-${settings.mode} comic-${settings.fit}`} dir={settings.direction}>
     <div className="reader-content" ref={contentRef}>

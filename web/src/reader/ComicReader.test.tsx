@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState, type ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { ComicReader } from "./ComicReader";
 import type { BookDetail } from "../api";
-import type { ComponentProps } from "react";
 
 const detail = {
   id: 7,
@@ -22,6 +22,15 @@ const detail = {
 } as BookDetail;
 
 const settings = { mode: "single", direction: "ltr", fit: "screen" } as const;
+
+function mockContentBounds() {
+  const content = document.querySelector<HTMLDivElement>(".reader-content");
+  if (!content) throw new Error("missing reader content");
+  content.getBoundingClientRect = () => ({ left: 0, right: 1000, top: 0, bottom: 700, width: 1000, height: 700, x: 0, y: 0, toJSON: () => ({}) });
+  return content;
+}
+
+const touch = (x: number, y = 200) => ({ identifier: 1, clientX: x, clientY: y });
 
 describe("ComicReader page navigation", () => {
   it("loads a newly selected page without remounting", async () => {
@@ -88,6 +97,48 @@ describe("ComicReader page navigation", () => {
     props = { ...props, settings };
     rerender(<ComicReader {...props} />);
     expect(screen.getByAltText("第 3 页")).toBeInTheDocument();
+  });
+
+  it("keeps a center tap after the toolbar rerenders and ignores the delayed click", () => {
+    function Host() {
+      const [open, setOpen] = useState(false);
+      return <>
+        <div data-testid="toolbar">{open ? "shown" : "hidden"}</div>
+        <ComicReader detail={detail} settings={settings} navigationRequest={null} onProgress={vi.fn()} onCurrentPageChange={vi.fn()} onCenterTap={() => setOpen((value) => !value)} onPageTurn={() => setOpen(false)} />
+      </>;
+    }
+    render(<Host />);
+    const content = mockContentBounds();
+    const point = touch(500);
+    fireEvent.touchStart(content, { touches: [point], changedTouches: [point] });
+    fireEvent.touchEnd(content, { touches: [], changedTouches: [point] });
+    fireEvent.click(content, { clientX: 500, clientY: 200 });
+    expect(screen.getByTestId("toolbar")).toHaveTextContent("shown");
+    expect(screen.getByAltText("第 1 页")).toBeInTheDocument();
+  });
+
+  it("turns one page when a touch rerenders the reader before its compatibility click", () => {
+    function Host() {
+      const [, setTick] = useState(0);
+      return <ComicReader detail={detail} settings={settings} navigationRequest={null} onProgress={vi.fn()} onCurrentPageChange={vi.fn()} onPageTurn={() => setTick((value) => value + 1)} />;
+    }
+    render(<Host />);
+    const content = mockContentBounds();
+    const point = touch(900);
+    fireEvent.touchStart(content, { touches: [point], changedTouches: [point] });
+    fireEvent.touchEnd(content, { touches: [], changedTouches: [point] });
+    fireEvent.click(content, { clientX: 900, clientY: 200 });
+    expect(screen.getByAltText("第 2 页")).toBeInTheDocument();
+    expect(screen.queryByAltText("第 3 页")).not.toBeInTheDocument();
+  });
+
+  it("applies a later reading direction without reinstalling the gesture listener", () => {
+    const props = { detail, settings, navigationRequest: null, onProgress: vi.fn(), onCurrentPageChange: vi.fn() };
+    const { rerender } = render(<ComicReader {...props} />);
+    const content = mockContentBounds();
+    rerender(<ComicReader {...props} settings={{ ...settings, direction: "rtl" }} />);
+    fireEvent.click(content, { clientX: 100, clientY: 200 });
+    expect(screen.getByAltText("第 2 页")).toBeInTheDocument();
   });
 
   it("turns one spread per RTL touch and ignores its synthetic click", () => {
