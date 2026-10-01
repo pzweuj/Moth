@@ -79,6 +79,8 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
   const onCenterTapRef = useRef(onCenterTap);
   const moveRef = useRef<(delta: number) => void>(() => undefined);
   const settingsRef = useRef(settings);
+  const updateWebtoonProgressRef = useRef<() => void>(() => undefined);
+  const paginatedRestoreKeyRef = useRef("");
   // The browser's compatibility click is delayed and arrives after a tap has
   // already rerendered the reader. This timestamp has to survive that reinstall.
   const gestureStateRef = useRef<PageGestureState>({ lastTouch: -Infinity });
@@ -231,6 +233,8 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
     });
   }, [failed, imageLoading, onReadingStateChange, pageCount, settings.direction, updateWebtoonWindow]);
 
+  useEffect(() => { updateWebtoonProgressRef.current = updateWebtoonProgress; }, [updateWebtoonProgress]);
+
   useEffect(() => {
     if (settings.mode !== "webtoon") return;
     const container = contentRef.current;
@@ -322,6 +326,78 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
       progress: clampProgress((Math.min(pageCount - 1, index + (settings.mode === "double" ? 1 : 0)) + 1) / pageCount),
     });
   }, [index, pageCount, settings.mode]);
+
+  const publishPaginatedProgress = useCallback((pageProgress: number) => {
+    if (settingsRef.current.mode === "webtoon" || !pageCount) return;
+    const page = indexRef.current;
+    const progress = clampProgress(pageProgress);
+    positionRef.current = { page, progress };
+    const lastPage = Math.min(pageCount - 1, page + (settingsRef.current.mode === "double" ? 1 : 0));
+    onProgressRef.current({
+      type: "cbz",
+      page_index: page,
+      page_progress: progress,
+      progress: clampProgress((lastPage + 1) / pageCount),
+    });
+  }, [pageCount]);
+
+  const restorePaginatedScroll = useCallback(() => {
+    if (settingsRef.current.mode === "webtoon") return;
+    const container = contentRef.current;
+    if (!container) return;
+    const page = indexRef.current;
+    const key = `${settingsRef.current.mode}:${settingsRef.current.fit}:${page}`;
+    if (paginatedRestoreKeyRef.current === key) return;
+    const progress = positionRef.current.page === page ? positionRef.current.progress : 0;
+    const maximum = Math.max(0, container.scrollHeight - container.clientHeight);
+    if (progress > 0 && maximum <= 0) return;
+    if (maximum > 0) container.scrollTop = Math.min(maximum, maximum * progress);
+    paginatedRestoreKeyRef.current = key;
+  }, []);
+
+  useEffect(() => { paginatedRestoreKeyRef.current = ""; }, [index, settings.fit, settings.mode]);
+
+  useEffect(() => {
+    if (settings.mode === "webtoon") return;
+    restorePaginatedScroll();
+    const frame = window.requestAnimationFrame(restorePaginatedScroll);
+    return () => window.cancelAnimationFrame(frame);
+  }, [index, measuredSizes, restorePaginatedScroll, settings.fit, settings.mode]);
+
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container) return;
+    let frame: number | null = null;
+    const commit = () => {
+      if (settingsRef.current.mode === "webtoon") return;
+      const maximum = Math.max(0, container.scrollHeight - container.clientHeight);
+      publishPaginatedProgress(maximum <= 0 ? 0 : container.scrollTop / maximum);
+    };
+    const onScroll = () => {
+      if (settingsRef.current.mode === "webtoon" || frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        commit();
+      });
+    };
+    // Capture runs before the progress saver's bubble listener, so the latest
+    // scroll position is dirty before that listener flushes it.
+    const onPageHide = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        frame = null;
+      }
+      if (settingsRef.current.mode === "webtoon") updateWebtoonProgressRef.current();
+      else commit();
+    };
+    container.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("pagehide", onPageHide, true);
+    return () => {
+      container.removeEventListener("scroll", onScroll);
+      window.removeEventListener("pagehide", onPageHide, true);
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
+  }, [publishPaginatedProgress]);
 
   const move = useCallback((delta: number) => {
     if (!pageCount) return;
@@ -478,6 +554,7 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
                         container.scrollTop += after - before;
                       }
                       updateWebtoonWindow();
+                      restorePaginatedScroll();
                       const restore = pendingScrollRef.current?.page === page
                         ? pendingScrollRef.current
                         : page === indexRef.current ? positionRef.current : null;
@@ -485,6 +562,9 @@ export function ComicReader({ detail, progress, settings, navigationRequest, onC
                     });
                   } else if (settings.mode === "webtoon" && pendingScrollRef.current?.page === page) {
                     scheduleWebtoonRestore(pendingScrollRef.current);
+                  } else {
+                    restorePaginatedScroll();
+                    window.requestAnimationFrame(restorePaginatedScroll);
                   }
                 }} onError={() => {
                   if (settings.mode !== "webtoon" || page === indexRef.current) setImageLoading(false);

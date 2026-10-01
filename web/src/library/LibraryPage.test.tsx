@@ -113,6 +113,13 @@ describe("library navigation", () => {
     expect(screen.queryByText("第一卷")).not.toBeInTheDocument();
   });
 
+  it("shows a parse failure without treating the book as a metadata task", async () => {
+    vi.mocked(api.home).mockResolvedValue({ ...home, continue_reading: [{ ...book, parse_status: "error" }] });
+    renderLibrary();
+    expect(await screen.findByText("无法解析 · 打开后可重试")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /第一卷/ })).toHaveAttribute("href", "/reader/1");
+  });
+
   it("shows genuine scan progress without clearing books, then refreshes on completion", async () => {
     vi.useFakeTimers();
     renderLibrary();

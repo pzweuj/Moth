@@ -205,7 +205,7 @@ function Section({ title, books, loading }: { title: string; books: PublicationS
 function BookGrid({ books, loading, showEmpty = true }: { books: PublicationSummary[]; loading: boolean; showEmpty?: boolean }) {
   if (loading) return null;
   if (books.length === 0) return showEmpty ? <p className="shelf-hint">这里还没有书。</p> : null;
-  return <div className="book-grid">{books.map((book) => <Link className="book-card" to={`/reader/${book.id}`} key={book.id}><div className="book-cover">{book.cover_url ? <img src={book.cover_url} alt="" loading="lazy" /> : <span>{book.source_format.toUpperCase()}</span>}</div><div className="book-info"><h3>{book.title}</h3><p>{book.author || "未知作者"}</p><small>{Math.round(book.progress * 100)}% · {book.directory_path || "书库"}</small></div></Link>)}</div>;
+  return <div className="book-grid">{books.map((book) => <Link className={`book-card${book.parse_status === "ok" ? "" : " book-card--unreadable"}`} to={`/reader/${book.id}`} key={book.id}><div className="book-cover">{book.cover_url ? <img src={book.cover_url} alt="" loading="lazy" /> : <span>{book.source_format.toUpperCase()}</span>}</div><div className="book-info"><h3>{book.title}</h3><p>{book.author || "未知作者"}</p><small>{book.parse_status === "ok" ? `${Math.round(book.progress * 100)}% · ${book.directory_path || "书库"}` : "无法解析 · 打开后可重试"}</small></div></Link>)}</div>;
 }
 
 function LibrarySearch({ query, includeHidden, onQueryChange, onIncludeHiddenChange, onSubmit }: { query: string; includeHidden: boolean; onQueryChange: (value: string) => void; onIncludeHiddenChange: (value: boolean) => void; onSubmit: () => void }) {

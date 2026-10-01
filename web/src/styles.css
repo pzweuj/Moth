@@ -121,6 +121,7 @@ a { color: inherit; }
 .breadcrumbs a:not(:last-child)::after { color: var(--app-muted); content: " /"; margin-left: 8px; }
 .book-grid { display: grid; gap: 22px 16px; grid-template-columns: repeat(auto-fill, minmax(144px, 1fr)); margin-inline: auto; max-width: 1180px; }
 .book-card { min-width: 0; text-decoration: none; }
+.book-card--unreadable .book-info small { color: var(--app-danger); }
 .book-cover { aspect-ratio: 2 / 3; background: var(--app-surface-muted); border: 1px solid var(--app-border); border-radius: 8px; display: grid; place-items: center; overflow: hidden; }
 .book-cover img { height: 100%; object-fit: cover; width: 100%; }
 .book-cover span { color: var(--app-accent); font: 700 13px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .12em; }

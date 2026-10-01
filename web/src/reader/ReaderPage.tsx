@@ -8,6 +8,7 @@ import { loadComicSettings, loadSettings, saveComicSettings, saveSettings, type 
 import { useProgressSaver } from "./useProgressSaver";
 import type { ReaderReadingState } from "./readingState";
 import type { ReaderKeyboardAction } from "./keyboard";
+import { chromeAfterCenterTap } from "./chrome";
 
 type Theme = "light" | "dark";
 type Props = { theme: Theme; onToggleTheme: () => void };
@@ -244,6 +245,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
       latestPositionRef.current = finalPosition;
       setProgress({ content_version: detail.content_version, position: finalPosition });
       saveProgress(finalPosition, detail.content_version);
+      void flush();
     }
     setSettingsOpen(false);
     setNavigationOpen(false);
@@ -252,7 +254,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
     setReadingState((current) => ({ ...current, progress: 1, atEnd: true, loading: false }));
     setCompletion({ loading: true, nextBook: null, error: "", advancing: false });
     void loadNextBook();
-  }, [detail, loadNextBook, progress, saveProgress]);
+  }, [detail, flush, loadNextBook, progress, saveProgress]);
 
   const advanceToNextBook = useCallback(async () => {
     const nextBook = completion?.nextBook;
@@ -310,12 +312,15 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   }, [advanceToNextBook, completion, readingState.direction, returnToLastPage]);
 
   const toggleToolbar = () => {
-    if (!isMobileViewport()) return;
-    if (settingsOpen || navigationOpen) {
-      setToolbarVisible(true);
-      return;
-    }
-    setToolbarVisible((value) => !value);
+    const next = chromeAfterCenterTap({
+      mobile: isMobileViewport(),
+      toolbarVisible,
+      settingsOpen,
+      navigationOpen,
+    });
+    setToolbarVisible(next.toolbarVisible);
+    setSettingsOpen(next.settingsOpen);
+    setNavigationOpen(next.navigationOpen);
   };
   const hideToolbar = (force = false) => {
     if (!isMobileViewport() || (!force && (settingsOpen || navigationOpen))) return;
@@ -371,6 +376,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
 
   if (error) return <main className="state-screen"><h1>打开失败</h1><p>{error}</p><div><button className="primary-button" type="button" onClick={retryOpen}>重试</button><button className="quiet-button" type="button" onClick={() => navigate(-1)}>返回书库</button></div></main>;
   if (!detail) return <main className="state-screen"><p>{loadingStage}…</p></main>;
+  if (detail.parse_status !== "ok") return <main className="state-screen"><h1>无法解析</h1><p>这本书没能读入。返回书库重新扫描后，可以再试一次。</p><div><button className="primary-button" type="button" onClick={retryOpen}>重试</button><button className="quiet-button" type="button" onClick={() => navigate(-1)}>返回书库</button></div></main>;
 
   return <main className={`reader-shell ${toolbarVisible ? "toolbar-visible" : "toolbar-hidden"}`}>
     <MobileClock />

@@ -153,6 +153,23 @@ describe("ComicReader page navigation", () => {
     expect(screen.queryByAltText("第 1 页")).not.toBeInTheDocument();
   });
 
+  it("restores paginated scroll and saves the position before the page hides", () => {
+    const onProgress = vi.fn();
+    const progress = { content_version: "v1", position: { type: "cbz" as const, page_index: 0, page_progress: 0.5, progress: 1 / 3 } };
+    const { rerender } = render(<ComicReader detail={detail} progress={progress} settings={settings} navigationRequest={null} onProgress={onProgress} onCurrentPageChange={vi.fn()} />);
+    const content = mockContentBounds();
+    Object.defineProperty(content, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(content, "clientHeight", { configurable: true, value: 400 });
+    let scrollTop = 0;
+    Object.defineProperty(content, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = value; } });
+    rerender(<ComicReader detail={detail} progress={progress} settings={{ ...settings, fit: "width" }} navigationRequest={null} onProgress={onProgress} onCurrentPageChange={vi.fn()} />);
+    expect(scrollTop).toBe(300);
+    scrollTop = 150;
+    fireEvent.scroll(content);
+    fireEvent(window, new Event("pagehide"));
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ page_index: 0, page_progress: 0.25 }));
+  });
+
   it("keeps webtoon placeholders while unloading distant images", async () => {
     const pages = Array.from({ length: 30 }, (_, idx) => ({ idx, path: `${idx}.jpg`, mime: "image/jpeg", width: 100, height: 100 }));
     const webtoonDetail = { ...detail, pages } as BookDetail;
