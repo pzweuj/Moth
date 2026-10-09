@@ -13,8 +13,14 @@ use regex::Regex;
 
 use crate::ParseError;
 
-/// Chapter heading markers, checked case-insensitively against a line. CJK
-/// covers 第N章/节/回/卷/部/篇; Latin covers chapter/part/volume/book/section.
+/// Bump when chapter boundary rules change. The server mixes this into the
+/// TXT content version so an already scanned book rebuilds its cache and
+/// drops locators that pointed at the old splits.
+pub const CHAPTER_INDEX_VERSION: &str = "cjk-sep-1";
+
+/// Chapter heading markers, checked case-insensitively against a line. Latin
+/// covers chapter/part/volume/book/section. CJK chapters are separate: the
+/// token itself must be bounded by separators.
 fn chapter_marker() -> &'static Regex {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     MARKER.get_or_init(|| {
@@ -23,14 +29,31 @@ fn chapter_marker() -> &'static Regex {
     })
 }
 
+/// A line is a Chinese chapter only when the token is bounded on both sides.
+///
+/// `第三十章 标题`, `第三十章：标题`, and `【第三十章】标题` match: a line
+/// boundary counts as a separator, and so does punctuation around the token.
+/// `第三十章标题` does not, because the title is glued to `章`. Volume lines
+/// such as `第一卷` or `卷一` are not chapters. `第二十一章` and `第廿一章`
+/// are the same chapter number written with different numerals.
 fn cjk_marker() -> &'static Regex {
     static MARKER: OnceLock<Regex> = OnceLock::new();
     MARKER.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?:第\s*[0-9０-９一二三四五六七八九十百千零〇]+\s*[章节回卷部篇]|卷\s*[0-9０-９一二三四五六七八九十百千零〇]+|楔子|序章|序言|终章|终回|番外(?:篇|章)?|后记|尾声|引子)",
-        )
+        Regex::new(concat!(
+            r"^[\s\p{P}\p{S}]*",
+            r"(?:第\s*",
+            r"[0-9０-９〇○零Ｏ一二三四五六七八九十百千万亿两廿卅卌壹贰貳叁參叄肆伍陆陸柒捌玖拾佰仟]+",
+            r"\s*(?:章节|[章回节])",
+            r"|楔子|序章|序言|终章|终回|番外(?:篇|章)?|后记|尾声|引子)",
+            r"(?:[\s\p{P}\p{S}]+.*)?$",
+        ))
         .expect("cjk marker")
     })
+}
+
+fn is_chapter_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && (chapter_marker().is_match(trimmed) || cjk_marker().is_match(trimmed))
 }
 
 /// A horizontal rule used to separate sections, e.g. `----` or `* * *`.
@@ -55,7 +78,8 @@ pub struct TextChapter {
 }
 
 /// Result of the streaming TXT scanner. `title` is the first non-empty
-/// heading, when one exists; callers use the filename as a fallback.
+/// heading, when one exists. The publication title shown in the library is
+/// the filename, not this heading.
 #[derive(Debug, Clone)]
 pub struct TextIndex {
     pub title: Option<String>,
@@ -288,7 +312,7 @@ fn normalize(text: &str) -> String {
 }
 
 /// Split decoded text into `(title, body)` chapters. Heading markers
-/// (`第N章`, `Chapter N`, ...) start chapters; without them, separator rules
+/// (`第N章 标题`, `Chapter N`, ...) start chapters; without them, separator rules
 /// (`----`, `* * *`) split sections; with neither, the text is chunked into
 /// fixed-size pieces so the reader can still paginate. When a chapter has a
 /// title, that title is removed from the body so the reader can render it
@@ -306,7 +330,7 @@ fn split_chapters(text: &str) -> Vec<(String, String)> {
         if trimmed.is_empty() {
             continue;
         }
-        if chapter_marker().is_match(trimmed) || cjk_marker().is_match(trimmed) {
+        if is_chapter_heading(trimmed) {
             heading_cuts.push(index);
         } else if separator().is_match(line) {
             // The rule belongs to the section it ends; the next chapter starts
@@ -473,7 +497,7 @@ fn scan_flags(path: &Path) -> Result<(bool, bool, bool), ParseError> {
     for_each_normalized_line(path, |line, _, _| {
         let trimmed = line.trim();
         has_non_whitespace |= !trimmed.is_empty();
-        if chapter_marker().is_match(trimmed) || cjk_marker().is_match(trimmed) {
+        if is_chapter_heading(trimmed) {
             has_heading = true;
         }
         if separator().is_match(line) {
@@ -717,7 +741,7 @@ fn build_indexed_cache(normalized: &Path, target: &Path) -> Result<TextIndex, Pa
     for_each_normalized_line(normalized, |line, _, _| {
         if has_heading {
             let trimmed = line.trim();
-            if chapter_marker().is_match(trimmed) || cjk_marker().is_match(trimmed) {
+            if is_chapter_heading(trimmed) {
                 if let Some(chapter) = open.take() {
                     chapter.finish(&mut cache, &mut chapters)?;
                 }
@@ -892,8 +916,7 @@ fn is_heading(text: &str) -> bool {
         return false;
     }
     // A heading has no sentence-ending punctuation.
-    !text.ends_with(['。', '.', '！', '!', '？', '?', ';', '；'])
-        && (text.starts_with("第") || chapter_marker().is_match(text))
+    !text.ends_with(['。', '.', '！', '!', '？', '?', ';', '；']) && is_chapter_heading(text)
 }
 
 fn escape_html(text: &str) -> String {
@@ -964,15 +987,94 @@ mod tests {
 
     #[test]
     fn detects_common_cjk_special_chapters() {
-        let text =
-            "卷一 初遇\n\n甲\n\n楔子\n\n乙\n\n番外篇\n\n丙\n\n终章\n\n丁\n\n第一章出发\n\n戊";
+        let text = "楔子\n\n甲\n\n番外篇\n\n乙\n\n终章\n\n丙";
         let chapters = split_chapters(text);
-        assert_eq!(chapters.len(), 5);
-        assert_eq!(chapters[0].0, "卷一 初遇");
-        assert_eq!(chapters[1].0, "楔子");
-        assert_eq!(chapters[2].0, "番外篇");
-        assert_eq!(chapters[3].0, "终章");
-        assert_eq!(chapters[4].0, "第一章出发");
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(chapters[0].0, "楔子");
+        assert_eq!(chapters[1].0, "番外篇");
+        assert_eq!(chapters[2].0, "终章");
+        assert_eq!(chapters[0].1, "甲");
+    }
+
+    #[test]
+    fn keeps_only_delimited_cjk_chapters() {
+        let text = "\
+第一卷 起始
+
+简介里写过第三十章标题这种句子。
+
+第二十一章 风起
+
+甲
+
+【第三十章】云涌
+
+乙
+
+第三十章标题XXXX
+
+丙
+
+第廿一章：旧写法
+
+丁
+
+第两百二十一章　决战
+
+戊
+
+第21章 数字
+
+己
+
+第一章出发
+
+庚";
+        let chapters = split_chapters(text);
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "",
+                "第二十一章 风起",
+                "【第三十章】云涌",
+                "第廿一章：旧写法",
+                "第两百二十一章　决战",
+                "第21章 数字",
+            ]
+        );
+        assert!(chapters[0].1.contains("第一卷 起始"));
+        assert!(chapters[0].1.contains("第三十章标题这种句子"));
+        assert_eq!(chapters[1].1, "甲");
+        assert!(chapters[2].1.contains("乙"));
+        assert!(chapters[2].1.contains("第三十章标题XXXX"));
+        assert!(chapters[2].1.contains("丙"));
+        assert!(!chapters[2].1.contains("第二十一章"));
+        assert_eq!(chapters[3].1, "丁");
+        assert_eq!(chapters[4].1, "戊");
+        assert!(chapters[5].1.contains("己"));
+        assert!(chapters[5].1.contains("第一章出发"));
+        assert!(chapters[5].1.contains("庚"));
+        assert!(!chapters.iter().any(|(title, _)| title.contains('卷')));
+
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let source = dir.path().join("cjk.txt");
+        std::fs::write(&source, text).expect("fixture");
+        let target = dir.path().join("book.utf8");
+        let index = write_indexed_cache(&source, Some("utf-8"), &target).expect("index");
+        assert_eq!(
+            index
+                .chapters
+                .iter()
+                .map(|chapter| chapter.title.as_str())
+                .collect::<Vec<_>>(),
+            chapters
+                .iter()
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

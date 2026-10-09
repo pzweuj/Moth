@@ -1,7 +1,7 @@
 import { test, expect, login, waitForScan } from "./fixtures";
 import { unlink, writeFile } from "node:fs/promises";
 
-type HomePublication = { id: number; title: string; source_format: string; reader_format: string; content_version?: string };
+type HomePublication = { id: number; title: string; filename?: string; directory_path?: string; source_format: string; reader_format: string; content_version?: string };
 
 async function homePublications(page: Parameters<typeof login>[0], url: string): Promise<HomePublication[]> {
   const home = await (await page.request.get(`${url}/api/v1/home`)).json() as { directories: Array<{ series: Array<{ representative: HomePublication | null }> }> };
@@ -166,10 +166,10 @@ test("TXT uses one heading, encoding-specific chapters, and keepalive recovery",
   await login(page, app.url);
   await waitForScan(page, app.url);
   const publications = await homePublications(page, app.url);
-  const txt = publications.find((publication) => publication.source_format === "txt" && publication.title.includes("夜色入海"));
-  const legacy = publications.find((publication) => publication.source_format === "txt" && publication.title.includes("Legacy GBK"));
-  expect(txt).toBeTruthy();
-  expect(legacy).toBeTruthy();
+  const txt = publications.find((publication) => publication.source_format === "txt" && publication.directory_path?.includes("夜色入海"));
+  const legacy = publications.find((publication) => publication.source_format === "txt" && publication.directory_path?.includes("Legacy GBK"));
+  expect(txt?.title).toBe("第一部");
+  expect(legacy?.title).toBe("第一部");
 
   const auto = await (await page.request.get(`${app.url}/api/v1/publications/${txt!.id}`)).json() as { content_version: string; chapters: Array<{ title: string }> };
   const explicit = await (await page.request.get(`${app.url}/api/v1/publications/${txt!.id}?encoding=utf-8`)).json() as { content_version: string; chapters: Array<{ title: string }> };

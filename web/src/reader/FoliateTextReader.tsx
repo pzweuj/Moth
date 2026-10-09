@@ -165,10 +165,12 @@ class TextPublication {
     }));
   }
 
-  resolveHref(href: string): { index: number; anchor: () => null } {
-    const target = String(href).replace(/^#/, "").split("#", 1)[0];
+  resolveHref(href: string): { index: number; anchor: () => number } {
+    const target = String(href).replace(/^#/, "").split("#")[0];
     const index = this.sections.findIndex((section) => section.id === target);
-    return { index: Math.max(0, index), anchor: () => null };
+    // Fraction 0 is the start of the section. A null anchor was kept as the
+    // previous section's scroll offset, so the chosen chapter opened mid-text.
+    return { index: Math.max(0, index), anchor: () => 0 };
   }
 
   splitTOCHref(href: string): [string, null] | null {
@@ -198,8 +200,8 @@ class TextPublication {
     if (this.signal.aborted) throw new DOMException("阅读器已关闭", "AbortError");
     this.onVersion(chapter.content_version);
     const title = chapter.title.trim();
-    const heading = title ? `<h1>${escapeHtml(title)}</h1>\n` : "";
-    const html = `<!doctype html><html><head><meta charset="utf-8"><style>body{white-space:normal}.txt-body{white-space:pre-wrap}</style></head><body>${heading}<div class="txt-body">${escapeHtml(chapter.text)}</div></body></html>`;
+    const heading = title ? `<h1 class="txt-title" id="chapter-start">${escapeHtml(title)}</h1>\n` : "";
+    const html = `<!doctype html><html><head><meta charset="utf-8"><style>body{white-space:normal}.txt-body{white-space:pre-wrap}h1.txt-title{margin-top:0}</style></head><body>${heading}<div class="txt-body">${escapeHtml(chapter.text)}</div></body></html>`;
     const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
     this.#blobs.set(id, url);
     return url;

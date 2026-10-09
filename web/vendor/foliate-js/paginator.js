@@ -709,6 +709,10 @@ export class Paginator extends HTMLElement {
             this.#view.destroy()
             this.#container.removeChild(this.#view.element)
         }
+        // Don't keep the previous section's column offset. The anchor applied
+        // after load moves to the real target; until then the start is visible.
+        this.#container.scrollLeft = 0
+        this.#container.scrollTop = 0
         this.#view = new View({
             container: this,
             onExpand: () => this.#scrollToAnchor(this.#anchor),
@@ -1007,7 +1011,15 @@ export class Paginator extends HTMLElement {
             return
         }
         const { pages } = this
-        if (!pages) return
+        if (!pages) {
+            // Layout is not ready yet. Drop the previous section's offset so
+            // the retry from expand() does not reopen mid-chapter.
+            if (typeof anchor === 'number') {
+                this.#container.scrollLeft = 0
+                this.#container.scrollTop = 0
+            }
+            return
+        }
         const textPages = pages - 2
         const newPage = Math.round(anchor * (textPages - 1))
         await this.#scrollToPage(newPage + 1, reason)
@@ -1041,6 +1053,10 @@ export class Paginator extends HTMLElement {
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
         this.#index = index
+        // A Range anchor belongs to the section being replaced. Leaving it in
+        // place makes the new section's first layout scroll to that old
+        // offset, so a chapter chosen from the TOC opens in the middle.
+        if (typeof this.#anchor !== 'number') this.#anchor = 0
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
             const view = this.#createView()

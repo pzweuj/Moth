@@ -40,6 +40,18 @@ const DIMENSION_HEADER_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(test)]
 mod stream_tests;
 
+#[cfg(test)]
+mod title_tests {
+    use super::txt_book_title;
+
+    #[test]
+    fn txt_book_title_uses_the_filename_stem() {
+        assert_eq!(txt_book_title("第一部.txt"), "第一部");
+        assert_eq!(txt_book_title("Night.Sea.txt"), "Night.Sea");
+        assert_eq!(txt_book_title(".txt"), ".txt");
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicationSummary {
     pub id: i64,
@@ -462,15 +474,32 @@ async fn fetch_publication(db: &SqlitePool, id: i64) -> Result<PublicationSummar
     Ok(summary_from_row(&row)?)
 }
 
+/// TXT has no metadata title. Show the filename without `.txt`; the format
+/// badge already says TXT. Older rows stored the first chapter heading.
+fn txt_book_title(filename: &str) -> String {
+    Path::new(filename)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.trim().is_empty())
+        .unwrap_or_else(|| filename.to_owned())
+}
+
 pub(crate) fn summary_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<PublicationSummary, sqlx::Error> {
     let source: String = row.try_get("format")?;
     let hash: String = row.try_get("sha256")?;
     let has_cover: bool = row.try_get("has_cover")?;
+    let filename: String = row.try_get("filename")?;
+    let stored_title: String = row.try_get("title")?;
+    let title = if source == "txt" {
+        txt_book_title(&filename)
+    } else {
+        stored_title
+    };
     Ok(PublicationSummary {
         id: row.try_get("id")?,
-        title: row.try_get("title")?,
+        title,
         author: row.try_get("author")?,
         source_format: source.clone(),
         reader_format: if source == "mobi" {
@@ -487,7 +516,7 @@ pub(crate) fn summary_from_row(
         progress: row.try_get::<f64, _>("progress")?.clamp(0.0, 1.0),
         content_version: content_version(&hash, row.try_get::<String, _>("format")?.as_str(), None),
         file_size: row.try_get("file_size")?,
-        filename: row.try_get("filename")?,
+        filename,
         directory_path: row.try_get("relative_path")?,
         parse_status: row.try_get("parse_status")?,
     })
@@ -605,21 +634,30 @@ async fn ensure_txt_encoding(
     if !supported_encoding(encoding) {
         return Err(AppError::Validation("unsupported TXT encoding".to_owned()));
     }
-    if encoding == "auto" {
-        return Ok(());
+    let version = current_content_version(row, Some(encoding));
+    let cache = state.txt_dir(&version, encoding).join("book.utf8");
+    let stamp = crate::library::txt_chapter_stamp(&cache);
+    let stamp_current = tokio::fs::read_to_string(&stamp)
+        .await
+        .ok()
+        .is_some_and(|value| value.trim() == moth_format::txt::CHAPTER_INDEX_VERSION);
+    let cache_ready = tokio::fs::metadata(&cache)
+        .await
+        .is_ok_and(|meta| meta.is_file());
+    if stamp_current && cache_ready {
+        let chapter_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
+        )
+        .bind(row.id)
+        .bind(encoding)
+        .fetch_one(&state.db)
+        .await?;
+        if chapter_count > 0 {
+            return Ok(());
+        }
     }
-    let chapter_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
-    )
-    .bind(row.id)
-    .bind(encoding)
-    .fetch_one(&state.db)
-    .await?;
-    if chapter_count == 0 {
-        let path = ensure_source_current(row).await?;
-        let version = current_content_version(row, Some(encoding));
-        crate::library::write_text_cache(state, row.id, &version, &path, encoding).await?;
-    }
+    let path = ensure_source_current(row).await?;
+    crate::library::write_text_cache(state, row.id, &version, &path, encoding).await?;
     Ok(())
 }
 
@@ -1390,7 +1428,17 @@ struct PublicationRow {
 
 pub(crate) fn content_version(hash: &str, format: &str, encoding: Option<&str>) -> String {
     let encoding = encoding.unwrap_or("auto").to_ascii_lowercase();
-    format!("{CONTENT_ADAPTER_VERSION}-{format}-{encoding}-{hash}")
+    // TXT chapter rules have their own revision. Bumping it changes the cache
+    // path and makes a saved chapter index count as an older parser version.
+    let adapter = if format == "txt" {
+        format!(
+            "{CONTENT_ADAPTER_VERSION}-{}",
+            moth_format::txt::CHAPTER_INDEX_VERSION
+        )
+    } else {
+        CONTENT_ADAPTER_VERSION.to_owned()
+    };
+    format!("{adapter}-{format}-{encoding}-{hash}")
 }
 fn current_content_version(row: &PublicationRow, encoding: Option<&str>) -> String {
     content_version(&row.sha256, &row.format, encoding)

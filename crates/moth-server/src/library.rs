@@ -87,9 +87,10 @@ fn parse_index(
                 ))
             })?;
             let index = moth_format::txt::write_indexed_cache(path, None, target)?;
-            let title = index.title.clone().unwrap_or_else(fallback_title);
+            // The first heading is a chapter, not the book. The filename is
+            // the name a person already uses for the file.
             Ok(IndexedPublication {
-                title,
+                title: fallback_title(),
                 author: None,
                 cover: None,
                 cover_error: None,
@@ -734,6 +735,7 @@ async fn store_publication(
     let cache_version = crate::books::content_version(&hash, format.as_str(), None);
     let txt_cache_target = (format == BookFormat::Txt)
         .then(|| state.txt_dir(&cache_version, "auto").join("book.utf8"));
+    let txt_cache_for_stamp = txt_cache_target.clone();
     // Parsing reads the cover. The blocking task owns its permit through the
     // cache write, including when the awaiting scan future is cancelled.
     let permit = if format == BookFormat::Txt {
@@ -834,6 +836,25 @@ async fn store_publication(
         insert_text_index(&mut tx, publication_id, "auto", index).await?;
     }
     tx.commit().await?;
+    if parsed_ok
+        && format == BookFormat::Txt
+        && let Some(target) = txt_cache_for_stamp
+    {
+        write_txt_chapter_stamp(&target).await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn txt_chapter_stamp(cache: &Path) -> PathBuf {
+    cache.with_file_name("chapter-index-version")
+}
+
+async fn write_txt_chapter_stamp(cache: &Path) -> Result<(), AppError> {
+    let stamp = txt_chapter_stamp(cache);
+    if let Some(parent) = stamp.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(stamp, moth_format::txt::CHAPTER_INDEX_VERSION.as_bytes()).await?;
     Ok(())
 }
 
@@ -847,6 +868,7 @@ pub(crate) async fn write_text_cache(
     let path = path.to_owned();
     let requested = (encoding != "auto").then(|| encoding.to_owned());
     let target = state.txt_dir(content_version, encoding).join("book.utf8");
+    let stamp_target = target.clone();
     let index = tokio::task::spawn_blocking(move || {
         moth_format::txt::write_indexed_cache(&path, requested.as_deref(), &target)
     })
@@ -861,6 +883,7 @@ pub(crate) async fn write_text_cache(
         .await?;
     insert_text_index(&mut tx, id, encoding, index).await?;
     tx.commit().await?;
+    write_txt_chapter_stamp(&stamp_target).await?;
     Ok(())
 }
 
