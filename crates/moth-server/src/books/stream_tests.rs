@@ -213,6 +213,24 @@ async fn thumbnails_recheck_cache_after_waiting_and_accept_rgba() {
     );
 }
 
+#[test]
+fn one_archive_pass_writes_every_page_thumbnail() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("book.cbz");
+    zip_fixture(&source, &[("wide", &png(300, 150)), ("broken", b"not an image")]);
+    let jobs = vec![
+        (0, "wide".into(), temp.path().join("0.jpg")),
+        (1, "broken".into(), temp.path().join("1.jpg")),
+    ];
+    let batch = crate::state::ThumbnailBatch::new();
+    batch.urgent.lock().unwrap().push_front(1);
+    write_thumbnails_once(source, jobs, &batch);
+    let wide = image::open(temp.path().join("0.jpg")).unwrap();
+    let broken = image::open(temp.path().join("1.jpg")).unwrap();
+    assert_eq!((wide.width(), wide.height()), (240, 120));
+    assert_eq!((broken.width(), broken.height()), (2, 2));
+}
+
 #[tokio::test]
 async fn oversized_and_corrupt_pages_have_placeholders_but_original_streams_remain_readable() {
     let temp = tempfile::tempdir().unwrap();

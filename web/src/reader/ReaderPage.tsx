@@ -3,7 +3,8 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api, pageThumbnailUrl, type BookDetail, type ProgressBody, type PublicationSummary, type ReadingPosition } from "../api";
 import { ComicReader } from "./ComicReader";
 import { FoliateTextReader } from "./FoliateTextReader";
-import type { ReaderNavigationItem, ReaderNavigationRequest } from "./navigation";
+import { navigationListScrollTop, navigationScrubIndex, type ReaderNavigationItem, type ReaderNavigationRequest } from "./navigation";
+import { PageThumbnailGrid } from "./PageThumbnailGrid";
 import { loadComicSettings, loadSettings, saveComicSettings, saveSettings, type ComicSettings, type ReaderSettings } from "./settings";
 import { useProgressSaver } from "./useProgressSaver";
 import type { ReaderReadingState } from "./readingState";
@@ -334,6 +335,8 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
     id: String(page.idx),
     label: `第 ${page.idx + 1} 页`,
     thumbnailUrl: pageThumbnailUrl(id, page.idx),
+    width: page.width,
+    height: page.height,
   })) ?? [], [detail?.pages, id]);
   const navigationItems = text ? textNavigation : pageNavigation;
 
@@ -389,7 +392,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
       <button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={openSettings} aria-label="阅读设置" aria-expanded={settingsOpen}>Aa</button>
     </header>
     {settingsOpen && <ReaderSettingsPanel detail={detail} settings={settings} setSettings={setSettings} comicSettings={comicSettings} setComicSettings={setComicSettings} encoding={encoding} onEncodingChange={onEncodingChange} text={text} />}
-    {navigationOpen && <ReaderNavigationDrawer items={navigationItems} activeId={activeNavigationId} kind={text ? "chapters" : "pages"} onSelect={selectNavigation} onClose={() => setNavigationOpen(false)} />}
+    {navigationOpen && <ReaderNavigationDrawer items={navigationItems} activeId={activeNavigationId} kind={text ? "chapters" : "pages"} columns={comicSettings.mode === "webtoon" ? 1 : 3} onSelect={selectNavigation} onClose={() => setNavigationOpen(false)} />}
     {progressError && <div className="reader-save-status" role="status">{progressError}<button className="reader-control-button" type="button" onClick={() => void retrySave()}>重试保存</button></div>}
     {text
       ? <FoliateTextReader key={`${detail.id}:${detail.content_version}`} detail={detail} progress={progress} settings={settings} theme={theme} encoding={encoding} navigationRequest={navigationRequest} onProgress={save} onNavigationChange={(items, activeId) => { setTextNavigation(items); if (activeId) setActiveNavigationId(activeId); }} onReadingStateChange={setReadingState} onAdvanceAtEnd={finishReading} onCenterTap={toggleToolbar} onPageTurn={hideToolbar} keyboardEnabled={() => !settingsOpen && !navigationOpen} onKeyboardAction={onKeyboardAction} />
@@ -480,6 +483,38 @@ function ReaderSettingsPanel({ detail, settings, setSettings, comicSettings, set
   </div>;
 }
 
-function ReaderNavigationDrawer({ items, activeId, kind, onSelect, onClose }: { items: ReaderNavigationItem[]; activeId: string; kind: "chapters" | "pages"; onSelect: (item: ReaderNavigationItem) => void; onClose: () => void }) {
-  return <><button className="reader-drawer-backdrop" type="button" aria-label="关闭导航" onClick={onClose} /><aside className={`reader-drawer ${kind === "pages" ? "reader-page-drawer" : ""}`} aria-label={kind === "pages" ? "页码选择器" : "章节选择器"}><div className="reader-drawer-header"><h2>{kind === "pages" ? "页码" : "章节"}</h2><button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>{items.length === 0 ? <p className="shelf-hint">正在读取…</p> : <div className="reader-navigation-list">{items.map((item) => <button className={`reader-navigation-item ${item.id === activeId ? "is-active" : ""}`} style={item.depth ? { paddingInlineStart: `${14 + Math.min(item.depth, 4) * 14}px` } : undefined} type="button" key={item.id} onClick={() => onSelect(item)}>{item.thumbnailUrl ? <img src={item.thumbnailUrl} alt="" loading="lazy" /> : <span>{item.label}</span>}{item.thumbnailUrl && <small>{item.label}</small>}</button>)}</div>}</aside></>;
+function scrollNavigationListTo(list: HTMLElement, id: string) {
+  const target = list.querySelector<HTMLElement>(`[data-nav-id="${CSS.escape(id)}"]`);
+  if (!target) return;
+  const listRect = list.getBoundingClientRect();
+  const itemRect = target.getBoundingClientRect();
+  list.scrollTop = navigationListScrollTop(list.scrollTop, list.clientHeight, itemRect.top - listRect.top, itemRect.height);
+}
+
+function ReaderNavigationDrawer({ items, activeId, kind, columns, onSelect, onClose }: { items: ReaderNavigationItem[]; activeId: string; kind: "chapters" | "pages"; columns: number; onSelect: (item: ReaderNavigationItem) => void; onClose: () => void }) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrubbing = useRef(false);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const activeIndex = Math.max(0, items.findIndex((item) => item.id === activeId));
+  const shownIndex = dragIndex ?? activeIndex;
+  const previewId = dragIndex === null ? "" : items[shownIndex]?.id ?? "";
+  useEffect(() => {
+    const list = listRef.current;
+    const targetId = previewId || activeId;
+    if (!list || !targetId || kind === "pages") return;
+    const frame = requestAnimationFrame(() => scrollNavigationListTo(list, targetId));
+    return () => cancelAnimationFrame(frame);
+  }, [activeId, items, kind, previewId]);
+  const commitScrub = (value: number) => {
+    scrubbing.current = false;
+    const item = items[navigationScrubIndex(items.length, value)];
+    setDragIndex(null);
+    if (item) onSelect(item);
+  };
+  const body = items.length === 0
+    ? <p className="shelf-hint">正在读取…</p>
+    : kind === "pages"
+      ? <PageThumbnailGrid items={items} activeId={activeId} previewId={previewId} columns={columns} onSelect={onSelect} />
+      : <div className="reader-navigation-list" ref={listRef}>{items.map((item) => <button className={`reader-navigation-item ${item.id === activeId ? "is-active" : ""} ${item.id === previewId ? "is-preview" : ""}`} data-nav-id={item.id} style={item.depth ? { paddingInlineStart: `${14 + Math.min(item.depth, 4) * 14}px` } : undefined} type="button" key={item.id} onClick={() => onSelect(item)}><span>{item.label}</span></button>)}</div>;
+  return <><button className="reader-drawer-backdrop" type="button" aria-label="关闭导航" onClick={onClose} /><aside className={`reader-drawer ${kind === "pages" ? "reader-page-drawer" : ""}`} aria-label={kind === "pages" ? "页码选择器" : "章节选择器"}><div className="reader-drawer-header"><h2>{kind === "pages" ? "页码" : "章节"}</h2><button className="quiet-button reader-control-button reader-icon-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>{body}{items.length > 1 && <div className="reader-drawer-scrub"><div><span>{items[shownIndex]?.label}</span><small>{shownIndex + 1} / {items.length}</small></div><input aria-label={kind === "pages" ? "按进度跳转页面" : "按进度跳转章节"} type="range" min={0} max={items.length - 1} step={1} value={shownIndex} onInput={(event) => { scrubbing.current = true; setDragIndex(navigationScrubIndex(items.length, Number(event.currentTarget.value))); }} onPointerDown={(event) => event.currentTarget.setPointerCapture(event.pointerId)} onPointerUp={(event) => { if (!scrubbing.current) return; commitScrub(Number(event.currentTarget.value)); }} onKeyUp={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Home" || event.key === "End") commitScrub(Number(event.currentTarget.value)); }} /></div>}</aside></>;
 }
