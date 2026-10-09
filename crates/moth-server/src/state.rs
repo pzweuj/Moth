@@ -1,14 +1,8 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 
@@ -65,35 +59,6 @@ pub struct AppState {
     /// Limit active ZIP decompression streams so several readers cannot keep
     /// one blocking worker and a large compressed page alive indefinitely.
     pub page_streams: Arc<Semaphore>,
-    /// One in-flight CBZ thumbnail pass per content version. The pass opens
-    /// the archive once; a page request can move itself to the front.
-    pub thumbnail_batches: Arc<Mutex<HashMap<String, Arc<ThumbnailBatch>>>>,
-}
-
-/// Wakes thumbnail readers while one archive pass writes page previews.
-pub struct ThumbnailBatch {
-    pub urgent: std::sync::Mutex<VecDeque<i64>>,
-    pub pulse: Notify,
-    pub finished: AtomicBool,
-}
-
-impl ThumbnailBatch {
-    pub fn new() -> Self {
-        Self {
-            urgent: std::sync::Mutex::new(VecDeque::new()),
-            pulse: Notify::new(),
-            finished: AtomicBool::new(false),
-        }
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
-    }
-
-    pub fn finish(&self) {
-        self.finished.store(true, Ordering::Release);
-        self.pulse.notify_waiters();
-    }
 }
 
 impl AppState {
@@ -109,7 +74,6 @@ impl AppState {
             image_tasks: Arc::new(Semaphore::new(1)),
             dimension_tasks: Arc::new(Semaphore::new(1)),
             page_streams: Arc::new(Semaphore::new(2)),
-            thumbnail_batches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

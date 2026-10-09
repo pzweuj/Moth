@@ -582,22 +582,13 @@ pub async fn get_book(
     if row.format == "cbz" {
         let source = ensure_source_current(&row).await?;
         let version = current_content_version(&row, None);
-        let dimensions = page_dimensions(&state, &version, source.clone(), &pages).await?;
+        let dimensions = page_dimensions(&state, &version, source, &pages).await?;
         for (page, dimensions) in pages.iter_mut().zip(dimensions) {
             if let Some((width, height)) = dimensions {
                 page.width = Some(width);
                 page.height = Some(height);
             }
         }
-        let jobs = pages
-            .iter()
-            .map(|page| (page.idx, page.path.clone()))
-            .collect::<Vec<_>>();
-        let warm_state = state.clone();
-        let warm_version = version.clone();
-        tokio::spawn(async move {
-            let _ = start_cbz_thumbnails(&warm_state, &warm_version, source, jobs).await;
-        });
     }
     Ok(Json(BookDetail {
         summary,
@@ -958,24 +949,10 @@ pub async fn get_page_thumbnail(
     let (entry,) = page.ok_or(AppError::NotFound)?;
     let version = current_content_version(&row, None);
     let target = state.thumbnail_path(&version, idx);
-    if !target.is_file() {
-        let jobs = sqlx::query_as::<_, (i64, String)>(
-            "SELECT idx, path FROM cbz_pages WHERE publication_id=? ORDER BY idx",
-        )
-        .bind(id)
-        .fetch_all(&state.db)
-        .await?;
-        let batch = start_cbz_thumbnails(&state, &version, source.clone(), jobs).await?;
-        if !batch.is_finished() {
-            if let Ok(mut urgent) = batch.urgent.lock() {
-                urgent.push_front(idx);
-            }
-            wait_for_thumbnail(&batch, &target).await;
-        }
-    }
-    if !target.is_file() {
-        ensure_page_thumbnail(state.image_tasks.clone(), source, entry, target.clone()).await?;
-    }
+    // One requested page only. A full-archive pass holds the single image
+    // permit and the disk until every page is decoded, so shelf and EPUB
+    // range requests stall behind it.
+    ensure_page_thumbnail(state.image_tasks.clone(), source, entry, target.clone()).await?;
     let bytes = tokio::fs::read(&target).await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -985,118 +962,6 @@ pub async fn get_page_thumbnail(
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("thumbnail response"))
-}
-
-async fn start_cbz_thumbnails(
-    state: &AppState,
-    version: &str,
-    source: PathBuf,
-    jobs: Vec<(i64, String)>,
-) -> Result<Arc<crate::state::ThumbnailBatch>, AppError> {
-    let mut batches = state.thumbnail_batches.lock().await;
-    if let Some(existing) = batches.get(version) {
-        return Ok(existing.clone());
-    }
-    let batch = Arc::new(crate::state::ThumbnailBatch::new());
-    batches.insert(version.to_owned(), batch.clone());
-    drop(batches);
-    let batch_task = batch.clone();
-    let image_tasks = state.image_tasks.clone();
-    let version_key = version.to_owned();
-    let batches = state.thumbnail_batches.clone();
-    let targets = jobs
-        .into_iter()
-        .map(|(idx, entry)| (idx, entry, state.thumbnail_path(&version_key, idx)))
-        .collect::<Vec<_>>();
-    if targets.iter().all(|(_, _, path)| path.is_file()) {
-        batch.finish();
-        state.thumbnail_batches.lock().await.remove(&version_key);
-        return Ok(batch);
-    }
-    tokio::spawn(async move {
-        let permit = image_tasks.clone().acquire_owned().await.ok();
-        let batch_for_write = batch_task.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            write_thumbnails_once(source, targets, &batch_for_write);
-        })
-        .await;
-        batch_task.finish();
-        let mut batches = batches.lock().await;
-        if batches
-            .get(&version_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &batch_task))
-        {
-            batches.remove(&version_key);
-        }
-    });
-    Ok(batch)
-}
-
-async fn wait_for_thumbnail(batch: &crate::state::ThumbnailBatch, target: &Path) {
-    loop {
-        let notified = batch.pulse.notified();
-        tokio::pin!(notified);
-        if target.is_file() || batch.is_finished() {
-            return;
-        }
-        notified.await;
-    }
-}
-
-fn write_thumbnails_once(
-    source: PathBuf,
-    jobs: Vec<(i64, String, PathBuf)>,
-    batch: &crate::state::ThumbnailBatch,
-) {
-    let mut pending = (0..jobs.len()).collect::<std::collections::VecDeque<_>>();
-    let mut archive = std::fs::File::open(source)
-        .ok()
-        .and_then(|file| ZipArchive::new(file).ok());
-    while !pending.is_empty() {
-        let position = {
-            let mut urgent = batch
-                .urgent
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let mut chosen = None;
-            while let Some(idx) = urgent.pop_front() {
-                if let Some(offset) = pending.iter().position(|item| jobs[*item].0 == idx) {
-                    chosen = pending.remove(offset);
-                    break;
-                }
-            }
-            chosen.or_else(|| pending.pop_front())
-        };
-        let Some(position) = position else {
-            break;
-        };
-        let (_, entry, target) = &jobs[position];
-        if !target.is_file() {
-            let bytes = archive
-                .as_mut()
-                .and_then(|archive| thumbnail_bytes(archive, entry))
-                .or_else(|| placeholder_thumbnail().ok());
-            if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
-                let _ = crate::state::write_cache(target, &bytes);
-            }
-        }
-        batch.pulse.notify_waiters();
-    }
-}
-
-fn thumbnail_bytes(archive: &mut ZipArchive<std::fs::File>, entry: &str) -> Option<Vec<u8>> {
-    let item = archive.by_name(entry).ok()?;
-    if item.size() > IMAGE_MAX_BYTES as u64 {
-        return placeholder_thumbnail().ok();
-    }
-    let mut raw = Vec::new();
-    item.take(IMAGE_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    encode_page_thumbnail(&raw)
-        .or_else(|_| placeholder_thumbnail())
-        .ok()
 }
 
 async fn ensure_page_thumbnail(
