@@ -334,10 +334,10 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
   const pageNavigation = useMemo<ReaderNavigationItem[]>(() => detail?.pages.map((page) => ({
     id: String(page.idx),
     label: `第 ${page.idx + 1} 页`,
-    thumbnailUrl: pageThumbnailUrl(id, page.idx),
+    thumbnailUrl: pageThumbnailUrl(id, page.idx, detail.content_version),
     width: page.width,
     height: page.height,
-  })) ?? [], [detail?.pages, id]);
+  })) ?? [], [detail?.content_version, detail?.pages, id]);
   const navigationItems = text ? textNavigation : pageNavigation;
 
   const openSettings = () => {

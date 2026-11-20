@@ -3,10 +3,30 @@ use std::{path::Path, time::Duration};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{
     SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 
 use crate::{config::Config, error::AppError};
+
+/// Separate write and read SQLite pools over the same WAL database.
+///
+/// Writes stay serialized on one pooled connection to avoid `SQLITE_BUSY`,
+/// while concurrent reads run in parallel on read-only connections.
+#[derive(Clone)]
+pub struct DbPools {
+    pub write: SqlitePool,
+    pub read: SqlitePool,
+}
+
+pub async fn connect_pools(config: &Config) -> Result<DbPools, AppError> {
+    let write = connect(config).await?;
+    let database_path = config.data_dir.join("moth.db");
+    let read = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(read_connect_options(&database_path))
+        .await?;
+    Ok(DbPools { write, read })
+}
 
 pub async fn connect(config: &Config) -> Result<SqlitePool, AppError> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
@@ -59,11 +79,19 @@ async fn reject_legacy_schema(pool: &SqlitePool) -> Result<(), AppError> {
     Ok(())
 }
 
+fn read_connect_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .busy_timeout(Duration::from_secs(5))
+}
+
 fn connect_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5))
 }
@@ -92,6 +120,41 @@ mod tests {
             .await
             .expect("journal mode");
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .expect("synchronous mode");
+        // SQLite PRAGMA synchronous = NORMAL reports 1.
+        assert_eq!(synchronous, 1);
+    }
+
+    #[tokio::test]
+    async fn connect_pools_supports_concurrent_reads_during_write_transaction() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = Config::for_test(temp.path().to_path_buf());
+        let pools = connect_pools(&config).await.expect("pools");
+
+        let mut tx = pools.write.begin().await.expect("write tx");
+        sqlx::query("INSERT INTO directories (parent_id, name, relative_path, updated_at) VALUES (NULL, '书库', '', 1)")
+            .execute(&mut *tx)
+            .await
+            .expect("insert in tx");
+
+        // While the write transaction is still uncommitted, the read pool must
+        // serve reads immediately without waiting on the write connection.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM directories")
+            .fetch_one(&pools.read)
+            .await
+            .expect("concurrent read");
+        assert_eq!(count, 0);
+
+        tx.commit().await.expect("commit");
+        let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM directories")
+            .fetch_one(&pools.read)
+            .await
+            .expect("post-commit read");
+        assert_eq!(count_after, 1);
     }
 
     #[tokio::test]

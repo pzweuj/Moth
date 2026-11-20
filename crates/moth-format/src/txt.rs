@@ -1,10 +1,13 @@
 //! Plain-text parsing: encoding detection, decoding, and chapter splitting.
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use chardetng::EncodingDetector;
@@ -13,10 +16,10 @@ use regex::Regex;
 
 use crate::ParseError;
 
-/// Bump when chapter boundary rules change. The server mixes this into the
-/// TXT content version so an already scanned book rebuilds its cache and
-/// drops locators that pointed at the old splits.
-pub const CHAPTER_INDEX_VERSION: &str = "cjk-sep-1";
+/// Bump when chapter boundary or auto-detection rules change. The server mixes
+/// this into the TXT content version so an already scanned book rebuilds its
+/// cache and drops locators that pointed at the old splits.
+pub const CHAPTER_INDEX_VERSION: &str = "cjk-sep-2";
 
 /// Chapter heading markers, checked case-insensitively against a line. Latin
 /// covers chapter/part/volume/book/section. CJK chapters are separate: the
@@ -158,20 +161,174 @@ impl<W: Write> Write for NewlineNormalizer<W> {
     }
 }
 
-fn detect_encoding(bytes: &[u8]) -> &'static Encoding {
+const DETECT_CHUNK_SIZE: usize = 64 * 1024;
+const DETECT_NON_ASCII_WINDOW: usize = 64 * 1024;
+const DETECT_MAX_ASCII_SCAN: usize = 4 * 1024 * 1024;
+
+fn detect_bom(bytes: &[u8]) -> Option<&'static Encoding> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return UTF_8;
+        return Some(UTF_8);
     }
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        return UTF_16LE;
+        return Some(UTF_16LE);
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        return UTF_16BE;
+        return Some(UTF_16BE);
+    }
+    None
+}
+
+fn resolve_requested_encoding(requested: Option<&str>) -> Option<&'static Encoding> {
+    requested.and_then(|label| match label.to_ascii_lowercase().as_str() {
+        "utf-8" => Some(UTF_8),
+        "gb18030" => Some(encoding_rs::GB18030),
+        "gbk" => Some(encoding_rs::GBK),
+        "big5" => Some(encoding_rs::BIG5),
+        "utf-16le" => Some(UTF_16LE),
+        "utf-16be" => Some(UTF_16BE),
+        _ => None,
+    })
+}
+
+/// Tracks UTF-8 byte validity across streamed chunks so a UTF-8 file with a
+/// handful of stray corrupt bytes is not misclassified as GBK mojibake.
+struct Utf8QualityTracker {
+    decoder: encoding_rs::Decoder,
+    valid_non_ascii_bytes: usize,
+    valid_multibyte_chars: usize,
+    invalid_bytes: usize,
+}
+
+impl Utf8QualityTracker {
+    fn new() -> Self {
+        Self {
+            decoder: UTF_8.new_decoder_without_bom_handling(),
+            valid_non_ascii_bytes: 0,
+            valid_multibyte_chars: 0,
+            invalid_bytes: 0,
+        }
+    }
+
+    fn feed(&mut self, buffer: &[u8], last: bool) {
+        let mut dst = [0_u8; 1024];
+        let mut offset = 0;
+        loop {
+            let (result, read, written) = self
+                .decoder
+                .decode_to_utf8_without_replacement(&buffer[offset..], &mut dst, last);
+            for &byte in &dst[..written] {
+                if byte >= 0x80 {
+                    self.valid_non_ascii_bytes += 1;
+                    if byte >= 0xC0 {
+                        self.valid_multibyte_chars += 1;
+                    }
+                }
+            }
+            offset += read;
+            match result {
+                encoding_rs::DecoderResult::InputEmpty => break,
+                encoding_rs::DecoderResult::OutputFull => continue,
+                encoding_rs::DecoderResult::Malformed(bad_len, _) => {
+                    self.invalid_bytes = self.invalid_bytes.saturating_add(usize::from(bad_len));
+                }
+            }
+        }
+    }
+
+    fn looks_mostly_utf8(&self) -> bool {
+        let total = self.valid_non_ascii_bytes.saturating_add(self.invalid_bytes);
+        self.valid_multibyte_chars >= 16
+            && total > 0
+            && self.valid_non_ascii_bytes.saturating_mul(100) >= total.saturating_mul(98)
+    }
+}
+
+fn finalize_guess(
+    detector: &EncodingDetector,
+    utf8_quality: &Utf8QualityTracker,
+) -> &'static Encoding {
+    let guess = detector.guess(None, chardetng::Utf8Detection::Allow);
+    if guess != UTF_8 && utf8_quality.looks_mostly_utf8() {
+        return UTF_8;
+    }
+    if guess == encoding_rs::GBK {
+        return encoding_rs::GB18030;
+    }
+    guess
+}
+
+fn detect_encoding(bytes: &[u8]) -> &'static Encoding {
+    if let Some(encoding) = detect_bom(bytes) {
+        return encoding;
     }
     let mut detector = EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
-    let sample_len = bytes.len().min(64 * 1024);
-    detector.feed(&bytes[..sample_len], true);
-    detector.guess(None, chardetng::Utf8Detection::Allow)
+    let mut utf8_quality = Utf8QualityTracker::new();
+    let sample_len = bytes.len().min(DETECT_NON_ASCII_WINDOW);
+    // Only mark `last = true` when the entire input was fed; passing `true` on
+    // a truncated prefix disqualifies UTF-8 whenever the cut splits a multi-byte
+    // character.
+    let is_eof = sample_len == bytes.len();
+    detector.feed(&bytes[..sample_len], is_eof);
+    utf8_quality.feed(&bytes[..sample_len], is_eof);
+    finalize_guess(&detector, &utf8_quality)
+}
+
+fn read_chunk_or_eof(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<(usize, bool)> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok((filled, true)),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((filled, false))
+}
+
+fn detect_file_encoding(file: &mut File) -> Result<&'static Encoding, ParseError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut detector = EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+    let mut utf8_quality = Utf8QualityTracker::new();
+    let mut buffer = vec![0_u8; DETECT_CHUNK_SIZE];
+    let mut first_chunk = true;
+    let mut seen_non_ascii = false;
+    let mut bytes_after_non_ascii = 0usize;
+    let mut total_scanned = 0usize;
+
+    loop {
+        let (len, is_eof) = read_chunk_or_eof(file, &mut buffer)?;
+        let chunk = &buffer[..len];
+        if first_chunk {
+            first_chunk = false;
+            if let Some(encoding) = detect_bom(chunk) {
+                file.seek(SeekFrom::Start(0))?;
+                return Ok(encoding);
+            }
+        }
+        if !chunk.is_empty() || is_eof {
+            // Only pass `last = true` at real EOF so a 64 KiB boundary splitting
+            // a 3-byte UTF-8 CJK character never disqualifies UTF-8.
+            let has_non_ascii = detector.feed(chunk, is_eof);
+            utf8_quality.feed(chunk, is_eof);
+            total_scanned = total_scanned.saturating_add(len);
+            if has_non_ascii {
+                seen_non_ascii = true;
+            }
+            if seen_non_ascii {
+                bytes_after_non_ascii = bytes_after_non_ascii.saturating_add(len);
+            }
+        }
+        if is_eof
+            || (seen_non_ascii && bytes_after_non_ascii >= DETECT_NON_ASCII_WINDOW)
+            || total_scanned >= DETECT_MAX_ASCII_SCAN
+        {
+            break;
+        }
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    Ok(finalize_guess(&detector, &utf8_quality))
 }
 
 fn decode(bytes: &[u8]) -> String {
@@ -190,24 +347,13 @@ fn decode(bytes: &[u8]) -> String {
 /// prefix; the remainder is fed through `encoding_rs`'s stateful decoder so a
 /// multi-byte character split across read buffers is handled correctly.
 fn decode_file(path: &Path, requested: Option<&str>) -> Result<String, ParseError> {
-    const SAMPLE_SIZE: usize = 64 * 1024;
     const BUFFER_SIZE: usize = 64 * 1024;
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
+    let encoding = match resolve_requested_encoding(requested) {
+        Some(encoding) => encoding,
+        None => detect_file_encoding(&mut file)?,
+    };
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
-    let mut sample = vec![0_u8; SAMPLE_SIZE];
-    let sample_len = reader.read(&mut sample)?;
-    let sample = &sample[..sample_len];
-    let encoding = requested
-        .and_then(|label| match label.to_ascii_lowercase().as_str() {
-            "utf-8" => Some(UTF_8),
-            "gb18030" => Some(encoding_rs::GB18030),
-            "gbk" => Some(encoding_rs::GBK),
-            "big5" => Some(encoding_rs::BIG5),
-            "utf-16le" => Some(UTF_16LE),
-            "utf-16be" => Some(UTF_16BE),
-            _ => None,
-        })
-        .unwrap_or_else(|| detect_encoding(sample));
 
     let mut decoder = encoding.new_decoder();
     let mut output = String::new();
@@ -229,7 +375,6 @@ fn decode_file(path: &Path, requested: Option<&str>) -> Result<String, ParseErro
             let _ = decoder.decode_to_string(&[], &mut output, true);
         }
     };
-    feed(sample, false);
 
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     loop {
@@ -250,25 +395,14 @@ fn decode_file_to_writer(
     requested: Option<&str>,
     writer: impl Write,
 ) -> Result<(), ParseError> {
-    const SAMPLE_SIZE: usize = 64 * 1024;
     const BUFFER_SIZE: usize = 64 * 1024;
 
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
+    let encoding = match resolve_requested_encoding(requested) {
+        Some(encoding) => encoding,
+        None => detect_file_encoding(&mut file)?,
+    };
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, file);
-    let mut sample = vec![0_u8; SAMPLE_SIZE];
-    let sample_len = reader.read(&mut sample)?;
-    let sample = &sample[..sample_len];
-    let encoding = requested
-        .and_then(|label| match label.to_ascii_lowercase().as_str() {
-            "utf-8" => Some(UTF_8),
-            "gb18030" => Some(encoding_rs::GB18030),
-            "gbk" => Some(encoding_rs::GBK),
-            "big5" => Some(encoding_rs::BIG5),
-            "utf-16le" => Some(UTF_16LE),
-            "utf-16be" => Some(UTF_16BE),
-            _ => None,
-        })
-        .unwrap_or_else(|| detect_encoding(sample));
 
     let mut decoder = encoding.new_decoder();
     let mut normalizer = NewlineNormalizer::new(writer);
@@ -292,7 +426,6 @@ fn decode_file_to_writer(
         Ok(())
     };
 
-    feed(sample, false)?;
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     loop {
         let read = reader.read(&mut buffer)?;
@@ -840,9 +973,17 @@ fn build_indexed_cache(normalized: &Path, target: &Path) -> Result<TextIndex, Pa
     Ok(TextIndex { title, chapters })
 }
 
+fn unique_temp_path(target: &Path, suffix: &str) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    target.with_extension(format!("{pid:x}-{seq:x}.{suffix}.tmp"))
+}
+
 /// Decode and index a TXT file while writing its normalized UTF-8 cache to
 /// `target`. Only chapter metadata is retained in memory; chapter bodies are
-/// streamed through temporary files and read later by byte range.
+/// streamed through unique temporary files and published atomically so
+/// concurrent writers never collide or expose a missing cache file.
 pub fn write_indexed_cache(
     source: &Path,
     requested_encoding: Option<&str>,
@@ -854,20 +995,13 @@ pub fn write_indexed_cache(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let normalized = target.with_extension("normalized.tmp");
-    let cache_temp = target.with_extension("utf8.tmp");
-    let legacy_cache_temp = target.with_extension("tmp");
-    let _ = std::fs::remove_file(&normalized);
-    let _ = std::fs::remove_file(&cache_temp);
-    let _ = std::fs::remove_file(&legacy_cache_temp);
+    let normalized = unique_temp_path(target, "normalized");
+    let cache_temp = unique_temp_path(target, "utf8");
     let result = (|| {
         let file = File::create(&normalized)?;
         let writer = BufWriter::with_capacity(64 * 1024, file);
         decode_file_to_writer(source, requested_encoding, writer)?;
         let index = build_indexed_cache(&normalized, &cache_temp)?;
-        if target.exists() {
-            std::fs::remove_file(target)?;
-        }
         std::fs::rename(&cache_temp, target)?;
         Ok(index)
     })();
@@ -1252,5 +1386,136 @@ mod tests {
         assert!(index.chapters.len() >= 2);
         assert_eq!(index.chapters[0].title, "第一章 开端");
         assert_eq!(index.chapters[1].title, "第一章 开端 (2)");
+    }
+
+    #[test]
+    fn concurrent_write_indexed_cache_uses_unique_temps_without_colliding() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let source = dir.path().join("concurrent.txt");
+        let target = dir.path().join("cache").join("book.utf8");
+        std::fs::write(&source, "第一章 开始\n第一段\n\n第二章 结束\n第二段").expect("fixture");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let source = source.clone();
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                write_indexed_cache(&source, Some("utf-8"), &target)
+            }));
+        }
+        for handle in handles {
+            let index = handle
+                .join()
+                .expect("thread join")
+                .expect("concurrent write");
+            assert_eq!(index.chapters.len(), 2);
+        }
+        let cached = std::fs::read_to_string(&target).expect("final cache");
+        assert_eq!(cached, "第一段\n第二段");
+        let entries: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .expect("cache dir")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["book.utf8"]);
+    }
+
+    #[test]
+    fn autodetects_utf8_when_64k_boundary_splits_cjk_character() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        // Test all 3 byte alignments across the 64 KiB sample boundary so a
+        // 3-byte UTF-8 CJK character is cut after byte 1, byte 2, or intact.
+        for pad in 0..3 {
+            let source = dir.path().join(format!("split-{pad}.txt"));
+            let mut text = format!("{}\n第一章 边界测试\n\n", "a".repeat(pad + 1));
+            while text.len() < DETECT_CHUNK_SIZE + 1024 {
+                text.push_str("中文正文内容，用来测试六十四千字节边界切分不会误判编码。\n");
+            }
+            std::fs::write(&source, &text).expect("utf8 fixture");
+
+            let mut file = File::open(&source).expect("open");
+            assert_eq!(
+                detect_file_encoding(&mut file).expect("detect"),
+                UTF_8,
+                "pad={pad}"
+            );
+            assert_eq!(detect_encoding(text.as_bytes()), UTF_8, "slice pad={pad}");
+
+            let target = dir.path().join(format!("split-{pad}.utf8"));
+            let index = write_indexed_cache(&source, None, &target).expect("auto cache");
+            assert!(
+                index
+                    .chapters
+                    .iter()
+                    .any(|chapter| chapter.title == "第一章 边界测试"),
+                "pad={pad}"
+            );
+            let cached = std::fs::read_to_string(&target).expect("cached text");
+            assert!(cached.contains("不会误判编码"));
+        }
+    }
+
+    #[test]
+    fn autodetects_encoding_after_long_ascii_prefix() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let ascii_prefix = "Preface line.\n".repeat(6000); // > 64 KiB pure ASCII
+
+        let utf8_path = dir.path().join("ascii-then-utf8.txt");
+        let utf8_text = format!("{ascii_prefix}\n第一章 正文开始\n\n这里是中文内容。");
+        std::fs::write(&utf8_path, &utf8_text).expect("utf8 fixture");
+        let mut utf8_file = File::open(&utf8_path).expect("open");
+        assert_eq!(detect_file_encoding(&mut utf8_file).expect("detect"), UTF_8);
+
+        let gbk_path = dir.path().join("ascii-then-gbk.txt");
+        let (gbk_tail, _, _) = encoding_rs::GB18030.encode(
+            "\n第一章 正文开始\n\n这是一段用来测试长英文前缀之后自动识别国标编码的中文正文。",
+        );
+        let mut gbk_bytes = ascii_prefix.into_bytes();
+        gbk_bytes.extend_from_slice(&gbk_tail);
+        std::fs::write(&gbk_path, &gbk_bytes).expect("gbk fixture");
+        let mut gbk_file = File::open(&gbk_path).expect("open");
+        assert_eq!(
+            detect_file_encoding(&mut gbk_file).expect("detect"),
+            encoding_rs::GB18030
+        );
+    }
+
+    #[test]
+    fn autodetects_mostly_utf8_with_stray_corrupt_bytes_without_breaking_gbk_or_big5() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+
+        // UTF-8 Chinese text with a couple of stray invalid bytes should still
+        // decode as UTF-8 rather than turning the whole book into GBK mojibake.
+        let mut mostly_utf8 = "第一章 序幕\n\n".as_bytes().to_vec();
+        for _ in 0..80 {
+            mostly_utf8
+                .extend_from_slice("清晨的薄雾笼罩着山谷，远处的钟声缓缓回荡。\n".as_bytes());
+        }
+        mostly_utf8.push(0xFF);
+        mostly_utf8.extend_from_slice("随后天色渐明，旅人再度启程。\n".as_bytes());
+        let corrupt_utf8_path = dir.path().join("corrupt-utf8.txt");
+        std::fs::write(&corrupt_utf8_path, &mostly_utf8).expect("fixture");
+        let mut file = File::open(&corrupt_utf8_path).expect("open");
+        assert_eq!(detect_file_encoding(&mut file).expect("detect"), UTF_8);
+
+        // Genuine GB18030 / GBK and Big5 prose must still be detected properly.
+        let gbk_prose = "第一章 序幕\n\n清晨的薄雾笼罩着山谷，远处的钟声缓缓回荡。这是一段完整的中文小说正文，不应被误判为UTF-8。\n".repeat(20);
+        let (gbk_bytes, _, _) = encoding_rs::GB18030.encode(&gbk_prose);
+        let gbk_path = dir.path().join("gbk.txt");
+        std::fs::write(&gbk_path, gbk_bytes.as_ref()).expect("gbk fixture");
+        let mut gbk_file = File::open(&gbk_path).expect("open");
+        assert_eq!(
+            detect_file_encoding(&mut gbk_file).expect("detect"),
+            encoding_rs::GB18030
+        );
+
+        let big5_prose = "第一章 序幕\n\n清晨的薄霧籠罩著山谷，遠處的鐘聲緩緩迴盪。這是一段完整的繁體中文小說正文，不應被誤判。\n".repeat(20);
+        let (big5_bytes, _, _) = encoding_rs::BIG5.encode(&big5_prose);
+        let big5_path = dir.path().join("big5.txt");
+        std::fs::write(&big5_path, big5_bytes.as_ref()).expect("big5 fixture");
+        let mut big5_file = File::open(&big5_path).expect("open");
+        assert_eq!(
+            detect_file_encoding(&mut big5_file).expect("detect"),
+            encoding_rs::BIG5
+        );
     }
 }

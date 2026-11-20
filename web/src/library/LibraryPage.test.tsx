@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, type BrowseResponse, type HomeResponse, type PublicationSummary, type ScanStatus } from "../api";
+import { api, pageThumbnailUrl, type BrowseResponse, type HomeResponse, type PublicationSummary, type ScanStatus } from "../api";
 import { LibraryPage } from "./LibraryPage";
 import { LibraryPageCache } from "./useLibraryData";
 
@@ -137,5 +137,42 @@ describe("library navigation", () => {
     expect(screen.queryByText("最近扫描")).not.toBeInTheDocument();
     await act(async () => { updated.resolve({ ...home, continue_reading: [{ ...book, title: "扫描后的书" }] }); });
     expect(screen.getByRole("link", { name: /扫描后的书/ })).toBeInTheDocument();
+  });
+
+  it("preserves IME composition text across re-renders and searches on composition end", async () => {
+    vi.useFakeTimers();
+    const searchSpy = vi.spyOn(api, "search").mockResolvedValue({
+      shelves: { items: [], total: 0, has_more: false },
+      series: { items: [], total: 0, has_more: false },
+      books: { items: [book], total: 1, has_more: false },
+    });
+    renderLibrary();
+    await act(async () => {});
+
+    const input = screen.getByRole("searchbox", { name: "搜索书架、系列或书籍名称" }) as HTMLInputElement;
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "santi" } });
+    expect(input.value).toBe("santi");
+
+    // Trigger a parent re-render during IME composition (e.g. scan poll).
+    vi.mocked(api.scanStatus).mockResolvedValueOnce({ ...idle, scanning: true });
+    fireEvent.click(screen.getByRole("button", { name: "重新扫描" }));
+    await act(async () => {});
+    expect(input.value).toBe("santi");
+    expect(searchSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "三体" } });
+    fireEvent.compositionEnd(input, { target: { value: "三体" } });
+    expect(input.value).toBe("三体");
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(350); });
+    expect(searchSpy).toHaveBeenCalledWith("三体", false, "all", 0, 20, expect.any(AbortSignal));
+  });
+
+  it("includes content version in CBZ thumbnail URLs when provided", () => {
+    expect(pageThumbnailUrl(7, 3, "core-v2-cbz-auto-abc")).toBe(
+      "/api/v1/publications/7/pages/3/thumbnail?v=core-v2-cbz-auto-abc",
+    );
+    expect(pageThumbnailUrl(7, 3)).toBe("/api/v1/publications/7/pages/3/thumbnail");
   });
 });

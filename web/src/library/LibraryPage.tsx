@@ -209,9 +209,15 @@ function BookGrid({ books, loading, showEmpty = true }: { books: PublicationSumm
 }
 
 function LibrarySearch({ query, includeHidden, onQueryChange, onIncludeHiddenChange, onSubmit }: { query: string; includeHidden: boolean; onQueryChange: (value: string) => void; onIncludeHiddenChange: (value: boolean) => void; onSubmit: () => void }) {
-  const [composing, setComposing] = useState(false);
-  return <form className="library-search" role="search" onSubmit={(event) => { event.preventDefault(); const native = event.nativeEvent as Event & { isComposing?: boolean }; if (!composing && !native.isComposing) onSubmit(); }}>
-    <input type="search" aria-label="搜索书架、系列或书籍名称" placeholder="搜索书架、系列或书籍名称" value={query} onCompositionStart={() => setComposing(true)} onCompositionEnd={(event) => { setComposing(false); onQueryChange(event.currentTarget.value); }} onChange={(event) => { if (!composing && !(event.nativeEvent as InputEvent).isComposing) onQueryChange(event.target.value); }} />
+  const [draft, setDraft] = useState(query);
+  const composingRef = useRef(false);
+
+  useEffect(() => {
+    if (!composingRef.current) setDraft(query);
+  }, [query]);
+
+  return <form className="library-search" role="search" onSubmit={(event) => { event.preventDefault(); const native = event.nativeEvent as Event & { isComposing?: boolean }; if (!composingRef.current && !native.isComposing) onSubmit(); }}>
+    <input type="search" aria-label="搜索书架、系列或书籍名称" placeholder="搜索书架、系列或书籍名称" value={draft} onCompositionStart={() => { composingRef.current = true; }} onCompositionEnd={(event) => { composingRef.current = false; const value = event.currentTarget.value; setDraft(value); onQueryChange(value); }} onChange={(event) => { const value = event.currentTarget.value; setDraft(value); if (!composingRef.current && !(event.nativeEvent as InputEvent).isComposing) onQueryChange(value); }} />
     <label><input type="checkbox" checked={includeHidden} onChange={(event) => onIncludeHiddenChange(event.target.checked)} />包含隐藏书架</label>
   </form>;
 }

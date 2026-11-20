@@ -184,7 +184,7 @@ pub fn validate_credentials(credentials: Credentials) -> Result<Credentials, App
 async fn user_exists(state: &AppState) -> Result<bool, AppError> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM user_account WHERE id = 1)")
-            .fetch_one(&state.db)
+            .fetch_one(&state.read_db)
             .await?
             != 0,
     )
@@ -226,7 +226,7 @@ async fn verify_user(state: &AppState, credentials: &Credentials) -> Result<bool
         .try_acquire_owned()
         .map_err(|_| AppError::LoginThrottled(1))?;
     let row = sqlx::query("SELECT username, password_hash FROM user_account WHERE id = 1")
-        .fetch_optional(&state.db)
+        .fetch_optional(&state.read_db)
         .await?;
     let Some(row) = row else {
         return Ok(false);
@@ -290,7 +290,7 @@ async fn resolve_session(state: &AppState, token: &str) -> Result<Option<String>
         "SELECT a.username, s.expires_at, s.last_used_at FROM sessions s JOIN user_account a ON a.id = 1 WHERE s.token_hash = ?",
     )
     .bind(&token_hash)
-    .fetch_optional(&state.db)
+    .fetch_optional(&state.read_db)
     .await?;
     let Some(row) = row else {
         return Ok(None);
@@ -373,10 +373,12 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 }
 
 fn token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    raw.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == SESSION_COOKIE).then(|| value.to_owned())
+    headers.get_all(header::COOKIE).iter().find_map(|header| {
+        let raw = header.to_str().ok()?;
+        raw.split(';').find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name == SESSION_COOKIE).then(|| value.to_owned())
+        })
     })
 }
 
@@ -656,5 +658,21 @@ mod tests {
             "other=value; moth_session=abc123".parse().expect("cookie"),
         );
         assert_eq!(token_from_headers(&headers).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extracts_token_across_multiple_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "other=value".parse().expect("first cookie"));
+        headers.append(
+            header::COOKIE,
+            "moth_session=split-h2-token"
+                .parse()
+                .expect("second cookie"),
+        );
+        assert_eq!(
+            token_from_headers(&headers).as_deref(),
+            Some("split-h2-token")
+        );
     }
 }

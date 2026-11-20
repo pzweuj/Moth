@@ -117,4 +117,4 @@ export const api = {
 };
 
 export const bookFileUrl = (id: number) => `/api/v1/publications/${id}/file`;
-export const pageThumbnailUrl = (id: number, page: number) => `/api/v1/publications/${id}/pages/${page}/thumbnail`;
+export const pageThumbnailUrl = (id: number, page: number, contentVersion?: string) => `/api/v1/publications/${id}/pages/${page}/thumbnail${contentVersion ? `?v=${encodeURIComponent(contentVersion)}` : ""}`;

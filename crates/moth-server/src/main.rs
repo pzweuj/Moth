@@ -8,9 +8,9 @@ async fn main() -> Result<(), moth_server::error::AppError> {
     let config = Config::from_env()?;
     config.init_tracing()?;
 
-    let pool = db::connect(&config).await?;
+    let pools = db::connect_pools(&config).await?;
     let bind_addr: SocketAddr = config.bind_addr;
-    let state = AppState::new(config.clone(), pool);
+    let state = AppState::with_pools(config.clone(), pools);
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 

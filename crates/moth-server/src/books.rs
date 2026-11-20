@@ -26,11 +26,14 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::{
     auth::Authenticated,
     error::AppError,
-    library::{is_hidden_shelf, now_unix},
-    state::{AppState, ConversionState},
+    library::{hidden_shelf_set, now_unix},
+    state::{AppState, CbzArchiveCache, ConversionState},
 };
 
 const CONTENT_ADAPTER_VERSION: &str = "core-v2";
+pub(crate) const SUPPORTED_TXT_ENCODINGS: &[&str] = &[
+    "auto", "utf-8", "utf-16le", "utf-16be", "gbk", "gb18030", "big5",
+];
 const IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const IMAGE_MAX_ALLOC: u64 = 64 * 1024 * 1024;
 const IMAGE_MAX_DIMENSION: u32 = 8192;
@@ -182,6 +185,11 @@ pub struct BookQuery {
     pub encoding: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct VersionQuery {
+    pub v: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChapterResponse {
     idx: i64,
@@ -197,12 +205,12 @@ pub async fn home(
     _user: Authenticated,
 ) -> Result<Json<HomeResponse>, AppError> {
     let (directories, hidden_directories) =
-        fetch_home_directories(&state.db, &state.config.books_dir).await?;
+        fetch_home_directories(&state.read_db, &state.config.books_dir).await?;
     let hidden_paths = hidden_directories
         .iter()
         .map(|directory| directory.path.as_str())
         .collect::<Vec<_>>();
-    let continue_reading = fetch_continue_reading(&state.db, &hidden_paths).await?;
+    let continue_reading = fetch_continue_reading(&state.read_db, &hidden_paths).await?;
     Ok(Json(HomeResponse {
         continue_reading,
         directories,
@@ -214,6 +222,17 @@ struct SeriesCandidate {
     preview: HomeSeriesPreview,
     active_at: Option<i64>,
 }
+
+struct RawSeriesRow {
+    id: i64,
+    parent_id: i64,
+    name: String,
+    path: String,
+    publication_count: i64,
+    active_at: Option<i64>,
+}
+
+const HOME_ID_CHUNK_SIZE: usize = 200;
 
 async fn fetch_home_directories(
     db: &SqlitePool,
@@ -232,54 +251,140 @@ async fn fetch_home_directories(
     .bind(root_id)
     .fetch_all(db)
     .await?;
-    let mut output = Vec::with_capacity(categories.len());
-    let mut hidden = Vec::new();
+
+    let mut parsed_categories = Vec::with_capacity(categories.len());
+    let mut category_paths = Vec::with_capacity(categories.len());
     for category in categories {
-        let category_id: i64 = category.try_get("id")?;
-        let category_path: String = category.try_get("relative_path")?;
-        let category_name: String = category.try_get("name")?;
-        if is_hidden_shelf(books_root, &category_path) {
-            hidden.push(HiddenDirectorySummary {
-                name: category_name,
-                path: category_path,
-            });
-            continue;
+        let id: i64 = category.try_get("id")?;
+        let name: String = category.try_get("name")?;
+        let path: String = category.try_get("relative_path")?;
+        category_paths.push(path.clone());
+        parsed_categories.push((id, name, path));
+    }
+    let hidden_set = hidden_shelf_set(books_root, category_paths).await?;
+
+    let mut visible_categories = Vec::with_capacity(parsed_categories.len());
+    let mut hidden = Vec::new();
+    for (id, name, path) in parsed_categories {
+        if hidden_set.contains(&path) {
+            hidden.push(HiddenDirectorySummary { name, path });
+        } else {
+            visible_categories.push((id, name, path));
         }
-        // Rank series in SQL so a large shelf never loads every series (or
-        // every book in every series) just to discard all but the four cards
-        // shown on the home page. `active_at` is NULL for series without an
-        // in-progress book; SQLite sorts those after real timestamps when
-        // ordering descending.
-        let series_rows = sqlx::query(
-            "SELECT d.id,d.name,d.relative_path,COUNT(p.id) AS publication_count,
-                    MAX(CASE WHEN r.progress>0 AND r.progress<1 THEN r.updated_at END) AS active_at
-             FROM directories d
-             LEFT JOIN publications p ON p.directory_id=d.id
-             LEFT JOIN reading_progress r ON r.publication_id=p.id
-             WHERE d.parent_id=?
-             GROUP BY d.id
-             ORDER BY active_at DESC, d.name COLLATE NOCASE
-             LIMIT 4",
-        )
-        .bind(category_id)
-        .fetch_all(db)
-        .await?;
-        let mut candidates = Vec::with_capacity(series_rows.len());
-        for series in series_rows {
-            let series_id: i64 = series.try_get("id")?;
-            let publication_count: i64 = series.try_get("publication_count")?;
-            let representative = fetch_series_representative(db, series_id).await?;
-            let active_at: Option<i64> = series.try_get("active_at")?;
-            candidates.push(SeriesCandidate {
+    }
+
+    if visible_categories.is_empty() {
+        return Ok((Vec::new(), hidden));
+    }
+
+    // Batch-rank the top 4 series per visible shelf in SQL using window
+    // functions instead of issuing 1 + 4 queries per shelf.
+    let visible_ids: Vec<i64> = visible_categories.iter().map(|(id, _, _)| *id).collect();
+    let mut raw_series = Vec::new();
+    for chunk in visible_ids.chunks(HOME_ID_CHUNK_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "WITH series_stats AS (
+                SELECT d.id, d.parent_id, d.name, d.relative_path,
+                       COUNT(p.id) AS publication_count,
+                       MAX(CASE WHEN r.progress>0 AND r.progress<1 THEN r.updated_at END) AS active_at
+                FROM directories d
+                LEFT JOIN publications p ON p.directory_id=d.id
+                LEFT JOIN reading_progress r ON r.publication_id=p.id
+                WHERE d.parent_id IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in chunk {
+            separated.push_bind(*id);
+        }
+        builder.push(
+            ") GROUP BY d.id
+            ),
+            ranked_series AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY parent_id
+                    ORDER BY active_at DESC, name COLLATE NOCASE
+                ) AS rn
+                FROM series_stats
+            )
+            SELECT id, parent_id, name, relative_path, publication_count, active_at
+            FROM ranked_series
+            WHERE rn <= 4
+            ORDER BY parent_id, rn",
+        );
+        let rows = builder.build().fetch_all(db).await?;
+        for row in rows {
+            raw_series.push(RawSeriesRow {
+                id: row.try_get("id")?,
+                parent_id: row.try_get("parent_id")?,
+                name: row.try_get("name")?,
+                path: row.try_get("relative_path")?,
+                publication_count: row.try_get("publication_count")?,
+                active_at: row.try_get("active_at")?,
+            });
+        }
+    }
+
+    // Batch-fetch the single representative publication for every selected series.
+    let series_ids: Vec<i64> = raw_series.iter().map(|series| series.id).collect();
+    let mut representatives: HashMap<i64, PublicationSummary> =
+        HashMap::with_capacity(series_ids.len());
+    for chunk in series_ids.chunks(HOME_ID_CHUNK_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "WITH ranked_pubs AS (
+                SELECT p.id, p.directory_id, p.title, p.author, p.format, p.sha256,
+                       p.file_size, p.filename, p.parse_status, p.has_cover,
+                       d.relative_path, COALESCE(r.progress, 0.0) AS progress,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY p.directory_id
+                           ORDER BY CASE WHEN p.parse_status='ok' THEN 0 ELSE 1 END,
+                                    p.filename COLLATE NOCASE,
+                                    p.title COLLATE NOCASE
+                       ) AS rn
+                FROM publications p
+                JOIN directories d ON d.id=p.directory_id
+                LEFT JOIN reading_progress r ON r.publication_id=p.id
+                WHERE p.directory_id IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in chunk {
+            separated.push_bind(*id);
+        }
+        builder.push(
+            ")
+            )
+            SELECT id, directory_id, title, author, format, sha256, file_size,
+                   filename, parse_status, has_cover, relative_path, progress
+            FROM ranked_pubs
+            WHERE rn = 1",
+        );
+        let rows = builder.build().fetch_all(db).await?;
+        for row in rows {
+            let directory_id: i64 = row.try_get("directory_id")?;
+            representatives.insert(directory_id, summary_from_row(&row)?);
+        }
+    }
+
+    let mut series_by_parent: HashMap<i64, Vec<SeriesCandidate>> =
+        HashMap::with_capacity(visible_categories.len());
+    for series in raw_series {
+        let representative = representatives.remove(&series.id);
+        series_by_parent
+            .entry(series.parent_id)
+            .or_default()
+            .push(SeriesCandidate {
                 preview: HomeSeriesPreview {
-                    name: series.try_get("name")?,
-                    path: series.try_get("relative_path")?,
-                    publication_count,
+                    name: series.name,
+                    path: series.path,
+                    publication_count: series.publication_count,
                     representative,
                 },
-                active_at,
+                active_at: series.active_at,
             });
-        }
+    }
+
+    let mut output = Vec::with_capacity(visible_categories.len());
+    for (category_id, category_name, category_path) in visible_categories {
+        let mut candidates = series_by_parent.remove(&category_id).unwrap_or_default();
         order_home_series(&mut candidates);
         output.push(HomeDirectoryPreview {
             name: category_name,
@@ -321,20 +426,6 @@ async fn fetch_continue_reading(
         .map_err(AppError::from)
 }
 
-async fn fetch_series_representative(
-    db: &SqlitePool,
-    series_id: i64,
-) -> Result<Option<PublicationSummary>, AppError> {
-    let row = sqlx::query(
-        "SELECT p.id,p.title,p.author,p.format,p.sha256,p.file_size,p.filename,p.parse_status,p.has_cover,d.relative_path,COALESCE(r.progress,0.0) AS progress FROM publications p JOIN directories d ON d.id=p.directory_id LEFT JOIN reading_progress r ON r.publication_id=p.id WHERE p.directory_id=? ORDER BY CASE WHEN p.parse_status='ok' THEN 0 ELSE 1 END, p.filename COLLATE NOCASE, p.title COLLATE NOCASE LIMIT 1",
-    )
-    .bind(series_id)
-    .fetch_optional(db)
-    .await?;
-    row.map(|value| summary_from_row(&value))
-        .transpose()
-        .map_err(AppError::from)
-}
 
 #[cfg(test)]
 fn is_hidden_directory_path(path: &str, hidden_paths: &[&str]) -> bool {
@@ -522,13 +613,38 @@ pub(crate) fn summary_from_row(
     })
 }
 
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*"
+            || candidate == etag
+            || candidate
+                .strip_prefix("W/")
+                .is_some_and(|weak| weak == etag)
+    })
+}
+
+fn not_modified(etag: &str, cache_control: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::empty())
+        .expect("not modified response")
+}
+
 pub async fn get_book(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
     Query(query): Query<BookQuery>,
 ) -> Result<Json<BookDetail>, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     ensure_source_current(&row).await?;
     let encoding = query
         .encoding
@@ -538,7 +654,7 @@ pub async fn get_book(
     if row.format == "txt" {
         ensure_txt_encoding(&state, &row, &encoding).await?;
     }
-    let summary = fetch_publication(&state.db, id).await?;
+    let summary = fetch_publication(&state.read_db, id).await?;
     let mut summary = summary;
     if row.format == "txt" {
         summary.content_version = current_content_version(&row, Some(&encoding));
@@ -552,7 +668,7 @@ pub async fn get_book(
     } else {
         "auto"
     })
-    .fetch_all(&state.db)
+    .fetch_all(&state.read_db)
     .await?
     .into_iter()
     .map(|row| {
@@ -566,7 +682,7 @@ pub async fn get_book(
     let mut pages =
         sqlx::query("SELECT idx,path,mime FROM cbz_pages WHERE publication_id=? ORDER BY idx")
             .bind(id)
-            .fetch_all(&state.db)
+            .fetch_all(&state.read_db)
             .await?
             .into_iter()
             .map(|row| {
@@ -601,13 +717,24 @@ pub async fn get_cover(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<VersionQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     ensure_source_current(&row).await?;
     if !row.has_cover {
         return Err(AppError::NotFound);
     }
-    let path = state.cover_path(&current_content_version(&row, None));
+    let version = current_content_version(&row, None);
+    let etag = format!("\"{version}\"");
+    let cache_control = match query.v.as_deref() {
+        Some(v) if v == row.sha256 || v == version => "private, max-age=31536000, immutable",
+        _ => "private, no-cache",
+    };
+    if etag_matches(&headers, &etag) {
+        return Ok(not_modified(&etag, cache_control));
+    }
+    let path = state.cover_path(&version);
     let bytes = tokio::fs::read(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AppError::NotFound
@@ -615,15 +742,41 @@ pub async fn get_cover(
             AppError::Io(error)
         }
     })?;
-    let etag = format!("\"{}\"", current_content_version(&row, None));
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/jpeg")
         .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("cover response"))
+}
+
+async fn txt_encoding_ready(
+    state: &AppState,
+    publication_id: i64,
+    encoding: &str,
+    cache: &Path,
+    stamp: &Path,
+) -> Result<bool, AppError> {
+    let stamp_current = tokio::fs::read_to_string(stamp)
+        .await
+        .ok()
+        .is_some_and(|value| value.trim() == moth_format::txt::CHAPTER_INDEX_VERSION);
+    let cache_ready = tokio::fs::metadata(cache)
+        .await
+        .is_ok_and(|meta| meta.is_file());
+    if !stamp_current || !cache_ready {
+        return Ok(false);
+    }
+    let chapter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
+    )
+    .bind(publication_id)
+    .bind(encoding)
+    .fetch_one(&state.read_db)
+    .await?;
+    Ok(chapter_count > 0)
 }
 
 async fn ensure_txt_encoding(
@@ -637,24 +790,19 @@ async fn ensure_txt_encoding(
     let version = current_content_version(row, Some(encoding));
     let cache = state.txt_dir(&version, encoding).join("book.utf8");
     let stamp = crate::library::txt_chapter_stamp(&cache);
-    let stamp_current = tokio::fs::read_to_string(&stamp)
+    if txt_encoding_ready(state, row.id, encoding, &cache, &stamp).await? {
+        return Ok(());
+    }
+    let _permit = state
+        .txt_tasks
+        .clone()
+        .acquire_owned()
         .await
-        .ok()
-        .is_some_and(|value| value.trim() == moth_format::txt::CHAPTER_INDEX_VERSION);
-    let cache_ready = tokio::fs::metadata(&cache)
-        .await
-        .is_ok_and(|meta| meta.is_file());
-    if stamp_current && cache_ready {
-        let chapter_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM text_chapters WHERE publication_id=? AND encoding=?",
-        )
-        .bind(row.id)
-        .bind(encoding)
-        .fetch_one(&state.db)
-        .await?;
-        if chapter_count > 0 {
-            return Ok(());
-        }
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    // Recheck after acquiring the permit so simultaneous opens or chapter
+    // requests for the same encoding share one rebuild.
+    if txt_encoding_ready(state, row.id, encoding, &cache, &stamp).await? {
+        return Ok(());
     }
     let path = ensure_source_current(row).await?;
     crate::library::write_text_cache(state, row.id, &version, &path, encoding).await?;
@@ -678,6 +826,7 @@ async fn page_dimensions(
         .acquire_owned()
         .await
         .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let cbz_archives = Arc::clone(&state.cbz_archives);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // Recheck after acquiring the permit: simultaneous opens share a rebuild.
@@ -695,8 +844,7 @@ async fn page_dimensions(
                 return Ok(value);
             }
         }
-        let file = std::fs::File::open(source)?;
-        let mut archive = ZipArchive::new(file).map_err(std::io::Error::other)?;
+        let mut archive = cbz_archives.open(&source)?;
         let mut dimensions = Vec::with_capacity(entries.len());
         for entry in entries {
             let value = archive.by_name(&entry).ok().and_then(|item| {
@@ -733,13 +881,16 @@ pub async fn get_file(
     AxumPath(id): AxumPath<i64>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     let source = ensure_source_current(&row).await?;
     let path = if row.format == "mobi" {
         let target = state
             .mobi_dir(&current_content_version(&row, None))
             .join("book.epub");
-        if !target.exists() {
+        if !tokio::fs::metadata(&target)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
             return Err(AppError::Conflict {
                 code: "conversion_required",
                 message: "请先转换此 MOBI，或将其转换为 EPUB",
@@ -785,7 +936,7 @@ pub async fn get_chapter(
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
     Query(query): Query<ChapterQuery>,
 ) -> Result<Json<ChapterResponse>, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     if row.format != "txt" {
         return Err(AppError::Validation(
             "chapters are available only for TXT publications".to_owned(),
@@ -804,7 +955,7 @@ pub async fn get_chapter(
     .bind(id)
     .bind(&encoding)
     .bind(idx)
-    .fetch_optional(&state.db)
+    .fetch_optional(&state.read_db)
     .await?
     .ok_or(AppError::NotFound)?;
     let start: u64 = chapter
@@ -835,32 +986,40 @@ pub async fn get_page(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     if row.format != "cbz" {
         return Err(AppError::Validation(
             "pages are available only for CBZ publications".to_owned(),
         ));
     }
     ensure_source_current(&row).await?;
+    let etag = format!("\"{}-page-{idx}\"", current_content_version(&row, None));
+    if etag_matches(&headers, &etag) {
+        return Ok(not_modified(&etag, "private, no-cache"));
+    }
     let page = sqlx::query("SELECT path,mime FROM cbz_pages WHERE publication_id=? AND idx=?")
         .bind(id)
         .bind(idx)
-        .fetch_optional(&state.db)
+        .fetch_optional(&state.read_db)
         .await?
         .ok_or(AppError::NotFound)?;
     let entry: String = page.try_get("path")?;
     let mime: String = page.try_get("mime")?;
     let source = row.root.join(&row.relative_path);
-    let (size, stream) = cbz_page_stream(source, entry, Arc::clone(&state.page_streams)).await?;
+    let (size, stream) = cbz_page_stream(
+        source,
+        entry,
+        Arc::clone(&state.page_streams),
+        Arc::clone(&state.cbz_archives),
+    )
+    .await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
-        .header(
-            header::ETAG,
-            format!("\"{}-page-{idx}\"", current_content_version(&row, None)),
-        )
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "private, no-cache")
         .header(header::CONTENT_LENGTH, size)
         .body(Body::from_stream(stream))
         .expect("page response"))
@@ -873,6 +1032,7 @@ async fn cbz_page_stream(
     source: PathBuf,
     entry: String,
     page_streams: Arc<tokio::sync::Semaphore>,
+    cbz_archives: Arc<CbzArchiveCache>,
 ) -> Result<(u64, ReceiverStream<Result<bytes::Bytes, std::io::Error>>), AppError> {
     // Acquire before opening the ZIP central directory, and open it only once.
     let permit = page_streams
@@ -888,8 +1048,7 @@ async fn cbz_page_stream(
             if sender.is_closed() {
                 return Ok(());
             }
-            let file = std::fs::File::open(source)?;
-            let mut archive = ZipArchive::new(file).map_err(std::io::Error::other)?;
+            let mut archive = cbz_archives.open(&source)?;
             let mut item = archive.by_name(&entry).map_err(std::io::Error::other)?;
             if ready
                 .take()
@@ -932,33 +1091,50 @@ pub async fn get_page_thumbnail(
     State(state): State<AppState>,
     _user: Authenticated,
     AxumPath((id, idx)): AxumPath<(i64, i64)>,
+    Query(query): Query<VersionQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     if row.format != "cbz" {
         return Err(AppError::Validation(
             "page thumbnails are available only for CBZ publications".to_owned(),
         ));
     }
     let source = ensure_source_current(&row).await?;
+    let version = current_content_version(&row, None);
+    let etag = format!("\"{version}-page-{idx}-thumbnail\"");
+    let cache_control = match query.v.as_deref() {
+        Some(v) if v == version => "private, max-age=31536000, immutable",
+        _ => "private, no-cache",
+    };
+    if etag_matches(&headers, &etag) {
+        return Ok(not_modified(&etag, cache_control));
+    }
     let page: Option<(String,)> =
         sqlx::query_as("SELECT path FROM cbz_pages WHERE publication_id=? AND idx=?")
             .bind(id)
             .bind(idx)
-            .fetch_optional(&state.db)
+            .fetch_optional(&state.read_db)
             .await?;
     let (entry,) = page.ok_or(AppError::NotFound)?;
-    let version = current_content_version(&row, None);
     let target = state.thumbnail_path(&version, idx);
     // One requested page only. A full-archive pass holds the single image
     // permit and the disk until every page is decoded, so shelf and EPUB
     // range requests stall behind it.
-    ensure_page_thumbnail(state.image_tasks.clone(), source, entry, target.clone()).await?;
+    ensure_page_thumbnail(
+        state.image_tasks.clone(),
+        Arc::clone(&state.cbz_archives),
+        source,
+        entry,
+        target.clone(),
+    )
+    .await?;
     let bytes = tokio::fs::read(&target).await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/jpeg")
-        .header(header::ETAG, format!("\"{version}-page-{idx}-thumbnail\""))
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::CONTENT_LENGTH, bytes.len())
         .body(Body::from(bytes))
         .expect("thumbnail response"))
@@ -966,11 +1142,15 @@ pub async fn get_page_thumbnail(
 
 async fn ensure_page_thumbnail(
     image_tasks: Arc<tokio::sync::Semaphore>,
+    cbz_archives: Arc<CbzArchiveCache>,
     source: PathBuf,
     entry: String,
     target: PathBuf,
 ) -> Result<(), AppError> {
-    if target.is_file() {
+    if tokio::fs::metadata(&target)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
         return Ok(());
     }
     let permit = image_tasks
@@ -983,8 +1163,7 @@ async fn ensure_page_thumbnail(
             return Ok(());
         }
         let encoded = (|| {
-            let file = std::fs::File::open(source)?;
-            let mut zip = ZipArchive::new(file).map_err(std::io::Error::other)?;
+            let mut zip = cbz_archives.open(&source)?;
             let item = zip.by_name(&entry).map_err(std::io::Error::other)?;
             if item.size() > IMAGE_MAX_BYTES as u64 {
                 return Err(AppError::Validation(
@@ -1063,13 +1242,13 @@ pub async fn get_progress(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<Option<ProgressBody>>, AppError> {
-    let publication = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let publication = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     ensure_source_current(&publication).await?;
     let row = sqlx::query(
         "SELECT content_version,locator_json,progress FROM reading_progress WHERE publication_id=?",
     )
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&state.read_db)
     .await?;
     let value = match row {
         Some(row) => {
@@ -1089,7 +1268,8 @@ pub async fn get_progress(
             } else {
                 // Keep the useful coarse progress but deliberately discard a
                 // locator tied to an older file/parser version.
-                let position = fallback_position(&state.db, &publication, stored_progress).await?;
+                let position =
+                    fallback_position(&state.read_db, &publication, stored_progress).await?;
                 Some(ProgressBody {
                     content_version: content_version_for_position(&publication, &position),
                     position,
@@ -1109,7 +1289,7 @@ pub async fn put_progress(
 ) -> Result<Json<ProgressBody>, AppError> {
     let Json(body) = payload
         .map_err(|_| AppError::Validation("Request body must be valid progress JSON".to_owned()))?;
-    let publication = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let publication = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     ensure_source_current(&publication).await?;
     let current_version = content_version_for_position(&publication, &body.position);
     if body.content_version != current_version {
@@ -1118,7 +1298,7 @@ pub async fn put_progress(
             message: "书籍内容已变化，请重新打开后再保存进度",
         });
     }
-    validate_progress(&state.db, &publication, &body).await?;
+    validate_progress(&state.read_db, &publication, &body).await?;
     let now = now_unix();
     let json = serde_json::to_string(&body.position)
         .map_err(|error| AppError::Validation(error.to_string()))?;
@@ -1218,10 +1398,8 @@ async fn validate_progress(
 }
 
 fn supported_encoding(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "auto" | "utf-8" | "utf-16le" | "utf-16be" | "gbk" | "gb18030" | "big5"
-    )
+    let lower = value.to_ascii_lowercase();
+    SUPPORTED_TXT_ENCODINGS.contains(&lower.as_str())
 }
 
 async fn fallback_position(
@@ -1290,7 +1468,7 @@ pub async fn conversion_status(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<ConversionResponse>, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     if row.format != "mobi" {
         return Ok(Json(ConversionResponse {
             status: "not_required".to_owned(),
@@ -1301,7 +1479,10 @@ pub async fn conversion_status(
     ensure_source_current(&row).await?;
     let version = current_content_version(&row, None);
     let target = state.mobi_dir(&version).join("book.epub");
-    if target.exists() {
+    if tokio::fs::metadata(&target)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
         return Ok(Json(ConversionResponse {
             status: "ready".to_owned(),
             file_url: Some(format!("/api/v1/publications/{id}/file")),
@@ -1334,7 +1515,7 @@ pub async fn start_conversion(
     _user: Authenticated,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<ConversionResponse>, AppError> {
-    let row = publication_row(&state.db, &state.config.books_dir, id).await?;
+    let row = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     if row.format != "mobi" {
         return Ok(Json(ConversionResponse {
             status: "not_required".to_owned(),
@@ -1345,7 +1526,10 @@ pub async fn start_conversion(
     ensure_source_current(&row).await?;
     let version = current_content_version(&row, None);
     let target = state.mobi_dir(&version).join("book.epub");
-    if target.exists() {
+    if tokio::fs::metadata(&target)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
         return Ok(Json(ConversionResponse {
             status: "ready".to_owned(),
             file_url: Some(format!("/api/v1/publications/{id}/file")),

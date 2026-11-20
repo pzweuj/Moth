@@ -95,7 +95,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
-    sqlx::query("SELECT 1").execute(&state.db).await?;
+    sqlx::query("SELECT 1").execute(&state.read_db).await?;
     Ok(Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
