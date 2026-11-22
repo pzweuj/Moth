@@ -9,6 +9,7 @@ export type ReadingPosition =
   | { type: "cbz"; page_index: number; page_progress: number; progress: number };
 
 export type ProgressBody = { content_version: string; position: ReadingPosition };
+export type ProgressWrite = ProgressBody & { writer_id: string; sequence: number };
 
 export type PublicationSummary = {
   id: number;
@@ -108,7 +109,7 @@ export const api = {
   search: (query: string, includeHidden = false, kind: "all" | "shelves" | "series" | "books" = "all", offset = 0, limit = 20, signal?: AbortSignal) => request<SearchResponse>(`/search?q=${encodeURIComponent(query)}&include_hidden=${includeHidden ? "true" : "false"}&kind=${kind}&offset=${offset}&limit=${limit}`, { signal }),
   book: (id: number, encoding?: string, signal?: AbortSignal) => request<BookDetail>(`/publications/${id}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
   progress: (id: number, signal?: AbortSignal) => request<ProgressBody | null>(`/publications/${id}/progress`, { signal }),
-  saveProgress: (id: number, value: ProgressBody, options: { keepalive?: boolean } = {}) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value), keepalive: options.keepalive }),
+  saveProgress: (id: number, value: ProgressWrite, options: { keepalive?: boolean } = {}) => request<ProgressBody>(`/publications/${id}/progress`, { method: "PUT", body: JSON.stringify(value), keepalive: options.keepalive }),
   chapter: (id: number, index: number, encoding?: string, signal?: AbortSignal) => request<ChapterContent>(`/publications/${id}/chapters/${index}${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`, { signal }),
   conversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { signal }),
   startConversion: (id: number, signal?: AbortSignal) => request<ConversionResponse>(`/publications/${id}/conversion`, { method: "POST", signal }),

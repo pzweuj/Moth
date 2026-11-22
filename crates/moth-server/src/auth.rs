@@ -86,6 +86,7 @@ pub struct SetupStatusResponse {
 #[derive(Debug)]
 pub struct Authenticated {
     pub username: String,
+    pub(crate) session_hash: String,
 }
 
 pub async fn setup_status(
@@ -393,7 +394,10 @@ impl FromRequestParts<AppState> for Authenticated {
         let username = resolve_session(state, &token)
             .await?
             .ok_or(AppError::Unauthorized)?;
-        Ok(Self { username })
+        Ok(Self {
+            username,
+            session_hash: hash_token(&token),
+        })
     }
 }
 

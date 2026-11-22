@@ -71,6 +71,28 @@ describe("useProgressSaver", () => {
     expect(saveProgress.mock.calls[0][2]).toEqual({ keepalive: true });
   });
 
+  it("immediately sends the latest position on pagehide while an older save is pending", async () => {
+    let finishFirst!: () => void;
+    saveProgress.mockImplementationOnce(() => new Promise<void>(resolve => { finishFirst = resolve; }));
+    render(<Harness />);
+    fireEvent.click(screen.getByRole("button", { name: "save one" }));
+    await act(async () => { vi.advanceTimersByTime(450); });
+
+    fireEvent.click(screen.getByRole("button", { name: "save two" }));
+    fireEvent(window, new Event("pagehide"));
+    fireEvent(window, new Event("pagehide"));
+    expect(saveProgress).toHaveBeenCalledTimes(2);
+    const [, first] = saveProgress.mock.calls[0];
+    const [, second, options] = saveProgress.mock.calls[1];
+    expect(second).toMatchObject({
+      writer_id: first.writer_id,
+      sequence: first.sequence + 1,
+      position: { page_index: 2 },
+    });
+    expect(options).toEqual({ keepalive: true });
+    await act(async () => { finishFirst(); });
+  });
+
   it("flushes the previous publication when the reader route changes", async () => {
     const view = render(<SwitchingHarness publicationId={7} />);
     fireEvent.click(screen.getByRole("button", { name: "save" }));

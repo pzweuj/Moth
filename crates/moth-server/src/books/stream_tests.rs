@@ -330,12 +330,14 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     .unwrap();
 
     let user = Authenticated {
+        session_hash: String::new(),
         username: "moth".to_owned(),
     };
 
     let cover_versioned = get_cover(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath(pub_id),
@@ -359,6 +361,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let cover_not_modified = get_cover(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath(pub_id),
@@ -374,6 +377,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let cover_unversioned = get_cover(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath(pub_id),
@@ -390,6 +394,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let thumb_versioned = get_page_thumbnail(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath((pub_id, 0)),
@@ -416,6 +421,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let thumb_not_modified = get_page_thumbnail(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath((pub_id, 0)),
@@ -431,6 +437,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let thumb_stale = get_page_thumbnail(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath((pub_id, 0)),
@@ -449,6 +456,7 @@ async fn cover_and_thumbnail_cache_headers_are_private_and_require_matching_vers
     let page_response = get_page(
         State(state.clone()),
         Authenticated {
+            session_hash: String::new(),
             username: user.username.clone(),
         },
         AxumPath((pub_id, 0)),

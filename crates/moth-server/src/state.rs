@@ -126,6 +126,7 @@ pub struct AppState {
     pub db: SqlitePool,
     pub read_db: SqlitePool,
     pub scan_status: Arc<Mutex<ScanStatus>>,
+    pub(crate) hidden_shelves: Arc<Mutex<Option<Arc<Vec<String>>>>>,
     /// Conversion jobs are keyed by content version rather than publication
     /// id so duplicate files share one generated EPUB and one in-flight task.
     pub conversion_jobs: Arc<Mutex<HashMap<String, ConversionState>>>,
@@ -165,6 +166,7 @@ impl AppState {
             db: pools.write,
             read_db: pools.read,
             scan_status: Arc::new(Mutex::new(ScanStatus::default())),
+            hidden_shelves: Arc::new(Mutex::new(None)),
             conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
             conversion_tasks: Arc::new(Semaphore::new(1)),
             image_tasks: Arc::new(Semaphore::new(1)),

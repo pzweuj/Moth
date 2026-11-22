@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashSet,
-    io::Cursor,
+    fs::Metadata,
+    io::{self, Cursor},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -273,15 +274,22 @@ pub async fn search(
     }
 
     let hidden_paths = if include_hidden {
-        Vec::new()
+        std::sync::Arc::new(Vec::new())
     } else {
-        hidden_shelf_paths(&state.read_db, &state.config.books_dir).await?
+        hidden_shelf_snapshot(&state, false).await?
     };
     let (shelves, series, books) = tokio::join!(
         async {
             if matches!(kind, "all" | "shelves") {
-                search_directories(&state.read_db, &query_text, &hidden_paths, true, offset, limit)
-                    .await
+                search_directories(
+                    &state.read_db,
+                    &query_text,
+                    &hidden_paths,
+                    true,
+                    offset,
+                    limit,
+                )
+                .await
             } else {
                 Ok(SearchGroup {
                     items: Vec::new(),
@@ -328,7 +336,24 @@ pub async fn search(
     }))
 }
 
-async fn hidden_shelf_paths(db: &SqlitePool, books_root: &Path) -> Result<Vec<String>, AppError> {
+pub(crate) async fn hidden_shelf_snapshot(
+    state: &AppState,
+    refresh: bool,
+) -> Result<std::sync::Arc<Vec<String>>, AppError> {
+    let mut snapshot = state.hidden_shelves.lock().await;
+    if !refresh && let Some(paths) = snapshot.as_ref() {
+        return Ok(paths.clone());
+    }
+    let paths =
+        std::sync::Arc::new(hidden_shelf_paths(&state.read_db, &state.config.books_dir).await?);
+    *snapshot = Some(paths.clone());
+    Ok(paths)
+}
+
+pub(crate) async fn hidden_shelf_paths(
+    db: &SqlitePool,
+    books_root: &Path,
+) -> Result<Vec<String>, AppError> {
     let paths: Vec<String> = sqlx::query_scalar(
         "SELECT relative_path FROM directories WHERE parent_id=(SELECT id FROM directories WHERE relative_path='')",
     )
@@ -485,7 +510,7 @@ pub async fn start_scan(
     State(state): State<AppState>,
     _user: Authenticated,
 ) -> Result<(), AppError> {
-    start_scan_on(&state).await
+    start_scan_on(&state, true).await
 }
 
 pub async fn scan_status(
@@ -495,7 +520,7 @@ pub async fn scan_status(
     Ok(Json(state.scan_status.lock().await.clone()))
 }
 
-pub async fn start_scan_on(state: &AppState) -> Result<(), AppError> {
+async fn start_scan_on(state: &AppState, retry_failed: bool) -> Result<(), AppError> {
     {
         let mut status = state.scan_status.lock().await;
         if status.scanning {
@@ -511,7 +536,8 @@ pub async fn start_scan_on(state: &AppState) -> Result<(), AppError> {
     }
     let cloned = state.clone();
     tokio::spawn(async move {
-        let result = run_scan(&cloned).await;
+        let result = run_scan(&cloned, retry_failed).await;
+        *cloned.hidden_shelves.lock().await = None;
         let mut status = cloned.scan_status.lock().await;
         status.scanning = false;
         if let Err(error) = result {
@@ -523,10 +549,10 @@ pub async fn start_scan_on(state: &AppState) -> Result<(), AppError> {
 
 pub async fn start_initial_scan(state: &AppState) -> Result<(), AppError> {
     ensure_directory(&state.db, Path::new("")).await?;
-    start_scan_on(state).await
+    start_scan_on(state, false).await
 }
 
-async fn run_scan(state: &AppState) -> Result<(), AppError> {
+async fn run_scan(state: &AppState, retry_failed: bool) -> Result<(), AppError> {
     let root = state.config.books_dir.clone();
     let (sender, mut receiver) = mpsc::channel(32);
     let discovery = tokio::task::spawn_blocking(move || discover_files(&root, sender));
@@ -554,12 +580,20 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
                 }
             }
             Discovered::File(file) => {
-                if let Err(error) = index_file(state, &file).await {
-                    tracing::warn!(path = %file.display(), %error, "publication indexing failed");
-                    complete = false;
-                    let mut status = state.scan_status.lock().await;
-                    status.errors += 1;
-                    status.message = error.to_string();
+                match index_file(state, &file, retry_failed).await {
+                    Ok(Some(error)) => {
+                        let mut status = state.scan_status.lock().await;
+                        status.errors += 1;
+                        status.message = error;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %file.display(), %error, "publication indexing failed");
+                        complete = false;
+                        let mut status = state.scan_status.lock().await;
+                        status.errors += 1;
+                        status.message = error.to_string();
+                    }
                 }
                 processed += 1;
                 let mut status = state.scan_status.lock().await;
@@ -593,7 +627,12 @@ async fn run_scan(state: &AppState) -> Result<(), AppError> {
             "扫描期间书库目录不可用，已保留现有索引".to_owned();
     }
     if complete {
-        prune_removed(state).await?;
+        if let Err(error) = prune_removed(state, |path| std::fs::metadata(path)).await {
+            let mut status = state.scan_status.lock().await;
+            status.errors += 1;
+            status.message = format!("无法核验待清理路径，已保留现有索引：{error}");
+            return Ok(());
+        }
         prune_derived_caches(state).await?;
     }
     Ok(())
@@ -659,7 +698,11 @@ fn collect_files(root: &Path) -> Collected {
     }
 }
 
-async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
+async fn index_file(
+    state: &AppState,
+    path: &Path,
+    retry_failed: bool,
+) -> Result<Option<String>, AppError> {
     let root = &state.config.books_dir;
     let relative = path
         .strip_prefix(root)
@@ -677,18 +720,20 @@ async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
     let format = BookFormat::from_path(path)
         .ok_or_else(|| AppError::Validation("unsupported publication".to_owned()))?;
     let existing = sqlx::query(
-        "SELECT id,sha256,file_size,mtime_ns,format FROM publications WHERE relative_path=?",
+        "SELECT id,sha256,file_size,mtime_ns,format,parse_status FROM publications WHERE relative_path=?",
     )
     .bind(&relative)
     .fetch_optional(&state.read_db)
     .await?;
     if let Some(row) = existing {
         let id: i64 = row.try_get("id")?;
-        if row.try_get::<i64, _>("file_size")? == size
+        let reparse = retry_failed && row.try_get::<String, _>("parse_status")? == "error";
+        if !reparse
+            && row.try_get::<i64, _>("file_size")? == size
             && row.try_get::<i64, _>("mtime_ns")? == mtime
             && row.try_get::<String, _>("format")? == format.as_str()
         {
-            return Ok(());
+            return Ok(None);
         }
         let hash = hash_file_async(path).await?;
         let directory = ensure_directory(
@@ -696,7 +741,7 @@ async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
             Path::new(&relative).parent().unwrap_or(Path::new("")),
         )
         .await?;
-        if row.try_get::<String, _>("sha256")? == hash {
+        if !reparse && row.try_get::<String, _>("sha256")? == hash {
             sqlx::query(
                 "UPDATE publications SET directory_id=?,filename=?,file_size=?,mtime_ns=?,updated_at=? WHERE id=?",
             )
@@ -712,7 +757,7 @@ async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
             .bind(id)
             .execute(&state.db)
             .await?;
-            return Ok(());
+            return Ok(None);
         }
         return store_publication(
             state, id, directory, &relative, path, format, hash, size, mtime,
@@ -736,10 +781,12 @@ async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
     let mut missing_candidates = Vec::new();
     for candidate in &candidates {
         let candidate_path: String = candidate.try_get("relative_path")?;
-        let still_exists = tokio::fs::metadata(root.join(&candidate_path))
-            .await
-            .is_ok_and(|meta| meta.is_file());
-        if !still_exists {
+        let source = root.join(&candidate_path);
+        if !source_matches(
+            &source,
+            tokio::fs::metadata(&source).await,
+            Metadata::is_file,
+        )? {
             missing_candidates.push(candidate);
         }
     }
@@ -787,7 +834,7 @@ async fn index_file(state: &AppState, path: &Path) -> Result<(), AppError> {
                 .execute(&state.db)
                 .await?;
             }
-            return Ok(());
+            return Ok(None);
         }
         return store_publication(
             state, id, directory, &relative, path, format, hash, size, mtime,
@@ -811,7 +858,7 @@ async fn store_publication(
     hash: String,
     size: i64,
     mtime: i64,
-) -> Result<(), AppError> {
+) -> Result<Option<String>, AppError> {
     let cache_version = crate::books::content_version(&hash, format.as_str(), None);
     let txt_cache_target = (format == BookFormat::Txt)
         .then(|| state.txt_dir(&cache_version, "auto").join("book.utf8"));
@@ -850,6 +897,7 @@ async fn store_publication(
     })
     .await
     .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let incomplete = matches!(&parsed, Err(ParseError::Io(_)));
     let now = now_unix();
     let (title, author, has_cover, pages, parse_error, text_index, parsed_ok) = match parsed {
         Ok((book, has_cover)) => (
@@ -898,9 +946,8 @@ async fn store_publication(
     if format == BookFormat::Cbz && !pages.is_empty() {
         for (chunk_idx, chunk) in pages.chunks(100).enumerate() {
             let base_idx = chunk_idx * 100;
-            let mut builder = sqlx::QueryBuilder::new(
-                "INSERT INTO cbz_pages (publication_id, idx, path, mime) ",
-            );
+            let mut builder =
+                sqlx::QueryBuilder::new("INSERT INTO cbz_pages (publication_id, idx, path, mime) ");
             builder.push_values(chunk.iter().enumerate(), |mut b, (offset, page)| {
                 b.push_bind(publication_id)
                     .push_bind((base_idx + offset) as i64)
@@ -922,7 +969,10 @@ async fn store_publication(
     {
         write_txt_chapter_stamp(&target).await?;
     }
-    Ok(())
+    if incomplete {
+        return Err(io::Error::other(parse_error.expect("failed parse has an error")).into());
+    }
+    Ok(if parsed_ok { None } else { parse_error })
 }
 
 pub(crate) fn txt_chapter_stamp(cache: &Path) -> PathBuf {
@@ -1171,95 +1221,103 @@ async fn ensure_directory(db: &SqlitePool, relative: &Path) -> Result<i64, AppEr
     Ok(parent_id)
 }
 
-async fn prune_removed(state: &AppState) -> Result<(), AppError> {
-    let mut last_id = 0_i64;
-    loop {
-        let rows = sqlx::query(
+fn source_matches(
+    path: &Path,
+    metadata: io::Result<Metadata>,
+    matches: impl FnOnce(&Metadata) -> bool,
+) -> io::Result<bool> {
+    match metadata {
+        Ok(metadata) => Ok(matches(&metadata)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
+}
+
+async fn prune_removed(
+    state: &AppState,
+    metadata: impl Fn(&Path) -> io::Result<Metadata> + Send + Sync + 'static,
+) -> Result<(), AppError> {
+    let metadata = std::sync::Arc::new(metadata);
+    let mut removed_books = Vec::new();
+    let mut removed_directories = Vec::new();
+    for (query, directories, removed) in [
+        (
             "SELECT id,relative_path FROM publications WHERE id>? ORDER BY id LIMIT 256",
-        )
-        .bind(last_id)
-        .fetch_all(&state.read_db)
-        .await?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut batch = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: i64 = row.try_get("id")?;
-            last_id = id;
-            let relative: String = row.try_get("relative_path")?;
-            batch.push((id, relative));
-        }
-        let root = state.config.books_dir.clone();
-        let to_delete = tokio::task::spawn_blocking(move || {
-            let mut missing = Vec::new();
-            for (id, relative) in batch {
-                let source = root.join(&relative);
-                match std::fs::metadata(&source) {
-                    Ok(metadata)
-                        if metadata.is_file() && BookFormat::from_path(&source).is_some() => {}
-                    Ok(_) => missing.push(id),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(id),
-                    Err(error) => {
-                        tracing::warn!(path = %relative, %error, "could not verify publication during prune")
+            false,
+            &mut removed_books,
+        ),
+        (
+            "SELECT id,relative_path FROM directories WHERE relative_path<>'' AND id>? ORDER BY id LIMIT 256",
+            true,
+            &mut removed_directories,
+        ),
+    ] {
+        let mut last_id = 0_i64;
+        loop {
+            let batch: Vec<(i64, String)> = sqlx::query_as(query)
+                .bind(last_id)
+                .fetch_all(&state.read_db)
+                .await?;
+            let Some((last, _)) = batch.last() else { break };
+            last_id = *last;
+            let root = state.config.books_dir.clone();
+            let metadata = metadata.clone();
+            let missing = tokio::task::spawn_blocking(move || {
+                let mut missing = Vec::new();
+                for (id, relative) in batch {
+                    let path = root.join(relative);
+                    let exists = source_matches(&path, metadata(&path), |entry| {
+                        if directories {
+                            entry.is_dir()
+                        } else {
+                            entry.is_file() && BookFormat::from_path(&path).is_some()
+                        }
+                    })?;
+                    if !exists {
+                        missing.push(id);
                     }
                 }
-            }
-            missing
-        })
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
-
-        if !to_delete.is_empty() {
-            let mut tx = state.db.begin().await?;
-            for id in to_delete {
-                sqlx::query("DELETE FROM publications WHERE id=?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
+                Ok::<_, io::Error>(missing)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            removed.extend(missing);
         }
     }
-    let mut last_id = 0_i64;
-    loop {
-        let rows = sqlx::query(
-            "SELECT id,relative_path FROM directories WHERE relative_path<>'' AND id>? ORDER BY id LIMIT 256",
-        )
-        .bind(last_id)
-        .fetch_all(&state.read_db)
-        .await?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut batch = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: i64 = row.try_get("id")?;
-            last_id = id;
-            let relative: String = row.try_get("relative_path")?;
-            batch.push((id, relative));
-        }
-        let root = state.config.books_dir.clone();
-        let to_delete = tokio::task::spawn_blocking(move || {
-            batch
-                .into_iter()
-                .filter_map(|(id, relative)| (!root.join(&relative).is_dir()).then_some(id))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
 
-        if !to_delete.is_empty() {
-            let mut tx = state.db.begin().await?;
-            for id in to_delete {
-                sqlx::query("DELETE FROM directories WHERE id=?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
-        }
+    let mut tx = state.db.begin().await?;
+    let root = state.config.books_dir.clone();
+    let is_available = tokio::task::spawn_blocking(move || {
+        source_matches(&root, metadata(&root), Metadata::is_dir)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    if !is_available {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "书库根目录不可用").into());
     }
+    for id in removed_books {
+        sqlx::query("DELETE FROM publications WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for id in removed_directories {
+        sqlx::query("DELETE FROM directories WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1441,7 +1499,7 @@ mod tests {
     }
 
     async fn scan(state: &AppState) {
-        run_scan(state).await.expect("scan");
+        run_scan(state, false).await.expect("scan");
     }
 
     #[test]
@@ -1462,6 +1520,131 @@ mod tests {
     fn rejects_parent_paths() {
         assert!(normalize_relative("../secret").is_err());
         assert_eq!(normalize_relative("a\\b").unwrap(), "a/b");
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_every_book_when_a_later_directory_cannot_be_verified() {
+        let (_temp, state) = test_state().await;
+        let shelf = state.config.books_dir.join("shelf");
+        std::fs::create_dir(&shelf).unwrap();
+        let book = shelf.join("book.txt");
+        std::fs::write(&book, "Chapter one\nGreetings").unwrap();
+        scan(&state).await;
+        let (id, _, _) = publication_rows(&state).await.remove(0);
+        sqlx::query("INSERT INTO reading_progress VALUES (?, 'version', '{}', 0.4, 1)")
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        std::fs::remove_file(&book).unwrap();
+
+        let error = prune_removed(&state, move |path| {
+            if path == shelf {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            std::fs::metadata(path)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(publication_rows(&state).await[0].0, id);
+        let progress: f64 =
+            sqlx::query_scalar("SELECT progress FROM reading_progress WHERE publication_id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(progress, 0.4);
+    }
+
+    #[tokio::test]
+    async fn manual_scan_retries_failed_publications_with_unchanged_files() {
+        let (_temp, state) = test_state().await;
+        let book = state.config.books_dir.join("book.txt");
+        std::fs::write(&book, "Chapter one\nGreetings").unwrap();
+        scan(&state).await;
+        let rows = publication_rows(&state).await;
+        let id = rows[0].0;
+        // Recreate the database state left by a transient parse error.
+        sqlx::query("UPDATE publications SET parse_status='error',parse_error='temporary'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM text_chapters")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO reading_progress VALUES (?, 'version', '{}', 0.4, 1)")
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        scan(&state).await;
+        let before: String = sqlx::query_scalar("SELECT parse_status FROM publications")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(before, "error");
+
+        std::fs::write(
+            state.config.books_dir.join("broken.cbz"),
+            b"invalid archive",
+        )
+        .unwrap();
+        run_scan(&state, true).await.unwrap();
+        assert!(publication_rows(&state).await.contains(&rows[0]));
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT parse_status,parse_error FROM publications WHERE id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), error), ("ok", None));
+        let chapters: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM text_chapters WHERE publication_id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert!(chapters > 0);
+        let progress: f64 =
+            sqlx::query_scalar("SELECT progress FROM reading_progress WHERE publication_id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(progress, 0.4);
+        assert_eq!(state.scan_status.lock().await.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn search_reuses_the_hidden_shelf_snapshot_until_home_refreshes_it() {
+        let (_temp, state) = test_state().await;
+        let shelf = state.config.books_dir.join("shelf");
+        std::fs::create_dir(&shelf).unwrap();
+        scan(&state).await;
+        let initial = hidden_shelf_snapshot(&state, false).await.unwrap();
+        assert!(initial.is_empty());
+
+        let marker = shelf.join("hide");
+        std::fs::write(&marker, "").unwrap();
+        let cached = hidden_shelf_snapshot(&state, false).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&initial, &cached));
+        let refreshed = hidden_shelf_snapshot(&state, true).await.unwrap();
+        assert_eq!(refreshed.as_slice(), &["shelf"]);
+
+        std::fs::remove_file(marker).unwrap();
+        let cached = hidden_shelf_snapshot(&state, false).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&refreshed, &cached));
+        assert!(
+            hidden_shelf_snapshot(&state, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

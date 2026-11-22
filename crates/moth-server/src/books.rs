@@ -26,7 +26,7 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 use crate::{
     auth::Authenticated,
     error::AppError,
-    library::{hidden_shelf_set, now_unix},
+    library::{hidden_shelf_snapshot, now_unix},
     state::{AppState, CbzArchiveCache, ConversionState},
 };
 
@@ -204,8 +204,9 @@ pub async fn home(
     State(state): State<AppState>,
     _user: Authenticated,
 ) -> Result<Json<HomeResponse>, AppError> {
+    let snapshot = hidden_shelf_snapshot(&state, true).await?;
     let (directories, hidden_directories) =
-        fetch_home_directories(&state.read_db, &state.config.books_dir).await?;
+        fetch_home_directories(&state.read_db, &snapshot).await?;
     let hidden_paths = hidden_directories
         .iter()
         .map(|directory| directory.path.as_str())
@@ -236,7 +237,7 @@ const HOME_ID_CHUNK_SIZE: usize = 200;
 
 async fn fetch_home_directories(
     db: &SqlitePool,
-    books_root: &std::path::Path,
+    hidden_paths: &[String],
 ) -> Result<(Vec<HomeDirectoryPreview>, Vec<HiddenDirectorySummary>), AppError> {
     let Some(root_id) =
         sqlx::query_scalar::<_, i64>("SELECT id FROM directories WHERE relative_path=''")
@@ -252,21 +253,16 @@ async fn fetch_home_directories(
     .fetch_all(db)
     .await?;
 
-    let mut parsed_categories = Vec::with_capacity(categories.len());
-    let mut category_paths = Vec::with_capacity(categories.len());
+    let hidden_set: std::collections::HashSet<&str> =
+        hidden_paths.iter().map(String::as_str).collect();
+
+    let mut visible_categories = Vec::with_capacity(categories.len());
+    let mut hidden = Vec::new();
     for category in categories {
         let id: i64 = category.try_get("id")?;
         let name: String = category.try_get("name")?;
         let path: String = category.try_get("relative_path")?;
-        category_paths.push(path.clone());
-        parsed_categories.push((id, name, path));
-    }
-    let hidden_set = hidden_shelf_set(books_root, category_paths).await?;
-
-    let mut visible_categories = Vec::with_capacity(parsed_categories.len());
-    let mut hidden = Vec::new();
-    for (id, name, path) in parsed_categories {
-        if hidden_set.contains(&path) {
+        if hidden_set.contains(path.as_str()) {
             hidden.push(HiddenDirectorySummary { name, path });
         } else {
             visible_categories.push((id, name, path));
@@ -425,7 +421,6 @@ async fn fetch_continue_reading(
         .collect::<Result<Vec<_>, sqlx::Error>>()
         .map_err(AppError::from)
 }
-
 
 #[cfg(test)]
 fn is_hidden_directory_path(path: &str, hidden_paths: &[&str]) -> bool {
@@ -1281,14 +1276,41 @@ pub async fn get_progress(
     Ok(Json(value))
 }
 
+#[derive(Deserialize)]
+pub struct ProgressWrite {
+    #[serde(flatten)]
+    body: ProgressBody,
+    writer_id: Option<String>,
+    sequence: Option<i64>,
+}
+
 pub async fn put_progress(
     State(state): State<AppState>,
-    _user: Authenticated,
+    user: Authenticated,
     AxumPath(id): AxumPath<i64>,
-    payload: Result<Json<ProgressBody>, axum::extract::rejection::JsonRejection>,
+    payload: Result<Json<ProgressWrite>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ProgressBody>, AppError> {
-    let Json(body) = payload
+    let Json(ProgressWrite {
+        body,
+        writer_id,
+        sequence,
+    }) = payload
         .map_err(|_| AppError::Validation("Request body must be valid progress JSON".to_owned()))?;
+    let order = match (writer_id, sequence) {
+        (None, None) => None,
+        (Some(writer), Some(sequence))
+            if writer.len() == 32
+                && writer.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && (1..=9_007_199_254_740_991).contains(&sequence) =>
+        {
+            Some((writer.to_ascii_lowercase(), sequence))
+        }
+        _ => {
+            return Err(AppError::Validation(
+                "Invalid progress write order".to_owned(),
+            ));
+        }
+    };
     let publication = publication_row(&state.read_db, &state.config.books_dir, id).await?;
     ensure_source_current(&publication).await?;
     let current_version = content_version_for_position(&publication, &body.position);
@@ -1299,11 +1321,65 @@ pub async fn put_progress(
         });
     }
     validate_progress(&state.read_db, &publication, &body).await?;
-    let now = now_unix();
+    persist_progress(&state.db, &user.session_hash, id, &body, order).await?;
+    Ok(Json(body))
+}
+
+async fn persist_progress(
+    db: &SqlitePool,
+    session_hash: &str,
+    id: i64,
+    body: &ProgressBody,
+    order: Option<(String, i64)>,
+) -> Result<(), AppError> {
+    let mut tx = db.begin().await?;
+    if let Some((writer, sequence)) = order {
+        let now = now_unix();
+        let accepted = sqlx::query(
+            "INSERT INTO progress_writers (session_hash,publication_id,writer_id,sequence)
+             SELECT token_hash,?,?,? FROM sessions WHERE token_hash=? AND expires_at>?
+             ON CONFLICT(session_hash,publication_id,writer_id) DO UPDATE SET sequence=excluded.sequence
+             WHERE excluded.sequence>progress_writers.sequence",
+        )
+        .bind(id)
+        .bind(writer)
+        .bind(sequence)
+        .bind(session_hash)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if accepted.rows_affected() == 0 {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=? AND expires_at>?)",
+            )
+            .bind(session_hash)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await?;
+            return if active {
+                Ok(())
+            } else {
+                Err(AppError::Unauthorized)
+            };
+        }
+    }
     let json = serde_json::to_string(&body.position)
         .map_err(|error| AppError::Validation(error.to_string()))?;
-    sqlx::query("INSERT INTO reading_progress (publication_id,content_version,locator_json,progress,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(publication_id) DO UPDATE SET content_version=excluded.content_version,locator_json=excluded.locator_json,progress=excluded.progress,updated_at=excluded.updated_at").bind(id).bind(&body.content_version).bind(json).bind(body.position.progress()).bind(now).execute(&state.db).await?;
-    Ok(Json(body))
+    sqlx::query(
+        "INSERT INTO reading_progress (publication_id,content_version,locator_json,progress,updated_at)
+         VALUES (?,?,?,?,?) ON CONFLICT(publication_id) DO UPDATE SET
+         content_version=excluded.content_version,locator_json=excluded.locator_json,
+         progress=excluded.progress,updated_at=excluded.updated_at",
+    )
+    .bind(id)
+    .bind(&body.content_version)
+    .bind(json)
+    .bind(body.position.progress())
+    .bind(now_unix())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn validate_progress(
@@ -2264,28 +2340,23 @@ fn rewrite_mobi_images(value: &str, image_paths: &HashMap<u32, String>) -> Strin
 
 fn split_long_markup(value: &str) -> Vec<String> {
     let value = value.trim();
-    if value.chars().count() <= MOBI_CHAPTER_CHAR_LIMIT {
-        return if value.is_empty() {
-            Vec::new()
-        } else {
-            vec![value.to_owned()]
-        };
-    }
-
     let mut output = Vec::new();
     let mut start = 0;
     while start < value.len() {
         let remaining = &value[start..];
-        if remaining.chars().count() <= MOBI_CHAPTER_CHAR_LIMIT {
+        let target = byte_index_after_chars(remaining, MOBI_CHAPTER_CHAR_LIMIT);
+        if target == remaining.len() {
             if !remaining.trim().is_empty() {
                 output.push(remaining.trim().to_owned());
             }
             break;
         }
 
-        let target = byte_index_after_chars(remaining, MOBI_CHAPTER_CHAR_LIMIT);
-        let max_boundary = byte_index_after_chars(remaining, MOBI_CHAPTER_CHAR_LIMIT * 2);
-        let boundaries = mobi_paragraph_boundaries(remaining);
+        let max_boundary =
+            target + byte_index_after_chars(&remaining[target..], MOBI_CHAPTER_CHAR_LIMIT);
+        // Only boundaries inside this window can affect the split. Restarting
+        // at each fragment preserves recovery for malformed markup.
+        let boundaries = mobi_paragraph_boundaries(&remaining[..max_boundary]);
         let end = boundaries
             .iter()
             .copied()
@@ -2867,6 +2938,97 @@ fn md5_like(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn progress_writes_are_ordered_within_a_writer_and_independent_across_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_test(temp.path().join("data"));
+        config.books_dir = temp.path().to_owned();
+        let source = temp.path().join("book.epub");
+        std::fs::write(&source, b"x").unwrap();
+        let mtime = std::fs::metadata(&source)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let db = crate::db::connect(&config).await.unwrap();
+        let state = AppState::new(config, db.clone());
+        sqlx::query("INSERT INTO directories VALUES (1, NULL, '', '', 0)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO publications (id,directory_id,relative_path,filename,format,title,file_size,mtime_ns,sha256,added_at,updated_at)
+                     VALUES (1,1,'book.epub','book.epub','epub','book',1,?,'hash',0,0)")
+            .bind(mtime).execute(&db).await.unwrap();
+        for session in ["phone", "desktop"] {
+            sqlx::query("INSERT INTO sessions VALUES (?, 0, ?, 0)")
+                .bind(session)
+                .bind(now_unix() + 100)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        let writer = "a".repeat(32);
+        let save = |session: &'static str, sequence: Option<i64>, page| {
+            let state = state.clone();
+            let writer = writer.clone();
+            async move {
+                let mut payload = serde_json::json!({
+                    "content_version": content_version("hash", "epub", None),
+                    "position": {
+                        "type": "epub", "href": "chapter.xhtml", "cfi": "epubcfi(/6/2)",
+                        "progress": page as f64 / 10.0,
+                    },
+                });
+                if let Some(sequence) = sequence {
+                    payload["writer_id"] = writer.into();
+                    payload["sequence"] = sequence.into();
+                }
+                let payload =
+                    Json::<ProgressWrite>::from_bytes(&serde_json::to_vec(&payload).unwrap());
+                let user = Authenticated {
+                    username: "reader".to_owned(),
+                    session_hash: session.to_owned(),
+                };
+                let Json(saved) = put_progress(State(state), user, AxumPath(1), payload)
+                    .await
+                    .unwrap();
+                assert_eq!(saved.position.progress(), page as f64 / 10.0);
+            }
+        };
+        let stored = || {
+            sqlx::query_scalar::<_, f64>(
+                "SELECT progress FROM reading_progress WHERE publication_id=1",
+            )
+            .fetch_one(&db)
+        };
+
+        save("phone", Some(1_i64), 9).await;
+        save("phone", Some(2), 4).await;
+        assert_eq!(stored().await.unwrap(), 0.4);
+        save("desktop", Some(1), 2).await;
+        save("phone", Some(1), 9).await;
+        save("phone", Some(2), 4).await;
+        assert_eq!(stored().await.unwrap(), 0.2);
+        save("phone", Some(4), 5).await;
+        save("phone", Some(3), 7).await;
+        assert_eq!(stored().await.unwrap(), 0.5);
+        save("desktop", None, 6).await;
+        assert_eq!(stored().await.unwrap(), 0.6);
+
+        sqlx::query("DELETE FROM sessions WHERE token_hash='phone'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let writers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM progress_writers")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(writers, 1);
+    }
+
     #[test]
     fn parses_single_and_suffix_ranges() {
         assert_eq!(parse_range("bytes=0-9", 20), Some((0, 9)));
@@ -3070,9 +3232,14 @@ mod tests {
         .await
         .expect("series");
 
-        let (visible, hidden) = fetch_home_directories(&db, &books_root)
-            .await
-            .expect("home directories");
+        let (visible, hidden) = fetch_home_directories(
+            &db,
+            &crate::library::hidden_shelf_paths(&db, &books_root)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("home directories");
         assert_eq!(
             hidden
                 .iter()
@@ -3092,9 +3259,14 @@ mod tests {
         // The marker is filesystem state, so removing it takes effect on the
         // next home request without a scan or a database update.
         std::fs::remove_file(marker).expect("remove hide marker");
-        let (visible, hidden) = fetch_home_directories(&db, &books_root)
-            .await
-            .expect("home directories after marker removal");
+        let (visible, hidden) = fetch_home_directories(
+            &db,
+            &crate::library::hidden_shelf_paths(&db, &books_root)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("home directories after marker removal");
         assert!(hidden.is_empty());
         assert!(visible.iter().any(|entry| entry.name == "隐藏"));
     }

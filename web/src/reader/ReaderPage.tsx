@@ -246,7 +246,7 @@ export function ReaderPage({ theme, onToggleTheme }: Props) {
       latestPositionRef.current = finalPosition;
       setProgress({ content_version: detail.content_version, position: finalPosition });
       saveProgress(finalPosition, detail.content_version);
-      void flush();
+      void flush().catch(() => undefined);
     }
     setSettingsOpen(false);
     setNavigationOpen(false);
